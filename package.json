@@ -1,0 +1,24 @@
+{
+  "name": "mcp-client",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "build": "tsc",
+  "scripts": {
+    "build": "tsc",
+    "start": "node build/client.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.124.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "dotenv": "^17.4.2",
+    "openai": "^7.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "typescript": "^7.0.2"
+  }
+}
