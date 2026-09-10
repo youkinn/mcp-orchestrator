@@ -211,6 +211,22 @@ class MCPClient {
     );
   }
 
+  async listTools(): Promise<Array<{ name: string; description?: string }>> {
+    if (!this.client) {
+      throw new Error("客户端未连接");
+    }
+
+    const response = await this.client.request(
+      { method: "tools/list" },
+      ListToolsResultSchema
+    );
+
+    return response.tools.map((tool: any) => ({
+      name: tool.name,
+      description: tool.description,
+    }));
+  }
+
   // 处理用户查询：
   // 1. 让模型决定是否需要调工具
   // 2. 执行 MCP 工具调用

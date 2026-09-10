@@ -1,6 +1,10 @@
 # MCP Client
 
-这是一个基于 Model Context Protocol (MCP) 的客户端示例，用于连接 MCP Server，并让 LLM 通过工具调用来回答问题。
+这是一个 MCP 网关：连接模型服务和 MCP Server，并同时提供控制台交互与 Web API。网页请求应先发送到本项目，再由本项目通过 stdio 调用 MCP Server。
+
+```text
+mcp-web → mcp-client Web API → MCP stdio → mcp-server
+```
 
 ## 1. 安装依赖
 
@@ -63,7 +67,48 @@ API_BASE_URL=https://api.anthropic.com
 npm run build
 ```
 
-## 4. 启动项目
+## 4. Web API 模式
+
+Web 模式会在启动时连接一次 MCP Server，并提供以下接口：
+
+```http
+GET  /health
+GET  /api/tools
+POST /api/chat
+```
+
+启动天气 MCP Server 的 Web 网关：
+
+```bash
+npm run build
+npm run web -- D:\workplace\mcp-server\src\weather\index.js
+```
+
+默认监听 `http://localhost:3000`。也可以通过环境变量配置：
+
+```env
+MCP_SERVER_SCRIPT=D:\workplace\mcp-server\src\weather\index.js
+PORT=3000
+WEB_ORIGIN=http://localhost:5173
+```
+
+此时可以直接执行：
+
+```bash
+npm run web
+```
+
+聊天请求示例：
+
+```bash
+curl -X POST http://localhost:3000/api/chat `
+	-H "Content-Type: application/json" `
+	-d '{"message":"纽约今天适合地铁通勤吗？"}'
+```
+
+请求体中的 `message` 必须是非空字符串，最大长度为 4000 个字符。Web API 会串行处理聊天请求，避免共享 MCP stdio 连接发生并发读写冲突。
+
+## 5. 控制台模式
 
 必须传入一个 MCP Server 的脚本路径作为参数，不能只传目录，必须传 `.js` 或 `.py` 文件。
 
@@ -85,7 +130,7 @@ npm run start -- D:\workplace\mcp-server\server.py
 node build/client.js D:\workplace\mcp-server\src\weather\index.js
 ```
 
-## 5. 启动后如何使用
+## 6. 启动后如何使用
 
 程序启动后会进入交互式聊天模式：
 
@@ -95,9 +140,9 @@ node build/client.js D:\workplace\mcp-server\src\weather\index.js
 
 输入 `quit` 可退出程序。
 
-## 6. 重要注意事项
+## 7. 重要注意事项
 
-### 6.1 必须传脚本路径，不是目录
+### 7.1 必须传脚本路径，不是目录
 
 下面这样是不对的：
 
@@ -107,26 +152,26 @@ npm run start -- D:\workplace\mcp-server
 
 因为代码会检查是否是 `.js` 或 `.py` 文件，目录本身不能直接作为子进程执行对象。
 
-### 6.2 `.env` 修改后需要重启项目
+### 7.2 `.env` 修改后需要重启项目
 
 `dotenv.config()` 在进程启动时读取环境变量，所以修改 `.env` 后通常需要关闭当前进程并重新启动。
 
-### 6.3 不是 MCP Server 认证问题，而是模型提供商认证问题
+### 7.3 不是 MCP Server 认证问题，而是模型提供商认证问题
 
 - `mcp-server` 负责提供工具能力
 - `LLM_PROVIDER` / `API_KEY` 负责模型调用鉴权
 
 两者是不同层次的问题。
 
-### 6.4 DeepSeek 需要注意 reasoning_content
+### 7.4 DeepSeek 需要注意 reasoning_content
 
 如果你使用 DeepSeek 这类支持思维模式的模型，工具调用时需要正确回传 reasoning 信息；当前项目已对这类场景做了兼容处理。
 
-### 6.5 需要保证 server 是实际可执行脚本
+### 7.5 需要保证 server 是实际可执行脚本
 
 如果你传入的 server 路径不存在，或者不是可执行脚本，连接会失败。
 
-## 7. 常见启动失败原因
+## 8. 常见启动失败原因
 
 1. 没有传入 server 路径
 2. 传入了目录而不是 `.js` / `.py` 文件
@@ -134,7 +179,7 @@ npm run start -- D:\workplace\mcp-server
 4. `LLM_PROVIDER` 与 `API_BASE_URL` 不匹配
 5. 当前程序还在运行，修改了 `.env` 但没有重启
 
-## 8. 推荐的默认配置
+## 9. 推荐的默认配置
 
 当前项目的默认推荐配置：
 

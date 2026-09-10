@@ -6,7 +6,8 @@
   "build": "tsc",
   "scripts": {
     "build": "tsc",
-    "start": "node build/client.js"
+    "start": "node build/client.js",
+    "web": "node build/web-server.js"
   },
   "keywords": [],
   "author": "",
@@ -14,10 +15,14 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.124.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "cors": "^2.8.6",
     "dotenv": "^17.4.2",
+    "express": "^5.2.1",
     "openai": "^7.13.0"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
     "@types/node": "^22.20.2",
     "typescript": "^7.0.2"
   }

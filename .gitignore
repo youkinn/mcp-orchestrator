@@ -1,9 +1,10 @@
 .DS_Store
 node_modules
-/build
-
+build
+dist
 
 # local env files
+.env
 .env.local
 .env.*.local
 
@@ -15,9 +16,13 @@ pnpm-debug.log*
 
 # Editor directories and files
 .idea
-.vscode
+.vscode/*
+!.vscode/launch.json
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+
+# project guidance
+!CLAUDE.md
