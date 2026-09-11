@@ -1,13 +1,12 @@
-{
-  "name": "mcp-client",
+﻿{
+  "name": "mcp-orchestrator",
   "version": "1.0.0",
-  "description": "",
+  "description": "MCP orchestration layer - connects LLM to MCP servers",
   "main": "index.js",
-  "build": "tsc",
   "scripts": {
     "build": "tsc",
-    "start": "node build/client.js",
-    "web": "node build/web-server.js"
+    "start": "node build/cli.js",
+    "web": "node build/index.js"
   },
   "keywords": [],
   "author": "",

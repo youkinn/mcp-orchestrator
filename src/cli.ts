@@ -1,0 +1,87 @@
+﻿import dotenv from "dotenv";
+import * as readline from "node:readline";
+import { MCPTransport } from "./transport.js";
+import { Agent } from "./agent.js";
+import type { LLMProvider } from "./types.js";
+
+dotenv.config();
+
+if (process.argv.length < 3) {
+  console.log("Usage: node build/cli.js <server-script-path>");
+  process.exit(1);
+}
+
+function readLLMConfig() {
+  const provider = (
+    process.env.LLM_PROVIDER || "deepseek"
+  ).toLowerCase() as LLMProvider;
+
+  if (!["anthropic", "deepseek", "openai"].includes(provider)) {
+    throw new Error("LLM_PROVIDER must be anthropic / deepseek / openai");
+  }
+
+  const model =
+    process.env.LLM_MODEL ||
+    (provider === "anthropic"
+      ? "claude-3-5-sonnet-20241022"
+      : provider === "openai"
+        ? "gpt-4o-mini"
+        : "deepseek-v4-flash");
+
+  const apiKey = process.env.API_KEY;
+  const apiBaseUrl =
+    process.env.API_BASE_URL ||
+    (provider === "anthropic"
+      ? "https://api.anthropic.com"
+      : provider === "openai"
+        ? "https://api.openai.com/v1"
+        : "https://api.deepseek.com");
+
+  if (!apiKey) {
+    throw new Error("Missing API_KEY in .env");
+  }
+
+  return { provider, model, apiKey, apiBaseUrl };
+}
+
+async function main() {
+  const transport = new MCPTransport(process.argv[2]);
+  await transport.connect();
+
+  const llmConfig = readLLMConfig();
+  const agent = new Agent(transport, llmConfig);
+
+  console.log("\nMCP Orchestrator CLI started");
+  console.log("Enter your query or type 'quit' to exit.");
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  const askQuestion = () => {
+    rl.question("\nQuery: ", async (query: string) => {
+      try {
+        if (query.toLowerCase() === "quit") {
+          await transport.close();
+          rl.close();
+          return;
+        }
+
+        const response = await agent.processQuery(query);
+        console.log("\n" + response);
+        askQuestion();
+      } catch (error) {
+        console.error("\nError:", error);
+        askQuestion();
+      }
+    });
+  };
+
+  askQuestion();
+}
+
+main().catch((error) => {
+  console.error("Error:", error);
+  process.exit(1);
+});
