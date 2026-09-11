@@ -13,15 +13,15 @@ export function createServer(agent: Agent, options: {
   app.use(express.json({ limit: "32kb" }));
 
   app.get("/health", (_request: Request, response: Response) => {
-    response.json({ status: "ok", service: "mcp-orchestrator" });
+    response.json({ code: 200, data: { status: "ok", service: "mcp-orchestrator" }, message: "" });
   });
 
   app.get("/api/tools", async (_request: Request, response: Response) => {
     try {
-      response.json({ tools: await agent.listTools() });
+      response.json({ code: 200, data: { tools: await agent.listTools() }, message: "" });
     } catch (error) {
       console.error("Failed to list MCP tools:", error);
-      response.status(503).json({ message: "MCP Server not connected" });
+      response.status(503).json({ code: 503, data: null, message: "MCP Server 未连接" });
     }
   });
 
@@ -29,12 +29,12 @@ export function createServer(agent: Agent, options: {
     const message = request.body?.message;
 
     if (typeof message !== "string" || !message.trim()) {
-      response.status(400).json({ message: "message must be a non-empty string" });
+      response.status(400).json({ code: 400, data: null, message: "message 不能为空" });
       return;
     }
 
-    if (message.length > 4000) {
-      response.status(413).json({ message: "message cannot exceed 4000 characters" });
+    if (message.length > 300) {
+      response.status(413).json({ code: 413, data: null, message: "消息不能超过 300 字符" });
       return;
     }
 
@@ -44,10 +44,10 @@ export function createServer(agent: Agent, options: {
         () => undefined,
         () => undefined,
       );
-      response.json({ answer: await result });
+      response.json({ code: 200, data: { answer: await result }, message: "" });
     } catch (error) {
       console.error("Failed to process chat request:", error);
-      response.status(500).json({ message: "Failed to process request, please try again" });
+      response.status(500).json({ code: 500, data: null, message: "处理请求失败，请稍后重试" });
     }
   });
 
