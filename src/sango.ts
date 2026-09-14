@@ -46,17 +46,6 @@ const ANSWER_COMMANDS = new Set(['答案', '这题选什么']);
 export const SANGO_NO_SESSION_PROMPT = '请先发送“随机一题”开始';
 export const SANGO_EMPTY_BANK_PROMPT = '题库为空，暂时无法出题';
 
-/** 知识问答 system prompt：LLM 负责理解问法与候选判定，答案只取题库原文 */
-export const SANGO_KNOWLEDGE_SYSTEM_PROMPT = [
-  '你是风云三国知识问答助手。',
-  '规则：',
-  '1. 收到用户提问后必须先调用 sango_query 工具（参数 text 传用户原始问题），取回候选题目。',
-  '2. 先理解用户问题的含义，再判断候选中哪条含义相同；问法不同但含义相同即算对应。',
-  '3. 判定出对应的题目后，只输出该题答案原文，不要输出题干、选项字母、解释或任何多余文字。',
-  '4. 候选中没有含义对应的题目时（包括只是字面相似、含义不同的），只回复「题库未收录该题，请换个问法」。',
-  '5. 禁止使用题库之外的知识作答、补充或改写答案。',
-].join('\n');
-
 /** 归一化：全角→半角、小写、去空白与标点 */
 export function normalize(text: string): string {
   return text

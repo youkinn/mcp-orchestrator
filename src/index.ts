@@ -1,6 +1,6 @@
 import dotenv from 'dotenv';
 import { MCPTransport } from './transport.js';
-import { Agent } from './agent.js';
+import { Agent, UNIFIED_SYSTEM_PROMPT } from './agent.js';
 import { SangoService } from './sango.js';
 import { createServer } from './server.js';
 import type { LLMProvider, MCPToolDefinition } from './types.js';
@@ -78,7 +78,7 @@ async function main() {
   // 统一 Agent：工具集 = MCP 工具 + 本地题库工具，调不调、调哪个由模型按语义自主决定
   const mcpTools = await transport.listTools();
   const agent = new Agent(transport, llmConfig, {
-    // 不传 systemPrompt：默认提示词即统一路由提示词（agent.ts），由 feat-A003 小胡落地
+    systemPrompt: UNIFIED_SYSTEM_PROMPT,
     tools: [...mcpTools, SANGO_QUERY_TOOL],
     localTools: {
       sango_query: async (args: Record<string, unknown>) => {
