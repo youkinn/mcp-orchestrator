@@ -5,8 +5,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
-import { Agent } from './agent.js';
-import { MCPTransport } from './transport.js';
+import { Agent } from '../../agent.js';
+import { MCPTransport } from '../../transport.js';
 import {
   SangoService,
   normalize,
@@ -14,15 +14,15 @@ import {
   SANGO_NO_SESSION_PROMPT,
   type SangoOptionKey,
   type SangoQuestion,
-} from './sango.js';
-import { createServer } from './server.js';
+} from '../../sango.js';
+import { createServer } from '../../server.js';
 import type {
   LLMConfig,
   LLMProvider,
   MCPToolDefinition,
   ModelResponse,
   ToolCallResult,
-} from './types.js';
+} from '../../types.js';
 
 const XIAHOU_DUN_QUESTION: SangoQuestion = {
   question: '夏侯惇的字是什么？',
