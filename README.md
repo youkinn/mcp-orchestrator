@@ -16,7 +16,8 @@ src/
 ├── server.ts     Express HTTP 层（路由、校验、请求队列）
 ├── sango.ts      三国知识问答题库服务（加载检索、随机一题会话）
 ├── index.ts      Web 服务入口
-└── cli.ts        CLI 交互入口
+├── cli.ts        CLI 交互入口
+└── test/         特性测试（按特性号分目录）
 ```
 
 ## 安装
@@ -24,6 +25,15 @@ src/
 ```bash
 npm install
 npm run build
+```
+
+## 测试
+
+测试代码按特性号放在 `src/test/<特性号>/`，编译后位于 `build/test/<特性号>/`：
+
+```bash
+npm run build
+node --test "build/test/feat-A002/*.test.js"
 ```
 
 ## 配置

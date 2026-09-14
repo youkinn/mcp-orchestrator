@@ -1,14 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Agent } from "./agent.js";
-import { MCPTransport } from "./transport.js";
+import { Agent } from "../../agent.js";
+import { MCPTransport } from "../../transport.js";
 import type {
   LLMConfig,
   LLMProvider,
   MCPToolDefinition,
   ModelResponse,
   ToolCallResult,
-} from "./types.js";
+} from "../../types.js";
 
 /** Mock Transport：只记录调用，不发起真实 MCP 连接（feat-A002） */
 class MockTransport extends MCPTransport {
