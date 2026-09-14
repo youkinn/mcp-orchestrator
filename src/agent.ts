@@ -19,6 +19,13 @@ const DEFAULT_SYSTEM_PROMPT = [
   "5. 不输出未来几天预报、预警区域细节或用户没问的建议。",
 ].join("\n");
 
+// general 场景：通用对话提示词，不套天气播报格式约束、不涉及题库、不调用工具
+export const GENERAL_SYSTEM_PROMPT = [
+  "你是通用对话助手，用简体中文回答用户的各类问题。",
+  "直接回答用户所问，简洁清楚，不要套用与问题无关的模板或格式。",
+  "不调用任何工具，仅凭自身知识作答；不确定时直接说明。",
+].join("\n");
+
 export type LocalToolHandler = (
   args: Record<string, unknown>
 ) => ToolCallResult | Promise<ToolCallResult>;

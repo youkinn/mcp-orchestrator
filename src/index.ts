@@ -1,6 +1,6 @@
 import dotenv from 'dotenv';
 import { MCPTransport } from './transport.js';
-import { Agent } from './agent.js';
+import { Agent, GENERAL_SYSTEM_PROMPT } from './agent.js';
 import { SANGO_KNOWLEDGE_SYSTEM_PROMPT, SangoService } from './sango.js';
 import { createServer } from './server.js';
 import type { LLMProvider, MCPToolDefinition } from './types.js';
@@ -73,7 +73,10 @@ async function main() {
   const llmConfig = readLLMConfig();
 
   // 各场景独立 Agent：general 无工具；weather 连 MCP 工具；sango 知识问答=本地召回候选+LLM 语义判定
-  const generalAgent = new Agent(transport, llmConfig, { tools: [] });
+  const generalAgent = new Agent(transport, llmConfig, {
+    systemPrompt: GENERAL_SYSTEM_PROMPT,
+    tools: [],
+  });
   const weatherAgent = new Agent(transport, llmConfig);
 
   const sangoService = new SangoService();
