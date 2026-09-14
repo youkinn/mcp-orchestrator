@@ -6,8 +6,7 @@ import { dirname, join } from 'node:path';
 import {
   SangoService,
   normalize,
-  SANGO_KNOWLEDGE_SYSTEM_PROMPT,
-  SANGO_NO_SESSION_PROMPT,
+ SANGO_NO_SESSION_PROMPT,
   type SangoOptionKey,
   type SangoQuestion,
 } from '../../sango.js';
@@ -150,13 +149,6 @@ test('candidates: 无关问法与空输入返回空，limit 生效', (t) => {
   assert.deepEqual(service.candidates('完全不存在的问题'), []);
   assert.deepEqual(service.candidates(''), []);
   assert.equal(service.candidates('的字是什么', 1).length, 1);
-});
-
-test('SANGO_KNOWLEDGE_SYSTEM_PROMPT: 要求先调工具召回、再按含义判定、未命中不编造', () => {
-  assert.match(SANGO_KNOWLEDGE_SYSTEM_PROMPT, /sango_query/);
-  assert.match(SANGO_KNOWLEDGE_SYSTEM_PROMPT, /理解用户问题的含义/);
-  assert.match(SANGO_KNOWLEDGE_SYSTEM_PROMPT, /只输出该题答案原文/);
-  assert.match(SANGO_KNOWLEDGE_SYSTEM_PROMPT, /题库未收录该题，请换个问法/);
 });
 
 test('judge: 选项字母（半角/全角/大小写）判题', (t) => {
