@@ -14,8 +14,10 @@ src/
 ├── transport.ts  MCP 协议层（连接、列工具、调工具、关闭）
 ├── agent.ts      AI 编排层（LLM 调用、tool-use 循环）
 ├── server.ts     Express HTTP 层（路由、校验、请求队列）
+├── sango.ts      三国知识问答题库服务（加载检索、随机一题会话）
 ├── index.ts      Web 服务入口
-└── cli.ts        CLI 交互入口
+├── cli.ts        CLI 交互入口
+└── test/         特性测试（按特性号分目录）
 ```
 
 ## 安装
@@ -23,6 +25,15 @@ src/
 ```bash
 npm install
 npm run build
+```
+
+## 测试
+
+测试代码按特性号放在 `src/test/<特性号>/`，编译后位于 `build/test/<特性号>/`：
+
+```bash
+npm run build
+node --test "build/test/feat-A002/*.test.js"
 ```
 
 ## 配置
@@ -53,6 +64,20 @@ npm run web -- D:\workplace\mcp-server\src\weather\index.js
 - `GET /api/tools` — 列出可用 MCP 工具
 - `POST /api/chat` — 发送聊天消息（`{ "message": "..." }`）
 
+### 场景分发（feat-A002 风云三国知识问答）
+
+`POST /api/chat` 请求体支持 `scenario` / `service` / `sessionId`（均为可选项）：
+
+| scenario | service | 说明 |
+|----------|---------|------|
+| `general`（缺省） | — | 普通问答，不带工具 |
+| `weather` | — | 天气 MCP 工具（现状） |
+| `sango` | `knowledge` | 三国知识问答：LLM 理解问法，答案从题库精确取 |
+| `sango` | `random` | 随机一题：本地规则出题/判题/查答案，不调 LLM |
+
+- `sango` + `random`：`sessionId` 标识会话（前端生成 UUID），会话 30 分钟过期
+- 题库默认 `data/sango-questions.json`，可用环境变量 `SANGO_QUESTION_FILE` 覆盖
+
 **CLI 交互模式：**
 
 ```bash
@@ -70,3 +95,4 @@ npm start -- D:\workplace\mcp-server\src\weather\index.js
 | `PORT` | Web 服务端口 | `3000` |
 | `WEB_ORIGIN` | CORS 允许来源 | `http://localhost:8001` |
 | `MCP_SERVER_SCRIPT` | MCP Server 脚本路径 | 也可通过命令行传入 |
+| `SANGO_QUESTION_FILE` | 风云三国题库文件路径 | `data/sango-questions.json` |

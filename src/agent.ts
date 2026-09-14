@@ -1,6 +1,11 @@
 ﻿import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
-import type { LLMConfig, MCPToolDefinition, ModelResponse } from "./types.js";
+import type {
+  LLMConfig,
+  MCPToolDefinition,
+  ModelResponse,
+  ToolCallResult,
+} from "./types.js";
 import type { MCPTransport } from "./transport.js";
 
 // 输出格式约束：所有回答必须简洁、结论优先
@@ -14,17 +19,51 @@ const DEFAULT_SYSTEM_PROMPT = [
   "5. 不输出未来几天预报、预警区域细节或用户没问的建议。",
 ].join("\n");
 
+// general 场景：通用对话提示词，不套天气播报格式约束、不涉及题库、不调用工具
+export const GENERAL_SYSTEM_PROMPT = [
+  "你是通用对话助手，用简体中文回答用户的各类问题。",
+  "直接回答用户所问，简洁清楚，不要套用与问题无关的模板或格式。",
+  "不调用任何工具，仅凭自身知识作答；不确定时直接说明。",
+].join("\n");
+
+export type LocalToolHandler = (
+  args: Record<string, unknown>
+) => ToolCallResult | Promise<ToolCallResult>;
+
+export type ModelCaller = (
+  messages: any[],
+  tools: MCPToolDefinition[]
+) => Promise<ModelResponse>;
+
+// Agent 第 3 参 options：不传时保持 A001 行为；systemPrompt 传字符串兼容旧调用
+export interface AgentOptions {
+  systemPrompt?: string;
+  tools?: MCPToolDefinition[];
+  localTools?: Record<string, LocalToolHandler>;
+  /** 测试注入点：注入后 processQuery 直接调用，不注入走 callModel 现实现 */
+  modelCaller?: ModelCaller;
+}
+
 export class Agent {
   private transport: MCPTransport;
   private config: LLMConfig;
+  private options: AgentOptions;
   private systemPrompt: string;
   private anthropic: Anthropic | null = null;
   private openai: OpenAI | null = null;
 
-  constructor(transport: MCPTransport, config: LLMConfig, systemPrompt?: string) {
+  constructor(
+    transport: MCPTransport,
+    config: LLMConfig,
+    options?: AgentOptions | string
+  ) {
     this.transport = transport;
     this.config = config;
-    this.systemPrompt = systemPrompt || DEFAULT_SYSTEM_PROMPT;
+    this.options =
+      typeof options === "string" || options === undefined ? {} : options;
+    this.systemPrompt =
+      (typeof options === "string" ? options : options?.systemPrompt) ||
+      DEFAULT_SYSTEM_PROMPT;
 
     if (config.provider === "anthropic") {
       this.anthropic = new Anthropic({
@@ -71,7 +110,7 @@ export class Agent {
     return [];
   }
 
-  private async callModel(
+  protected async callModel(
     messages: any[],
     tools: MCPToolDefinition[]
   ): Promise<ModelResponse> {
@@ -156,6 +195,16 @@ export class Agent {
     return this.transport.listTools();
   }
 
+  private invokeModel(
+    messages: any[],
+    tools: MCPToolDefinition[]
+  ): Promise<ModelResponse> {
+    if (this.options.modelCaller) {
+      return this.options.modelCaller(messages, tools);
+    }
+    return this.callModel(messages, tools);
+  }
+
   async processQuery(query: string): Promise<string> {
     let messages: any[] = [
       {
@@ -168,9 +217,12 @@ export class Agent {
       },
     ];
 
-    const availableTools = await this.transport.listTools();
+    const availableTools =
+      this.options.tools !== undefined
+        ? this.options.tools
+        : await this.transport.listTools();
 
-    let currentResponse = await this.callModel(messages, availableTools);
+    let currentResponse = await this.invokeModel(messages, availableTools);
 
     while (true) {
       let hasToolUse = false;
@@ -184,7 +236,10 @@ export class Agent {
         const toolName = item.name!;
         const toolArgs = item.input!;
 
-        const result = await this.transport.callTool(toolName, toolArgs);
+        const localTool = this.options.localTools?.[toolName];
+        const result = localTool
+          ? await localTool(toolArgs)
+          : await this.transport.callTool(toolName, toolArgs);
 
         if (this.config.provider === "anthropic") {
           messages.push({
@@ -239,7 +294,7 @@ export class Agent {
         break;
       }
 
-      currentResponse = await this.callModel(messages, availableTools);
+      currentResponse = await this.invokeModel(messages, availableTools);
     }
 
     return currentResponse.content
@@ -249,4 +304,3 @@ export class Agent {
       .trim();
   }
 }
-

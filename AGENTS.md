@@ -8,7 +8,8 @@ src/
 ├── agent.ts       LLM 编排（callModel/processQuery）
 ├── server.ts      Express HTTP 层（路由、校验、队列）
 ├── index.ts       Web 服务入口
-└── cli.ts         CLI 入口
+├── cli.ts         CLI 入口
+└── test/          测试（按特性号分目录，如 test/feat-A002/）
 ```
 
 依赖方向：`index/cli → server → agent → transport`（无循环）
@@ -22,11 +23,13 @@ src/
 - 模块之间禁止循环依赖
 - LLM 配置在启动时从环境变量读取，不写在 agent 逻辑内部
 - Agent 通过接口依赖 transport，不依赖具体实现类
+- 测试文件放在 `src/test/<特性号>/`（如 `src/test/feat-A002/`），与被测模块分目录
 
 ## 脚本
 - `npm run build` — TypeScript 编译
 - `npm run web` — 启动 Web 服务（`node build/index.js`）
 - `npm start` — CLI 模式（`node build/cli.js`）
+- 运行测试 — `npm run build` 后 `node --test "build/test/<特性号>/*.test.js"`
 
 ## 开发流程（以 feat-A001 为例）
 
