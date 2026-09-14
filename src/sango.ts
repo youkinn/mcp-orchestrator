@@ -46,6 +46,17 @@ const ANSWER_COMMANDS = new Set(['答案', '这题选什么']);
 export const SANGO_NO_SESSION_PROMPT = '请先发送“随机一题”开始';
 export const SANGO_EMPTY_BANK_PROMPT = '题库为空，暂时无法出题';
 
+/** 知识问答 system prompt：LLM 负责理解问法与候选判定，答案只取题库原文 */
+export const SANGO_KNOWLEDGE_SYSTEM_PROMPT = [
+  '你是风云三国知识问答助手。',
+  '规则：',
+  '1. 收到用户提问后必须先调用 sango_query 工具（参数 text 传用户原始问题），取回候选题目。',
+  '2. 先理解用户问题的含义，再判断候选中哪条含义相同；问法不同但含义相同即算对应。',
+  '3. 判定出对应的题目后，只输出该题答案原文，不要输出题干、选项字母、解释或任何多余文字。',
+  '4. 候选中没有含义对应的题目时（包括只是字面相似、含义不同的），只回复「题库未收录该题，请换个问法」。',
+  '5. 禁止使用题库之外的知识作答、补充或改写答案。',
+].join('\n');
+
 /** 归一化：全角→半角、小写、去空白与标点 */
 export function normalize(text: string): string {
   return text
@@ -53,6 +64,22 @@ export function normalize(text: string): string {
     .toLowerCase()
     .replace(/\s+/g, '')
     .replace(/\p{P}/gu, '');
+}
+
+/** 知识问答召回条数上限：候选越多 token 越贵，8 条足够覆盖问法差异 */
+const DEFAULT_CANDIDATE_LIMIT = 8;
+
+/** 字符 bigram 集合（相邻二字组，无需分词依赖） */
+function bigrams(text: string): Set<string> {
+  const grams = new Set<string>();
+  if (text.length === 1) {
+    grams.add(text);
+    return grams;
+  }
+  for (let i = 0; i < text.length - 1; i++) {
+    grams.add(text.slice(i, i + 2));
+  }
+  return grams;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -134,25 +161,40 @@ export class SangoService {
   get questionCount(): number {
     return this.questions.length;
   }
-  /** 知识问答：归一化后精确优先，再包含兜底 */
-  search(text: string): SangoSearchHit | null {
+
+  /**
+   * 知识问答召回：按字符 bigram 重合度（Dice 系数）取 Top-K 候选。
+   * 只负责把候选捞出来，是否含义对应由 LLM 判定；无候选即未收录。
+   */
+  candidates(text: string, limit = DEFAULT_CANDIDATE_LIMIT): SangoSearchHit[] {
     const normalized = normalize(text);
     if (!normalized) {
-      return null;
+      return [];
     }
-    const exact = this.questions.find(
-      (question) => normalize(question.question) === normalized
-    );
-    if (exact) {
-      return { question: exact, answer: exact.answer };
-    }
-    const fuzzy = this.questions.find((question) =>
-      normalize(question.question).includes(normalized)
-    );
-    if (fuzzy) {
-      return { question: fuzzy, answer: fuzzy.answer };
-    }
-    return null;
+
+    const inputGrams = bigrams(normalized);
+
+    return this.questions
+      .map((question) => {
+        const questionGrams = bigrams(normalize(question.question));
+        let shared = 0;
+        for (const gram of inputGrams) {
+          if (questionGrams.has(gram)) {
+            shared += 1;
+          }
+        }
+        return {
+          question,
+          score: (2 * shared) / (inputGrams.size + questionGrams.size),
+        };
+      })
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => right.score - left.score)
+      .slice(0, limit)
+      .map((entry) => ({
+        question: entry.question,
+        answer: entry.question.answer,
+      }));
   }
 
   /** 随机一题（不标注答案） */

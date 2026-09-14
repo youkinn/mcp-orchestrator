@@ -10,6 +10,7 @@ import { MCPTransport } from './transport.js';
 import {
   SangoService,
   normalize,
+  SANGO_KNOWLEDGE_SYSTEM_PROMPT,
   SANGO_NO_SESSION_PROMPT,
   type SangoOptionKey,
   type SangoQuestion,
@@ -36,6 +37,25 @@ const LV_BU_QUESTION: SangoQuestion = {
 };
 
 const VALID_ENTRIES = [XIAHOU_DUN_QUESTION, LV_BU_QUESTION];
+
+const XIAHOU_YUAN_QUESTION: SangoQuestion = {
+  question: '夏侯渊的字是什么？',
+  options: { A: '元让', B: '妙才', C: '奉先', D: '仲达' },
+  answer: '妙才',
+};
+
+const LEBUSISHU_QUESTION: SangoQuestion = {
+  question: '“乐不思蜀”的典故指的是谁？',
+  options: { A: '刘禅', B: '刘备', C: '刘协', D: '刘封' },
+  answer: '刘禅',
+};
+
+/** 召回用例题库：含同类干扰题（夏侯惇/夏侯渊）与换问法目标题（乐不思蜀） */
+const CANDIDATE_ENTRIES = [
+  XIAHOU_DUN_QUESTION,
+  XIAHOU_YUAN_QUESTION,
+  LEBUSISHU_QUESTION,
+];
 
 const BAD_ENTRIES: unknown[] = [
   { question: '缺选项', options: { A: '甲', B: '乙' }, answer: '甲' },
@@ -81,7 +101,7 @@ test('load: 合法题加载，坏行跳过并告警，服务不挂', (t) => {
 
   assert.equal(service.questionCount, 2);
   assert.ok(warned.mock.calls.length >= BAD_ENTRIES.length);
-  assert.equal(service.search('夏侯惇的字是什么？')?.answer, '元让');
+  assert.equal(service.candidates('夏侯惇的字是什么？')[0]?.answer, '元让');
 });
 
 test('load: 题库文件缺失时为空题库并告警，不抛异常', (t) => {
@@ -117,15 +137,38 @@ test('normalize: 全角→半角、小写、去空白与标点', () => {
   assert.equal(normalize('这题选什么？'), '这题选什么');
   assert.equal(normalize('《孟德新书》'), '孟德新书');
 });
-test('search: 归一化精确优先，包含兜底，未命中返回 null', (t) => {
+
+test('candidates: 标点/空白不影响，原问法排第一', (t) => {
   const service = makeFixtureService(t);
 
-  assert.equal(service.search('夏侯惇的字是什么？')?.answer, '元让');
-  assert.equal(service.search(' 夏侯惇的字是什么 ')?.answer, '元让');
-  assert.equal(service.search('夏侯惇的字是什么？！')?.answer, '元让');
-  assert.equal(service.search('吕布的字')?.answer, '奉先');
-  assert.equal(service.search('完全不存在的问题'), null);
-  assert.equal(service.search(''), null);
+  assert.equal(service.candidates('夏侯惇的字是什么？')[0]?.answer, '元让');
+  assert.equal(service.candidates(' 夏侯惇的字是什么 ')[0]?.answer, '元让');
+  assert.equal(service.candidates('夏侯惇的字是什么？！')[0]?.answer, '元让');
+});
+
+test('candidates: 换问法可召回目标题，同类干扰题不串位', (t) => {
+  const file = writeQuestionFile(CANDIDATE_ENTRIES);
+  t.after(() => cleanupQuestionFile(file));
+  const service = new SangoService({ questionFile: file });
+
+  assert.equal(service.candidates('乐不思蜀说的是谁')[0]?.answer, '刘禅');
+  assert.equal(service.candidates('夏侯渊的字是什么？')[0]?.answer, '妙才');
+  assert.equal(service.candidates('夏侯的字是什么？')[0]?.answer, '元让');
+});
+
+test('candidates: 无关问法与空输入返回空，limit 生效', (t) => {
+  const service = makeFixtureService(t);
+
+  assert.deepEqual(service.candidates('完全不存在的问题'), []);
+  assert.deepEqual(service.candidates(''), []);
+  assert.equal(service.candidates('的字是什么', 1).length, 1);
+});
+
+test('SANGO_KNOWLEDGE_SYSTEM_PROMPT: 要求先调工具召回、再按含义判定、未命中不编造', () => {
+  assert.match(SANGO_KNOWLEDGE_SYSTEM_PROMPT, /sango_query/);
+  assert.match(SANGO_KNOWLEDGE_SYSTEM_PROMPT, /理解用户问题的含义/);
+  assert.match(SANGO_KNOWLEDGE_SYSTEM_PROMPT, /只输出该题答案原文/);
+  assert.match(SANGO_KNOWLEDGE_SYSTEM_PROMPT, /题库未收录该题，请换个问法/);
 });
 
 test('judge: 选项字母（半角/全角/大小写）判题', (t) => {
@@ -291,25 +334,37 @@ async function startChatServer(
     },
   });
 
+  const sangoService = makeFixtureService(t);
+
   const sangoKnowledge = new Agent(transport, config, {
-    systemPrompt: '你是风云三国知识问答助手',
+    systemPrompt: SANGO_KNOWLEDGE_SYSTEM_PROMPT,
     tools: [
       {
         name: 'sango_query',
-        description: '风云三国知识问答：查题库',
+        description: '风云三国知识问答：按用户原始问法召回候选题目（题干 → 答案）',
         inputSchema: {},
       },
     ],
     localTools: {
-      sango_query: async () => ({ content: [{ type: 'text', text: '命中' }] }),
+      sango_query: async (args: Record<string, unknown>) => {
+        const hits = sangoService.candidates(String(args.text ?? ''));
+        return {
+          content: [
+            {
+              type: 'text',
+              text: hits
+                .map((hit) => hit.question.question + ' → ' + hit.answer)
+                .join('\n'),
+            },
+          ],
+        };
+      },
     },
     modelCaller: async () => {
       seen.push('knowledge');
       return textResponse('knowledge 回复');
     },
   });
-
-  const sangoService = makeFixtureService(t);
   const app = createServer({ general, weather, sangoKnowledge }, sangoService, {
     port: 0,
     allowedOrigin: '*',
@@ -365,7 +420,7 @@ test('server: weather 场景走 weather Agent（MCP 工具链路）', async (t) 
   assert.deepEqual(seen, ['weather']);
 });
 
-test('server: sango+knowledge 场景走 sangoKnowledge Agent（本地题库工具）', async (t) => {
+test('server: sango+knowledge 场景走 sangoKnowledge Agent（本地召回 + LLM 判定）', async (t) => {
   const { baseUrl, seen } = await startChatServer(t);
 
   const res = await postChat(baseUrl, {

@@ -19,10 +19,6 @@ const DEFAULT_SYSTEM_PROMPT = [
   "5. 不输出未来几天预报、预警区域细节或用户没问的建议。",
 ].join("\n");
 
-// 风云三国知识问答模式 system prompt（feat-A002）：单行纯文本，结论优先
-export const SANGO_KNOWLEDGE_SYSTEM_PROMPT =
-  "你是风云三国知识问答助手；遇到用户问法必须调用 sango_query 工具（参数 text 传用户原始问题）；严格依据工具返回的题干与答案作答，只输出答案内容本身，禁止编造或补充；工具返回未命中（hit=false）时回复「题库未收录该题，请换个问法」。";
-
 export type LocalToolHandler = (
   args: Record<string, unknown>
 ) => ToolCallResult | Promise<ToolCallResult>;

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Agent, SANGO_KNOWLEDGE_SYSTEM_PROMPT } from "./agent.js";
+import { Agent } from "./agent.js";
 import { MCPTransport } from "./transport.js";
 import type {
   LLMConfig,
@@ -192,14 +192,6 @@ test("未命中本地工具时回退 transport.callTool（天气链路回归）"
   assert.equal(transport.callToolCalls.length, 1);
   assert.equal(transport.callToolCalls[0]!.name, "get_weather");
   assert.deepEqual(transport.callToolCalls[0]!.args, { city: "New York" });
-});
-
-test("SANGO_KNOWLEDGE_SYSTEM_PROMPT 已导出，含未收录提示与 sango_query 调用要求", () => {
-  assert.equal(typeof SANGO_KNOWLEDGE_SYSTEM_PROMPT, "string");
-  assert.ok(SANGO_KNOWLEDGE_SYSTEM_PROMPT.length > 0);
-  assert.match(SANGO_KNOWLEDGE_SYSTEM_PROMPT, /未收录/);
-  assert.match(SANGO_KNOWLEDGE_SYSTEM_PROMPT, /hit=false/);
-  assert.match(SANGO_KNOWLEDGE_SYSTEM_PROMPT, /sango_query/);
 });
 
 test("向后兼容：第 3 参字符串仍作为 systemPrompt；不传时保持默认提示", async () => {
