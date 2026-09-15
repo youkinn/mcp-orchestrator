@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 import { MCPTransport } from './transport.js';
-import { Agent, GENERAL_SYSTEM_PROMPT } from './agent.js';
-import { SANGO_KNOWLEDGE_SYSTEM_PROMPT, SangoService } from './sango.js';
+import { Agent, UNIFIED_SYSTEM_PROMPT } from './agent.js';
+import { SangoService } from './sango.js';
 import { createServer } from './server.js';
 import type { LLMProvider, MCPToolDefinition } from './types.js';
 
@@ -11,10 +11,11 @@ const port = Number(process.env.PORT || 3000);
 const serverScriptPath = process.argv[2] || process.env.MCP_SERVER_SCRIPT;
 const allowedOrigin = process.env.WEB_ORIGIN || 'http://localhost:8001';
 
-// 风云三国知识问答：本地题库召回工具（走 agent localTools，不经 MCP）
+// 本地题库工具：走 agent localTools，不经 MCP；描述限定适用域，供模型自主路由
 const SANGO_QUERY_TOOL: MCPToolDefinition = {
   name: 'sango_query',
-  description: '风云三国知识问答：按用户原始问法召回候选题目（题干 → 答案）',
+  description:
+    '风云三国题库检索：仅当用户询问风云三国游戏内招募武将问答题时调用；参数 text 传用户原始问法，返回候选题目（题干 → 答案）',
   inputSchema: {
     type: 'object',
     properties: { text: { type: 'string' } },
@@ -66,23 +67,19 @@ async function shutdown(signal: string, transport: MCPTransport) {
   await transport.close();
   process.exit(0);
 }
+
 async function main() {
   const transport = new MCPTransport(serverScriptPath!);
   await transport.connect();
 
   const llmConfig = readLLMConfig();
-
-  // 各场景独立 Agent：general 无工具；weather 连 MCP 工具；sango 知识问答=本地召回候选+LLM 语义判定
-  const generalAgent = new Agent(transport, llmConfig, {
-    systemPrompt: GENERAL_SYSTEM_PROMPT,
-    tools: [],
-  });
-  const weatherAgent = new Agent(transport, llmConfig);
-
   const sangoService = new SangoService();
-  const sangoKnowledgeAgent = new Agent(transport, llmConfig, {
-    systemPrompt: SANGO_KNOWLEDGE_SYSTEM_PROMPT,
-    tools: [SANGO_QUERY_TOOL],
+
+  // 统一 Agent：工具集 = MCP 工具 + 本地题库工具，调不调、调哪个由模型按语义自主决定
+  const mcpTools = await transport.listTools();
+  const agent = new Agent(transport, llmConfig, {
+    systemPrompt: UNIFIED_SYSTEM_PROMPT,
+    tools: [...mcpTools, SANGO_QUERY_TOOL],
     localTools: {
       sango_query: async (args: Record<string, unknown>) => {
         const text = typeof args.text === 'string' ? args.text : '';
@@ -106,15 +103,7 @@ async function main() {
     },
   });
 
-  const app = createServer(
-    {
-      general: generalAgent,
-      weather: weatherAgent,
-      sangoKnowledge: sangoKnowledgeAgent,
-    },
-    sangoService,
-    { port, allowedOrigin }
-  );
+  const app = createServer(agent, sangoService, { port, allowedOrigin });
 
   const server = app.listen(port, () => {
     console.log(`mcp-orchestrator Web API running at http://localhost:${port}`);

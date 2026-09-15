@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Agent } from "../../agent.js";
+import { Agent, UNIFIED_SYSTEM_PROMPT } from "../../agent.js";
 import { MCPTransport } from "../../transport.js";
 import type {
   LLMConfig,
@@ -194,7 +194,7 @@ test("未命中本地工具时回退 transport.callTool（天气链路回归）"
   assert.deepEqual(transport.callToolCalls[0]!.args, { city: "New York" });
 });
 
-test("向后兼容：第 3 参字符串仍作为 systemPrompt；不传时保持默认提示", async () => {
+test("向后兼容：第 3 参字符串仍作为 systemPrompt；不传时默认统一路由提示词", async () => {
   const transport = new MockTransport();
 
   const legacy = new RecordingAgent(transport, makeConfig(), "你是自定义助手");
@@ -203,5 +203,5 @@ test("向后兼容：第 3 参字符串仍作为 systemPrompt；不传时保持�
 
   const defaultAgent = new RecordingAgent(transport, makeConfig());
   await defaultAgent.processQuery("纽约天气？");
-  assert.match(defaultAgent.prompts[0], /地铁通勤天气助手/);
+  assert.equal(defaultAgent.prompts[0], UNIFIED_SYSTEM_PROMPT);
 });
