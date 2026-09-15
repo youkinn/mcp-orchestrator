@@ -5,14 +5,15 @@ import type { SangoService } from './sango.js';
 import { ToolExecutionError } from './types.js';
 
 const MAX_MESSAGE_LENGTH = 300;
-const CHAT_ALLOWED_KEYS = ['message'];
-const CHAT_ALLOWED_LABEL = 'message';
+const CHAT_ALLOWED_KEYS = ['message', 'domain'];
+const CHAT_ALLOWED_LABEL = 'message、domain';
 const RANDOM_ALLOWED_KEYS = ['message', 'sessionId'];
 const RANDOM_ALLOWED_LABEL = 'message、sessionId';
 
 interface ParsedBody {
   message: string;
   sessionId?: string;
+  domain?: string;
 }
 
 type BodyParseResult =
@@ -44,11 +45,17 @@ function parseBody(
     return { ok: false, code: 413, message: '消息不能超过 300 字符' };
   }
 
+  const rawDomain = body.domain;
+  if (rawDomain !== undefined && rawDomain !== "sango") {
+    return { ok: false, code: 400, message: "domain 字段仅支持 \"sango\"" };
+  }
+
   const session = body.sessionId;
   return {
     ok: true,
     value: {
       message: raw.trim(),
+      domain: rawDomain === "sango" ? "sango" : undefined,
       sessionId:
         typeof session === 'string' && session.trim()
           ? session.trim()
@@ -131,7 +138,7 @@ export function createServer(
       return;
     }
 
-    await enqueue(response, () => agent.processQuery(parsed.value.message));
+    await enqueue(response, () => agent.processQuery(parsed.value.message, parsed.value.domain));
   });
 
   app.post('/api/sango/random', async (request: Request, response: Response) => {

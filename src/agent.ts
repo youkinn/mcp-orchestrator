@@ -246,11 +246,16 @@ export class Agent {
     return this.callModel(messages, tools);
   }
 
-  async processQuery(query: string): Promise<string> {
+  async processQuery(query: string, domain?: string): Promise<string> {
+    const domainHint = "\n当前用户已明确选择了“风云三国题库”场景。用户接下来的提问应一律视为风云三国游戏内的招募武将问答题，必须先调用 sango_query 工具查询题库。";
+    const systemContent = domain === "sango"
+      ? this.systemPrompt + domainHint
+      : this.systemPrompt;
+
     let messages: any[] = [
       {
         role: "system",
-        content: this.systemPrompt,
+        content: systemContent,
       },
       {
         role: "user",
