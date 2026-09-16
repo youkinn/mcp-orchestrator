@@ -35,6 +35,6 @@ src/
 ## 脚本
 
 - `npm run build` — TypeScript 编译（`tsc`）。
-- `npm run web` — 启动 Web 服务（`node build/index.js`）。
+- `npm run dev` — 启动 Web 服务（先 `npm run build` 再 `node build/index.js`）。
 - `npm start` — CLI 模式（`node build/cli.js`）。
 - 测试：先 `npm run build`，再 `node --test "build/test/{特性号}/*.test.js"`。
