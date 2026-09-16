@@ -141,16 +141,59 @@ export function verifyCitation(
   return { ok: unverified.length === 0, unverified };
 }
 
-/** 兜底输出：不做归纳生成，只输出「原文片段 + 出处」并补一句结论归纳 */
+/** 从白话问句提取定位关键词（2~4 字连续子串，长度降序），用于在原文中定位检索词窗口 */
+function extractQueryKeys(query: string): string[] {
+  const cleaned = query.replace(/[^\u4e00-\u9fa5]/g, "");
+  const keys = new Set<string>();
+  for (let len = 4; len >= 2; len--) {
+    for (let i = 0; i + len <= cleaned.length; i++) {
+      keys.add(cleaned.slice(i, i + len));
+    }
+  }
+  return [...keys];
+}
+
+/** 截取「出处头 + 检索词附近窗口」：定位 query 关键词首次出现，前后各取 60 字；
+ * 找不到关键词时取正文开头 120 字。注入与兜底共用，避免整段全文刷屏。 */
+export function trimFragmentToWindow(
+  fragment: RecallFragment,
+  query: string
+): RecallFragment {
+  const m = fragment.text.match(/^(\【出处\】[^\n]*\n?)([\s\S]*)$/);
+  const header = m ? m[1] : "";
+  const body = m ? m[2] : fragment.text;
+  const WINDOW = 60;
+  const FALLBACK = 120;
+  let start = 0;
+  let end = Math.min(body.length, FALLBACK);
+  for (const key of extractQueryKeys(query)) {
+    const idx = body.indexOf(key);
+    if (idx >= 0) {
+      start = Math.max(0, idx - WINDOW);
+      end = Math.min(body.length, idx + key.length + WINDOW);
+      break;
+    }
+  }
+  return { text: header + body.slice(start, end), source: fragment.source };
+}
+
+/** 兜底输出：不做归纳生成，只输出最符合的一段（检索词附近窗口）+ 出处 + 一句结论 */
 export function buildFallback(
   fragments: RecallFragment[],
-  conclusion: string
+  conclusion: string,
+  query = ""
 ): string {
   const conclusionLine = conclusion.startsWith("按原文")
     ? conclusion
     : `按原文，${conclusion}`;
-  const blocks = fragments.map(
-    (fragment) => `${fragment.text}\n（出处：${fragment.source}）`
-  );
-  return ["【原文片段】", ...blocks, "", conclusionLine].join("\n");
+  if (fragments.length === 0) {
+    return conclusionLine;
+  }
+  const top = trimFragmentToWindow(fragments[0], query);
+  return [
+    "【原文片段】",
+    `${top.text}\n（出处：${top.source}）`,
+    "",
+    conclusionLine,
+  ].join("\n");
 }

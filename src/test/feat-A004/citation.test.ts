@@ -8,6 +8,7 @@ import {
   buildFallback,
   loadAliasTable,
   scanRecallPersonIds,
+  trimFragmentToWindow,
   verifyCitation,
 } from "../../citation.js";
 
@@ -113,4 +114,38 @@ test("⑪ 兜底输出格式：原文片段 + 出处 + 一句结论归纳", () =
 
 test("⑫ 检索无命中固定话术", () => {
   assert.equal(NOVEL_NO_HIT_ANSWER, "演义中未涉及");
+});
+test("⑬ trimFragmentToWindow：出处头保留 + 只取检索词附近窗口，不长篇大论", () => {
+  const filler = "先叙无关内容。".repeat(40); // 240 字无关前置
+  const key = "孙权遣人向关羽求亲，关羽怒曰“吾虎女安肯嫁犬子乎！”";
+  const tailText = "后叙无关内容。".repeat(40);
+  const fragment = {
+    text: `【出处】第73回 玄德进位汉中王 云长攻拔襄阳郡 · 段5（叙述）\n${filler}${key}${tailText}`,
+    source: "sanguo-yanyi",
+  };
+  const trimmed = trimFragmentToWindow(fragment, "孙权遣人向关羽求亲，关羽是怎么回复使者的");
+  assert.ok(trimmed.text.startsWith("【出处】第73回"), "出处头应保留");
+  assert.ok(trimmed.text.includes("求亲"), "窗口应包含检索词附近原文");
+  assert.ok(trimmed.text.length < fragment.text.length, "应截短原文，禁止整段全文刷屏");
+});
+
+test("⑭ buildFallback 只输出最符合的一段：多段召回不长篇大论", () => {
+  const out = buildFallback(
+    [
+      {
+        text: "【出处】第73回 玄德进位汉中王 云长攻拔襄阳郡 · 段5（叙述）\n孙权遣人向关羽求亲，关羽怒曰“吾虎女安肯嫁犬子乎！”",
+        source: "sanguo-yanyi",
+      },
+      {
+        text: "【出处】第82回 孙权降魏受九锡 先主征吴赏六军 · 段1（叙述）\n却说章武元年秋八月，先主起大军至夔关。",
+        source: "sanguo-yanyi",
+      },
+    ],
+    "关羽怒斥求亲使者",
+    "孙权遣人向关羽求亲，关羽是怎么回复使者的"
+  );
+  assert.match(out, /【原文片段】/);
+  assert.ok(out.includes("吾虎女安肯嫁犬子乎"), "应输出最符合一段的窗口");
+  assert.ok(!out.includes("章武元年"), "不应输出第二段全文");
+  assert.match(out, /按原文，关羽怒斥求亲使者/);
 });

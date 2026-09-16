@@ -14,6 +14,7 @@ import {
   buildFallback,
   loadAliasTable,
   scanRecallPersonIds,
+  trimFragmentToWindow,
   verifyCitation,
   type RecallFragment,
 } from "./citation.js";
@@ -305,7 +306,18 @@ export class Agent {
       typeof args.source === "string" && args.source.trim()
         ? args.source
         : "《三国演义》";
-    return texts.map((text) => ({ text, source }));
+    // 工具按相关度降序返回多段（每段以【出处】开头），拆成独立片段供「取最符合一段」与注入收窄
+    const fragments: RecallFragment[] = [];
+    for (const text of texts) {
+      const parts = text.split(/(?=\【出处\】第\d+回)/);
+      for (const part of parts) {
+        const trimmed = part.trim();
+        if (trimmed) {
+          fragments.push({ text: trimmed, source });
+        }
+      }
+    }
+    return fragments;
   }
 
   private getAliasTable(): Map<string, string> {
@@ -318,19 +330,27 @@ export class Agent {
     return this.aliasTable;
   }
 
-  private concludeFallback(fragments: RecallFragment[]): Promise<string> {
+  private concludeFallback(
+    fragments: RecallFragment[],
+    query: string
+  ): Promise<string> {
     if (this.options.fallbackConcluder) {
       return this.options.fallbackConcluder(fragments);
     }
-    return this.concludeFallbackViaModel(fragments);
+    return this.concludeFallbackViaModel(fragments, query);
   }
 
   private async concludeFallbackViaModel(
-    fragments: RecallFragment[]
+    fragments: RecallFragment[],
+    query: string
   ): Promise<string> {
-    const content = fragments
-      .map((fragment) => `${fragment.text}\n（出处：${fragment.source}）`)
-      .join("\n\n");
+    // 只取最符合的一段（检索词附近窗口），避免结论归纳被无关长文带偏
+    const top = fragments.length
+      ? trimFragmentToWindow(fragments[0], query)
+      : null;
+    const content = top
+      ? `${top.text}\n（出处：${top.source}）`
+      : "（无原文片段）";
     const response = await this.invokeModel(
       [
         { role: "system", content: CITATION_FALLBACK_CONCLUSION_PROMPT },
@@ -348,7 +368,8 @@ export class Agent {
   /** feat-A004：引用硬校验（本地别名表扫描，0 次 LLM）+ 固定格式；校验 / 格式不过 → 兜底 */
   private async applyNovelCitationGuard(
     answer: string,
-    fragments: RecallFragment[]
+    fragments: RecallFragment[],
+    query: string
   ): Promise<string> {
     if (fragments.length === 0) {
       return NOVEL_NO_HIT_ANSWER;
@@ -373,8 +394,8 @@ export class Agent {
     if (formatOk && check.ok) {
       return answer;
     }
-    const conclusion = await this.concludeFallback(fragments);
-    return buildFallback(fragments, conclusion);
+    const conclusion = await this.concludeFallback(fragments, query);
+    return buildFallback(fragments, conclusion, query);
   }
 
   async processQuery(query: string, domain?: string): Promise<string> {
@@ -408,8 +429,12 @@ export class Agent {
         ...fragments.filter((fragment) => !fragment.text.includes("未召回"))
       );
       novelSearched = true;
+      // 注入收窄：只取最符合的前 3 段，每段截为「出处头 + 检索词附近窗口」（LLM 输入 2500→~500 字）
       const injected = novelFragments.length
-        ? novelFragments.map((fragment) => fragment.text).join("\n\n")
+        ? novelFragments
+            .slice(0, 3)
+            .map((fragment) => trimFragmentToWindow(fragment, query).text)
+            .join("\n\n")
         : "（检索无命中）";
       userContent = `${query}\n\n【已检索到的《三国演义》原文片段，请直接依据它们作答，不要再调用 sango_novel_search】\n${injected}`;
       availableTools = availableTools.filter(
@@ -515,7 +540,7 @@ export class Agent {
       .trim();
 
     if (novelSearched) {
-      answer = await this.applyNovelCitationGuard(answer, novelFragments);
+      answer = await this.applyNovelCitationGuard(answer, novelFragments, query);
     }
 
     return answer;

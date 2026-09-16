@@ -249,3 +249,33 @@ test("⑤ 默认链路（本地别名表扫描 + 兜底结论）：校验不过�
   assert.match(answer, /按原文，斩华雄者系关羽/);
   assert.equal(callIndex, 3, "主问答 + 兜底结论共 3 次模型调用（无提取/NER）");
 });
+test("⑥ 快路径注入收窄：只取最符合前 3 段且每段窗口截断（不整段刷屏）", async () => {
+  let capturedUser = "";
+  const filler = "先叙无关内容。".repeat(40);
+  const key = "孙权遣人向关羽求亲，关羽怒曰“吾虎女安肯嫁犬子乎！”";
+  const tailText = "后叙无关内容。".repeat(40);
+  // 4 段召回（按相关度降序）：第一段命中关键词、其余为无关长段
+  const multiText = [
+    "【出处】第73回 玄德进位汉中王 云长攻拔襄阳郡 · 段5（叙述）\n" + filler + key + tailText,
+    "【出处】第1回 宴桃园豪杰三结义 斩黄巾英雄首立功 · 段1（叙述）\n" + "桃园结义无关内容。".repeat(40),
+    "【出处】第5回 发矫诏诸镇应曹公 破关兵三英战吕布 · 段4（叙述）\n" + "三英战吕布无关内容。".repeat(40),
+    "【出处】第82回 孙权降魏受九锡 先主征吴赏六军 · 段1（叙述）\n" + "章武元年无关内容。".repeat(40),
+  ].join("\n\n");
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    capturedUser = messages.find((m) => m.role === "user")?.content ?? "";
+    return textResponse("斩华雄者系关羽。");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: multiText }],
+      }),
+    },
+    modelCaller,
+  });
+  await agent.processQuery("孙权遣人向关羽求亲，关羽是怎么回复使者的", "sango-novel");
+  assert.ok(capturedUser.includes("求亲"), "注入应含最符合段的关键句");
+  assert.ok(!capturedUser.includes("章武元年"), "注入只取前 3 段，不应含第 4 段");
+  assert.ok(!capturedUser.includes("桃园结义无关内容。".repeat(40)), "每段应被窗口截断，不整段注入");
+});
