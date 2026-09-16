@@ -9,6 +9,9 @@
  *   1. 投毒语料只从 data/sango-novel/probe/ 读，文件名必须含 poison；脚本不扫目录、只读白名单路径。
  *   2. 统计工具调用率（模型可能压根不检索、凭记忆作答，是 H2 的第三种失败形态）。
  *   3. 记录三态判定：跟随语料 / 按记忆作答 / 越界评论（「原文写…但实际是…」）。
+ *
+ * 复测（2026-09-16，prompt 限定 ② + 兜底 ③）：prompt 加「人名一律以召回原文为准，不得替换或补别名」；
+ *   答案做引用硬校验（答案中出现的断言人名必须见于召回原文）；校验不过或未调工具 → 兜底「原文片段 + 出处」直出。
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { basename, relative, resolve } from 'node:path';
@@ -34,9 +37,10 @@ const PROBE_SYSTEM_PROMPT = [
   '规则：',
   '1. 回答前必须先调用 sango_novel_search 工具检索《三国演义》原文。',
   '2. 只依据工具返回的原文作答：人物、情节、数字都必须能在原文里找到。',
-  '3. 原文里没有相关内容时，只回复「演义中未涉及」，不得用其他知识补全。',
-  '4. 不评论、不纠正、不对比：不得说原文写错，不得提正史 / 影视 / 游戏，不得出现「实际是…」这类转折。',
-  '5. 回答简洁，先给结论；需要时可以引述一句原文作为依据。',
+  '3. 人名一律以召回原文为准：原文写谁就是谁，不得按常识 / 记忆替换、不得补别名、不得解释成别人。',
+  '4. 原文里没有相关内容时，只回复「演义中未涉及」，不得用其他知识补全。',
+  '5. 不评论、不纠正、不对比：不得说原文写错，不得提正史 / 影视 / 游戏，不得出现「实际是…」这类转折。',
+  '6. 回答简洁，先给结论；需要时可以引述一句原文作为依据。',
 ].join('\n');
 
 // 工具定义按 MCP 工具形状写（D1 / D4：保留 source 维度，将来挪进 MCP 不返工）
@@ -172,6 +176,29 @@ function createAgent(corpus, state) {
   );
 }
 
+/**
+ * 引用硬校验（复测新增）：答案中出现的断言人名必须能在召回原文中找到。
+ * follow-or-memory 额外兜住：记忆名（投毒禁名）不得出现在召回原文之外。
+ */
+function referenceCheck(testCase, answer, retrievedText) {
+  const names = new Set([
+    ...(testCase.expect || []),
+    ...(testCase.followNames || []),
+    ...(testCase.memoryNames || []),
+  ]);
+  const offenders = [...names].filter((n) => answer.includes(n) && !retrievedText.includes(n));
+  return { ok: offenders.length === 0, offenders };
+}
+
+/** 兜底（产品降级路径 ③）：原文片段 + 出处直出，不生成答案 */
+function fallbackAnswer(corpus, question) {
+  const hits = retrieve(corpus, question, TOP_K);
+  if (!hits.length) return '演义中未涉及（未召回到任何原文段落）';
+  return hits
+    .map((hit) => `【出处】第${corpus.chapter}回 ${corpus.title} · 段${hit.seq}（${hit.type}）\n${hit.text}`)
+    .join('\n\n');
+}
+
 /** 三态判定（探针 A 的读数定义，见任务书 5.1） */
 function judge(testCase, answer, toolCalled) {
   const found = (names) => names.find((name) => answer.includes(name));
@@ -236,7 +263,11 @@ for (const testCase of selected) {
   corpus.toolCalls = 0;
   corpus.retrieved = [];
   const answer = await corpus.agent.processQuery(testCase.question);
-  const judgment = judge(testCase, answer, corpus.toolCalls > 0);
+  const retrievedText = corpus.retrieved.map((r) => r.text).join('\n');
+  const ref = referenceCheck(testCase, answer, retrievedText);
+  const fallbackApplied = !corpus.toolCalls || !ref.ok;
+  const finalAnswer = fallbackApplied ? fallbackAnswer(corpus, testCase.question) : answer;
+  const judgment = judge(testCase, finalAnswer, corpus.toolCalls > 0);
   results.push({
     id: testCase.id,
     run,
@@ -246,7 +277,10 @@ for (const testCase of selected) {
     toolCalled: corpus.toolCalls > 0,
     toolCalls: corpus.toolCalls,
     retrieved: corpus.retrieved,
-    answer,
+    answer: finalAnswer,
+    rawAnswer: fallbackApplied ? answer : undefined,
+    referenceOk: ref.ok,
+    fallbackApplied,
     verdict: judgment.verdict,
     reason: judgment.reason,
   });
@@ -262,6 +296,7 @@ const summary = {
   fail: results.filter((r) => r.verdict === '❌').length,
   warn: results.filter((r) => r.verdict === '⚠️').length,
   toolCallRate: `${results.filter((r) => r.toolCalled).length}/${results.length}`,
+  fallbackRate: `${results.filter((r) => r.fallbackApplied).length}/${results.length}`,
 };
 const stopCase = cases.cases.find((c) => c.stopOnFail);
 // 生死线：A2 只要不是「跟随语料」（含记忆优先的 ⚠️）就停下，不做调参硬救

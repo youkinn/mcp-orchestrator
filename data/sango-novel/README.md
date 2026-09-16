@@ -29,7 +29,9 @@ npm run build && node scripts/probe/h2-faithfulness.mjs        # 跑探针 A，�
 - 来源：负责人提供的 `三国演义.txt`（毛本 120 回），存本于 `source/sanguo-yanyi-maoben.txt`。
 - 现状：正文为现代通行标点，原始排印本 / 点校本出处未核实 → **正式上线前需确认底本版权口径**。
 - 探针阶段结论不受影响（只验忠实度，不发布语料）。
-## 探针 A 结论（2026-09-16）
+## 探针 A 结论（2026-09-16 复测）
 
-**H2 未通过**（投毒第五回问「斩华雄的是谁」，6/6 未跟随语料，工具调用率 6/6）→ 停 T3。
-数据与三态拆解见 `dev-docs/docs/sango-classics-rag-research.md` 第 12 节；原始结果见 `probe/h2-results*.json`。
+**H2 通过（鲁棒性口径）**：走 prompt 限定 ② + 兜底 ③ 复测——prompt 加「人名一律以召回原文为准，不得替换或补别名」+ 引用硬校验 + 兜底原文直出。
+A2 投毒 4/4 跟随语料（答「张三」，不再答「关羽」；其中 1 次由兜底兜住），A3 负样本仍答「演义中未涉及」，工具调用率 7/7。
+首次实跑（2026-09-15）H2 未通过（6/6 答关羽）→ 停 T3；处置拍板（prompt 限定，鲁棒性口径）与三态拆解见 `dev-docs/docs/sango-classics-rag-research.md` 第 12 节。
+证据：`probe/h2-results-retest.json`（A1/A2/A3）、`probe/h2-results-retest-a2.json`（A2×3）、基线存证 `probe/h2-results.json`。
