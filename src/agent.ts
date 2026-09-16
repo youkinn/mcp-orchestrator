@@ -79,7 +79,97 @@ export const UNIFIED_SYSTEM_PROMPT = [
 
 // feat-A004：引用硬校验的兜底结论归纳提示词（校验 / 格式不过时调用）
 const CITATION_FALLBACK_CONCLUSION_PROMPT =
-  "根据给定的《三国演义》原文片段，用一句话归纳结论，以「按原文，」开头；只依据片段内容作答，不得补充片段之外的信息，不得评价、纠正、对比原文。引用的原文片段长度以10字内为佳，最长不得超过20汉字。";
+  "根据给定的《三国演义》原文片段，用一句话归纳结论，以「按原文，」开头；结论必须先回答用户问题的主体（例如用户问“谁”，就要写出对应人物），再写事件，禁止只复述事件。如果用户只是问名字，只回答名字即可。只依据片段内容作答，不得补充片段之外的信息，不得评价、纠正、对比原文。引用的原文片段长度以10字内为佳，最长不得超过20汉字。";
+
+/** 路由目标（docs/sango-mcp-routing-design.md §二）：决定系统提示词、可见工具与是否走域内快路径 */
+export type RouteTarget = "weather" | "sango" | "sango-novel" | "auto";
+
+/** 最终路由决策：auto 表示继续走统一 Agent；irrelevant 表示无关问题，直接短路 */
+export type RouteDecision = RouteTarget | "irrelevant";
+
+/** L3 向量匹配注入点：只做风云三国高置信正向识别，命中返回 sango */
+export type SangoVectorMatcher = (
+  query: string
+) =>
+  | boolean
+  | "sango"
+  | null
+  | Promise<boolean | "sango" | null>;
+
+/** L4 轻量路由注入点：前三层未命中时，由调用方提供四分类结果 */
+export type RouteClassifier = (
+  query: string
+) => RouteDecision | Promise<RouteDecision>;
+
+/** L4 轻量路由提示词（docs/sango-mcp-routing-design.md §二 第四层）：只输出数字编号 */
+export const ROUTE_CLASSIFIER_PROMPT = [
+  "你是路由助手，请判断用户问题属于哪个类别，只返回数字编号：",
+  "1: 天气查询",
+  "2: 风云三国游戏问答",
+  "3: 三国演义原著问答",
+  "4: 以上都不是 / 无关问题",
+  "",
+  "用户问题：{{用户问题}}",
+  "输出：",
+].join("\n");
+
+/** L4 判为无关问题时直接返回的引导话术，不调用任何 MCP 或 LLM 生成答案 */
+export const IRRELEVANT_ROUTE_RESPONSE =
+  "我是统一对话助手，目前可以帮你：美国天气播报、风云三国题库问答、《三国演义》原著检索。请直接问相关问题。";
+
+/** 本地题库工具名（index.ts 装配同名 localTool）：sango 域快路径预调它，不经模型决策 */
+export const SANGO_QUERY_TOOL = "sango_query";
+
+/** L1 前端标签 → 域：domain 取值与 server.ts 白名单同源，命中即跳过后续所有路由判断 */
+const DOMAIN_ROUTES: Record<string, RouteTarget> = {
+  weather: "weather",
+  sango: "sango",
+  "sango-novel": "sango-novel",
+};
+
+// L2 本地关键词硬匹配（文档 §二 第二层）：命中任意专属关键词即路由到对应域
+const SANGO_KEYWORDS = ["风云三国", "MOD", "骑砍", "招募", "答题", "好感度"];
+const NOVEL_KEYWORDS = [
+  "官职",
+  "生卒年",
+  "原著",
+  "章节",
+  "第几回",
+  "原文",
+  "生平",
+  "演义",
+  "三国时期",
+  "罗贯中",
+];
+const WEATHER_KEYWORDS = [
+  "天气",
+  "气温",
+  "下雨",
+  "下雪",
+  "湿度",
+  "风力",
+  "晴天",
+  "阴天",
+  "温度",
+  "降雨",
+  "雷暴",
+  "大风",
+  "出门",
+  "游玩",
+  "旅游",
+  "美国",
+];
+
+// 重叠题校正（文档 §二 第三层 4）：字 / 籍贯 在题库与文史两域都高频出现，命中后不直接路由
+const AMBIGUOUS_KEYWORDS = ["字", "籍贯"];
+
+/** 域提示：命中域后追加在统一提示词之后（域内工具已预调并注入结果，模型不再自行调工具） */
+const ROUTE_HINTS: Record<string, string> = {
+  sango:
+    "\n当前提问属于“风云三国题库”场景（题库域硬锁）。系统已预先调用 sango_query 检索题库，候选题目附在问题下方【已检索到的题库候选】中；请直接依据候选作答，不要再调用 sango_query：候选中含义相同的那道题只输出该题答案原文，候选为「未召回到任何候选题目」时只回复「题库未收录该题，请换个问法」。",
+  "sango-novel":
+    "\n当前用户已明确选择了“三国演义原著解读”场景。系统已预先调用 sango_novel_search（source=sanguo-yanyi）检索《三国演义》原文并附在问题下方【已检索到的《三国演义》原文片段】中；请直接依据这些片段作答，不要再调用 sango_novel_search。\n1. 先给出一句结论，结论必须直接回答用户问题的主体。例如用户问“谁温酒斩华雄”，结论应写「关羽温酒斩华雄」；不能只写「酒尚温时斩华雄」。人名用原文中的称呼，关羽、云长、关公均可。\n2. 结论后写一条「引用的原文」，格式为`「原文短句」（出处：第X回 回目）`，出处只到回目，不写段落编号。\n3. 只依据片段作答；片段中确实没有相关内容时才回复「演义中未涉及」。\n4. 正常回答不要以「按原文，」开头，禁止输出解释、总结或格式以外的内容。若提问明显不属于原著检索（如问候、天气等），按普通对话处理。",
+};
 
 export type LocalToolHandler = (
   args: Record<string, unknown>
@@ -100,6 +190,10 @@ export interface AgentOptions {
   /** feat-A004 引用硬校验注入点（测试用）；不注入使用默认实现（本地别名表扫描 + LLM 结论归纳） */
   aliasTable?: Map<string, string>;
   fallbackConcluder?: (fragments: RecallFragment[]) => Promise<string>;
+  /** L3 向量匹配注入点；命中 sango 后走题库快路径 */
+  sangoVectorMatcher?: SangoVectorMatcher;
+  /** L4 轻量路由注入点；不注入则保持统一 Agent 语义自主决策 */
+  routeClassifier?: RouteClassifier;
 }
 
 export class Agent {
@@ -276,6 +370,15 @@ export class Agent {
       : await this.callTransportTool(SANGO_NOVEL_SEARCH_TOOL, args);
   }
 
+  /** sango 域快路径：直接调本地题库工具（不经模型决策）；测试可用 localTools 注入 */
+  private async searchSangoQuestions(query: string): Promise<ToolCallResult> {
+    const args = { text: query };
+    const localTool = this.options.localTools?.[SANGO_QUERY_TOOL];
+    return localTool
+      ? await localTool(args)
+      : await this.callTransportTool(SANGO_QUERY_TOOL, args);
+  }
+
   private invokeModel(
     messages: any[],
     tools: MCPToolDefinition[]
@@ -286,12 +389,9 @@ export class Agent {
     return this.callModel(messages, tools);
   }
 
-  /** feat-A004：sango_novel_search 返回文本 → 召回原文片段（无文本视为无命中） */
-  private collectRecallFragments(
-    result: ToolCallResult,
-    args: Record<string, unknown>
-  ): RecallFragment[] {
-    const texts = result.content
+  /** 工具返回的纯文本片段（空文本不计入） */
+  private collectTexts(result: ToolCallResult): string[] {
+    return result.content
       .filter(
         (item) =>
           item.type === "text" &&
@@ -299,6 +399,14 @@ export class Agent {
           item.text.trim().length > 0
       )
       .map((item) => item.text!.trim());
+  }
+
+  /** feat-A004：sango_novel_search 返回文本 → 召回原文片段（无文本视为无命中） */
+  private collectRecallFragments(
+    result: ToolCallResult,
+    args: Record<string, unknown>
+  ): RecallFragment[] {
+    const texts = this.collectTexts(result);
     if (texts.length === 0) {
       return [];
     }
@@ -348,9 +456,10 @@ export class Agent {
     const top = fragments.length
       ? trimFragmentToWindow(fragments[0], query)
       : null;
-    const content = top
+    const fragmentText = top
       ? `${top.text}\n（出处：${top.source}）`
       : "（无原文片段）";
+    const content = `用户问题：${query}\n\n${fragmentText}`;
     const response = await this.invokeModel(
       [
         { role: "system", content: CITATION_FALLBACK_CONCLUSION_PROMPT },
@@ -384,7 +493,7 @@ export class Agent {
     );
     // 软性域：问候 / 天气等非原著问句（无别名人物、无出处标记）不套用原著检索格式
     const isNovelAnswer =
-      assertedIds.size > 0 || /（出处：第\d+回/.test(answer);
+      assertedIds.size > 0 || /（出处：第\d+回/.test(answer) || /按原文，/.test(answer);
     if (!isNovelAnswer) {
       return answer;
     }
@@ -398,27 +507,129 @@ export class Agent {
     return buildFallback(fragments, conclusion, query);
   }
 
+  /**
+   * 路由判定（零 LLM）：L1 前端标签 → L2 本地关键词硬匹配。
+   * 返回 "auto" 表示前两层未命中，交统一 Agent 按语义自主决策（即 L3 向量 / L4 大模型兜底的现有承载）。
+   */
+  resolveRoute(query: string, domain?: string): RouteTarget {
+    if (domain && DOMAIN_ROUTES[domain]) {
+      return DOMAIN_ROUTES[domain];
+    }
+    const lowered = query.toLowerCase();
+    const hit = (keywords: string[]) =>
+      keywords.some((keyword) => lowered.includes(keyword.toLowerCase()));
+    if (hit(SANGO_KEYWORDS)) {
+      return "sango";
+    }
+    // 重叠题校正：字 / 籍贯 两个域都高频出现，不直接路由文史域，交 L3 / L4 判定
+    if (hit(AMBIGUOUS_KEYWORDS)) {
+      return "auto";
+    }
+    if (hit(NOVEL_KEYWORDS)) {
+      return "sango-novel";
+    }
+    if (hit(WEATHER_KEYWORDS)) {
+      return "weather";
+    }
+    return "auto";
+  }
+
+  /**
+   * 四层路由收口：L1 标签 → L2 关键词 → L3 向量匹配 → L4 轻量分类。
+   * 默认不注入 L3 / L4 时，auto 沿用统一 Agent 自主决策，保证向后兼容。
+   */
+  private async resolveFinalRoute(
+    query: string,
+    domain?: string
+  ): Promise<RouteDecision> {
+    const route = this.resolveRoute(query, domain);
+    if (route !== "auto") {
+      return route;
+    }
+
+    const sangoHit = await this.options.sangoVectorMatcher?.(query);
+    if (sangoHit === true || sangoHit === "sango") {
+      return "sango";
+    }
+
+    if (this.options.routeClassifier) {
+      const decision = await this.options.routeClassifier(query);
+      if (
+        decision === "weather" ||
+        decision === "sango" ||
+        decision === "sango-novel" ||
+        decision === "auto" ||
+        decision === "irrelevant"
+      ) {
+        return decision;
+      }
+    }
+
+    // 默认 L4：生产路径（未注入测试 modelCaller / 分类器）由轻量路由模型兜底；
+    // 测试注入 modelCaller 时保持统一 Agent 现状，避免路由与生成脚本串扰。
+    if (
+      !this.options.modelCaller &&
+      this.systemPrompt === UNIFIED_SYSTEM_PROMPT
+    ) {
+      return this.classifyRouteViaModel(query);
+    }
+
+    return "auto";
+  }
+
+  /** L4 默认实现：四分类轻量模型，只解析数字编号；解析失败回退 auto */
+  private async classifyRouteViaModel(query: string): Promise<RouteDecision> {
+    const prompt = ROUTE_CLASSIFIER_PROMPT.replace("{{用户问题}}", query);
+    const response = await this.invokeModel(
+      [{ role: "user", content: prompt }],
+      []
+    );
+    const text = response.content
+      .filter((item) => item.type === "text")
+      .map((item) => item.text ?? "")
+      .join("\n")
+      .trim();
+    const digit = text.match(/[1-4]/)?.[0];
+    if (digit === "1") {
+      return "weather";
+    }
+    if (digit === "2") {
+      return "sango";
+    }
+    if (digit === "3") {
+      return "sango-novel";
+    }
+    if (digit === "4") {
+      return "irrelevant";
+    }
+    return "auto";
+  }
+
+  /**
+   * 处理提问：先做四层路由判定（L1 标签 → L2 关键词 → L3 向量 → L4 轻量分类），
+   * 命中 sango / sango-novel 走域内快路径；L4 判为无关问题直接返回引导话术；
+   * 未注入 L3 / L4 时 auto 保持统一 Agent 语义自主决策。
+   */
   async processQuery(query: string, domain?: string): Promise<string> {
-    // feat-A004 域提示：sango=风云三国题库（硬锁），sango-novel=三国演义原著解读（软性，不拦截非原著问句）
-    const domainHints: Record<string, string> = {
-      sango: "\n当前用户已明确选择了“风云三国题库”场景。用户接下来的提问应一律视为风云三国游戏内的招募武将问答题，必须先调用 sango_query 工具查询题库。",
-      "sango-novel": "\n当前用户已明确选择了“三国演义原著解读”场景。系统已预先调用 sango_novel_search（source=sanguo-yanyi）检索《三国演义》原文并附在问题下方【已检索到的《三国演义》原文片段】中；请直接依据这些片段作答，不要再调用 sango_novel_search，并按能力三第 6 条固定格式输出：第一行只写一句结论，随后每条「引用的原文」（出处：第X回 回目），禁止输出解释、总结或格式以外的内容。若提问明显不属于原著检索（如问候、天气等），按普通对话处理。",
-    };
-    const systemContent =
-      domain && domainHints[domain]
-        ? this.systemPrompt + domainHints[domain]
-        : this.systemPrompt;
+    const route = await this.resolveFinalRoute(query, domain);
+    if (route === "irrelevant") {
+      return IRRELEVANT_ROUTE_RESPONSE;
+    }
+    const domainHint = ROUTE_HINTS[route];
+    const systemContent = domainHint
+      ? domainHint
+      : this.systemPrompt;
 
     let availableTools =
       this.options.tools ?? (await this.transport.listTools());
 
-    // feat-A004 快路径（domain=sango-novel）：预先检索并注入原文片段 → 单次 LLM 生成，
-    // 避免 agent 多轮 tool-use 的 2+ 次串行 LLM 调用（响应 5~10s → 1~2s）
-    const novelFastPath = domain === "sango-novel";
+    // 快路径：路由目标已确定（L1/L2/L3/L4 命中 sango / sango-novel）；
+    // weather / auto 保持统一 Agent 现状，由模型按语义调度。
     let novelSearched = false;
     const novelFragments: RecallFragment[] = [];
     let userContent = query;
-    if (novelFastPath) {
+
+    if (route === "sango-novel") {
       const result = await this.searchNovel(query);
       const fragments = this.collectRecallFragments(result, {
         source: "sanguo-yanyi",
@@ -432,13 +643,20 @@ export class Agent {
       // 注入收窄：只取最符合的前 3 段，每段截为「出处头 + 检索词附近窗口」（LLM 输入 2500→~500 字）
       const injected = novelFragments.length
         ? novelFragments
-            .slice(0, 3)
-            .map((fragment) => trimFragmentToWindow(fragment, query).text)
-            .join("\n\n")
+          .slice(0, 3)
+          .map((fragment) => trimFragmentToWindow(fragment, query).text)
+          .join("\n\n")
         : "（检索无命中）";
       userContent = `${query}\n\n【已检索到的《三国演义》原文片段，请直接依据它们作答，不要再调用 sango_novel_search】\n${injected}`;
       availableTools = availableTools.filter(
         (tool) => tool.name !== SANGO_NOVEL_SEARCH_TOOL
+      );
+    } else if (route === "sango") {
+      const result = await this.searchSangoQuestions(query);
+      const candidates = this.collectTexts(result).join("\n");
+      userContent = `${query}\n\n【已检索到的题库候选，请直接依据它们作答，不要再调用 sango_query】\n${candidates || "（未召回到任何候选题目）"}`;
+      availableTools = availableTools.filter(
+        (tool) => tool.name !== SANGO_QUERY_TOOL
       );
     }
 

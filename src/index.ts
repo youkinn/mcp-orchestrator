@@ -106,6 +106,9 @@ async function main() {
         };
       },
     },
+    // L3：无 domain 且 L2 未命中时，先做题库向量高置信识别，命中直接走 sango 快路径
+    sangoVectorMatcher: (query) =>
+      Promise.resolve(sangoService.isHighConfidenceSangoQuery(query)),
   });
 
   const app = createServer(agent, sangoService, { port, allowedOrigin });

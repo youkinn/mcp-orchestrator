@@ -153,7 +153,7 @@ function extractQueryKeys(query: string): string[] {
   return [...keys];
 }
 
-/** 截取「出处头 + 检索词附近窗口」：定位 query 关键词首次出现，前后各取 60 字；
+/** 截取「出处头 + 检索词附近窗口」：定位 query 关键词最后一次出现，前后各取 60 字；
  * 找不到关键词时取正文开头 120 字。注入与兜底共用，避免整段全文刷屏。 */
 export function trimFragmentToWindow(
   fragment: RecallFragment,
@@ -167,7 +167,12 @@ export function trimFragmentToWindow(
   let start = 0;
   let end = Math.min(body.length, FALLBACK);
   for (const key of extractQueryKeys(query)) {
-    const idx = body.indexOf(key);
+    let idx = -1;
+    let cursor = body.indexOf(key);
+    while (cursor >= 0) {
+      idx = cursor;
+      cursor = body.indexOf(key, cursor + key.length);
+    }
     if (idx >= 0) {
       start = Math.max(0, idx - WINDOW);
       end = Math.min(body.length, idx + key.length + WINDOW);
