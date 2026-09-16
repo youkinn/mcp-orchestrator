@@ -1,5 +1,9 @@
-import dotenv from 'dotenv';
-import { MCPTransport } from './transport.js';
+﻿import dotenv from 'dotenv';
+import {
+  MCPTransport,
+  resolveMCPServerConfigs,
+  WEATHER_SERVER_NAME,
+} from './transport.js';
 import { Agent, UNIFIED_SYSTEM_PROMPT } from './agent.js';
 import { SangoService } from './sango.js';
 import { createServer } from './server.js';
@@ -8,7 +12,6 @@ import type { LLMProvider, MCPToolDefinition } from './types.js';
 dotenv.config();
 
 const port = Number(process.env.PORT || 3000);
-const serverScriptPath = process.argv[2] || process.env.MCP_SERVER_SCRIPT;
 const allowedOrigin = process.env.WEB_ORIGIN || 'http://localhost:8001';
 
 // 本地题库工具：走 agent localTools，不经 MCP；描述限定适用域，供模型自主路由
@@ -22,9 +25,11 @@ const SANGO_QUERY_TOOL: MCPToolDefinition = {
   },
 };
 
-if (!serverScriptPath) {
+// 多 server 注册表：weather 必需（兼容旧 MCP_SERVER_SCRIPT / argv[2]），sango 可缺配
+const mcpServerConfigs = resolveMCPServerConfigs(process.env, process.argv);
+if (!mcpServerConfigs.some((config) => config.name === WEATHER_SERVER_NAME)) {
   console.error(
-    'Missing MCP Server path. Use npm run web -- <server.js path> or set MCP_SERVER_SCRIPT.'
+    'Missing MCP weather server path. Use npm run web -- <server.js path> or set MCP_WEATHER_SCRIPT (sango optional via MCP_SANGO_SCRIPT).'
   );
   process.exit(1);
 }
@@ -69,13 +74,13 @@ async function shutdown(signal: string, transport: MCPTransport) {
 }
 
 async function main() {
-  const transport = new MCPTransport(serverScriptPath!);
+  const transport = new MCPTransport(mcpServerConfigs);
   await transport.connect();
 
   const llmConfig = readLLMConfig();
   const sangoService = new SangoService();
 
-  // 统一 Agent：工具集 = MCP 工具 + 本地题库工具，调不调、调哪个由模型按语义自主决定
+  // 统一 Agent：工具集 = MCP 工具（合并 weather + sango）+ 本地题库工具；调不调、调哪个由模型按语义自主决定
   const mcpTools = await transport.listTools();
   const agent = new Agent(transport, llmConfig, {
     systemPrompt: UNIFIED_SYSTEM_PROMPT,

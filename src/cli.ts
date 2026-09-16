@@ -1,13 +1,20 @@
 ﻿import dotenv from "dotenv";
 import * as readline from "node:readline";
-import { MCPTransport } from "./transport.js";
+import {
+  MCPTransport,
+  resolveMCPServerConfigs,
+  WEATHER_SERVER_NAME,
+} from "./transport.js";
 import { Agent } from "./agent.js";
 import type { LLMProvider } from "./types.js";
 
 dotenv.config();
 
-if (process.argv.length < 3) {
-  console.log("Usage: node build/cli.js <server-script-path>");
+const mcpServerConfigs = resolveMCPServerConfigs(process.env, process.argv);
+if (!mcpServerConfigs.some((config) => config.name === WEATHER_SERVER_NAME)) {
+  console.log(
+    "Usage: node build/cli.js <server-script-path> or set MCP_WEATHER_SCRIPT (sango optional via MCP_SANGO_SCRIPT)."
+  );
   process.exit(1);
 }
 
@@ -45,7 +52,7 @@ function readLLMConfig() {
 }
 
 async function main() {
-  const transport = new MCPTransport(process.argv[2]);
+  const transport = new MCPTransport(mcpServerConfigs);
   await transport.connect();
 
   const llmConfig = readLLMConfig();
