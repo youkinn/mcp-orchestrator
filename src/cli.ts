@@ -10,10 +10,10 @@ import type { LLMProvider } from "./types.js";
 
 dotenv.config();
 
-const mcpServerConfigs = resolveMCPServerConfigs(process.env, process.argv);
+const mcpServerConfigs = resolveMCPServerConfigs(process.env);
 if (!mcpServerConfigs.some((config) => config.name === WEATHER_SERVER_NAME)) {
   console.log(
-    "Usage: node build/cli.js <server-script-path> or set MCP_WEATHER_SCRIPT (sango optional via MCP_SANGO_SCRIPT)."
+    "Usage: set MCP_WEATHER_SCRIPT in .env (sango optional via MCP_SANGO_SCRIPT), then run npm start."
   );
   process.exit(1);
 }

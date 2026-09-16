@@ -25,11 +25,11 @@ const SANGO_QUERY_TOOL: MCPToolDefinition = {
   },
 };
 
-// 多 server 注册表：weather 必需（兼容旧 MCP_SERVER_SCRIPT / argv[2]），sango 可缺配
-const mcpServerConfigs = resolveMCPServerConfigs(process.env, process.argv);
+// 多 server 注册表：weather 必需（MCP_WEATHER_SCRIPT 必填），sango 可缺配（MCP_SANGO_SCRIPT）
+const mcpServerConfigs = resolveMCPServerConfigs(process.env);
 if (!mcpServerConfigs.some((config) => config.name === WEATHER_SERVER_NAME)) {
   console.error(
-    'Missing MCP weather server path. Use npm run web -- <server.js path> or set MCP_WEATHER_SCRIPT (sango optional via MCP_SANGO_SCRIPT).'
+    'Missing MCP weather server path. Set MCP_WEATHER_SCRIPT in .env (sango optional via MCP_SANGO_SCRIPT), then run npm run dev.'
   );
   process.exit(1);
 }

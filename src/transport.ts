@@ -84,16 +84,15 @@ export class StdioMCPServerConnection implements MCPServerConnection {
 
 /**
  * 从环境变量解析注册表配置（weather 必需、sango 可缺配）：
- * - MCP_WEATHER_SCRIPT：weather 入口绝对路径；兼容旧配置 MCP_SERVER_SCRIPT / CLI 第 2 参兜底。
+ * - MCP_WEATHER_SCRIPT：weather 入口绝对路径（必填；缺配 → 启动层报错退出）。
  * - MCP_SANGO_SCRIPT：sango 入口绝对路径（可选）；缺配 → sango 不可用。
+ * 注册表只认 MCP_*_SCRIPT 环境变量；不再支持命令行参数 / 旧 MCP_SERVER_SCRIPT。
  */
 export function resolveMCPServerConfigs(
-  env: Record<string, string | undefined>,
-  argv: string[] = []
+  env: Record<string, string | undefined>
 ): MCPServerConfig[] {
   const configs: MCPServerConfig[] = [];
-  const weatherScript =
-    env.MCP_WEATHER_SCRIPT || env.MCP_SERVER_SCRIPT || argv[2];
+  const weatherScript = env.MCP_WEATHER_SCRIPT;
   if (weatherScript) {
     configs.push({
       name: WEATHER_SERVER_NAME,
@@ -114,7 +113,7 @@ export function resolveMCPServerConfigs(
 
 /**
  * 多 server 注册表：同时管理多个 stdio MCP 子进程（各自独立 Client、独立启动 / 独立失败）。
- * 构造兼容旧签名：传单个脚本路径 = 只注册一个必需 server。
+ * 构造兼容旧签名：传单个脚本路径 = 只注册一个必需 server（测试 / 单 server 场景用）。
  */
 export class MCPTransport {
   private configs: MCPServerConfig[];

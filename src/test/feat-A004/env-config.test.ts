@@ -25,27 +25,8 @@ test("缺配 sango：只注册 weather", () => {
   ]);
 });
 
-test("旧配置兼容：MCP_SERVER_SCRIPT 兜底为 weather", () => {
-  assert.deepEqual(resolveMCPServerConfigs({ MCP_SERVER_SCRIPT: "legacy.js" }), [
-    { name: WEATHER_SERVER_NAME, scriptPath: "legacy.js", required: true },
-  ]);
-});
-
-test("旧配置兼容：CLI 第 2 参 process.argv[2] 兜底为 weather", () => {
-  assert.deepEqual(
-    resolveMCPServerConfigs({}, ["node", "build/cli.js", "argv-script.js"]),
-    [{ name: WEATHER_SERVER_NAME, scriptPath: "argv-script.js", required: true }]
-  );
-});
-
-test("新变量优先于旧配置（MCP_WEATHER_SCRIPT > MCP_SERVER_SCRIPT > argv[2]）", () => {
-  assert.deepEqual(
-    resolveMCPServerConfigs(
-      { MCP_WEATHER_SCRIPT: "new.js", MCP_SERVER_SCRIPT: "legacy.js" },
-      ["node", "cli.js", "argv.js"]
-    ),
-    [{ name: WEATHER_SERVER_NAME, scriptPath: "new.js", required: true }]
-  );
+test("不再兼容旧配置：MCP_SERVER_SCRIPT 不生效（注册表只认 MCP_WEATHER_SCRIPT）", () => {
+  assert.deepEqual(resolveMCPServerConfigs({ MCP_SERVER_SCRIPT: "legacy.js" }), []);
 });
 
 test("全缺配：注册表为空（weather 未配置 → 启动层应报错退出）", () => {
