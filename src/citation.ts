@@ -1,6 +1,6 @@
 ﻿// feat-A004：《三国演义》原著检索的引用硬校验模块
 // 校验规则：答案断言人物集合（ID 级）⊆ 召回原文人物集合（ID 级），不成立走兜底。
-// 人物 ID 化：别名表（封闭集合）优先，未命中走全量 NER；无 ID 的次要人物退化为字符串包含校验。
+// 人物 ID 化：本地别名表（封闭集合）扫描；无 ID 的次要人物退化为字符串包含校验。
 import { readFileSync } from "node:fs";
 
 export const SANGO_NOVEL_SEARCH_TOOL = "sango_novel_search";
@@ -83,8 +83,6 @@ export interface RecallFragment {
   source: string;
 }
 
-export type PersonNameExtractor = (text: string) => Promise<string[]>;
-export type NERIdResolver = (name: string) => Promise<string[]>;
 
 export interface CitationCheckResult {
   ok: boolean;
@@ -123,43 +121,8 @@ export function scanRecallPersonIds(
   return ids;
 }
 
-/** 单个人名解析：别名表（封闭集合）命中优先；未命中走全量 NER 生成候选，取首个 ID */
-export async function resolvePersonName(
-  name: string,
-  aliasTable: Map<string, string>,
-  nerResolver: NERIdResolver
-): Promise<PersonMention> {
-  const aliasId = aliasTable.get(name);
-  if (aliasId) {
-    return { name, id: aliasId };
-  }
-  const candidates = await nerResolver(name);
-  return { name, id: candidates[0] ?? undefined };
-}
-
-/** 从答案识别断言人物集合（ID 级）：模型提取人名 → 别名表优先 → 未命中走 NER */
-export async function buildAssertedPersons(
-  answer: string,
-  aliasTable: Map<string, string>,
-  extractNames: PersonNameExtractor,
-  nerResolver: NERIdResolver
-): Promise<PersonMention[]> {
-  const names = await extractNames(answer);
-  const mentions: PersonMention[] = [];
-  const seen = new Set<string>();
-  for (const name of names) {
-    const trimmed = name.trim();
-    if (!trimmed || seen.has(trimmed)) {
-      continue;
-    }
-    seen.add(trimmed);
-    mentions.push(await resolvePersonName(trimmed, aliasTable, nerResolver));
-  }
-  return mentions;
-}
-
 /** 集合包含判定：断言人物集合（ID 级）⊆ 召回原文人物集合（ID 级）。
- * 别名表未命中且 NER 未给 ID 的次要人物退化为字符串包含校验（名字出现在召回原文即通过），避免误杀小配角。 */
+ * 无 ID 的次要人物退化为字符串包含校验（名字出现在召回原文即通过），避免误杀小配角。 */
 export function verifyCitation(
   asserted: PersonMention[],
   recallText: string,

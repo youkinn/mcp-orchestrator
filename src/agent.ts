@@ -11,7 +11,6 @@ import type { MCPTransport } from "./transport.js";
 import {
   NOVEL_NO_HIT_ANSWER,
   SANGO_NOVEL_SEARCH_TOOL,
-  buildAssertedPersons,
   buildFallback,
   loadAliasTable,
   scanRecallPersonIds,
@@ -55,6 +54,7 @@ export const UNIFIED_SYSTEM_PROMPT = [
   "3. 人名一律以召回原文为准：原文写谁就是谁，不得按常识/记忆替换、不得补别名、不得解释成别人。",
   "4. 原文里没有相关内容的问句，必须回答「演义中未涉及」，禁止用先验知识补全。",
   "5. 不评价、不纠正、不对比：不得说原文写错，不得提正史/影视/游戏，不得出现「实际上是…」这类转折。",
+  "6. 回答格式固定：先写一句结论，然后写「引用的原文」（出处：第X回 回目），出处只到回目、不写段落编号；有多段时匹配优先度最高的那一段即可。",
   "",
   // 优先级判断次序
   "【判断次序（自上而下，命中即停）】",
@@ -76,33 +76,9 @@ export const UNIFIED_SYSTEM_PROMPT = [
   "一律输出简体中文纯文本；只有天气域、题库域与原著检索域有强制格式（见上），其余域按普通对话作答，不加无关模板、不解释自己的判断过程、不提及工具名。",
 ].join("\n");
 
-// feat-A004：引用硬校验的 LLM 子任务提示词（提取断言人名 / 全量 NER / 兜底结论归纳）
-const CITATION_NAME_EXTRACTION_PROMPT =
-  "你是三国人物人名提取器。从给定文本中提取出现的所有人名，只输出 JSON 字符串数组（如 [\"关羽\",\"曹操\"]），不要输出任何其他内容。";
-const CITATION_NER_PROMPT =
-  "你是三国人物实体识别器。判断给定人名是否属于《三国演义》人物：若是则输出其规范人物 ID（如 P002），否则输出空数组；只输出 JSON 字符串数组（如 [\"P002\"]），不要输出任何其他内容。";
+// feat-A004：引用硬校验的兜底结论归纳提示词（校验 / 格式不过时调用）
 const CITATION_FALLBACK_CONCLUSION_PROMPT =
-  "根据给定的《三国演义》原文片段，用一句话归纳结论，以「按原文，」开头；只依据片段内容作答，不得补充片段之外的信息，不得评价、纠正、对比原文。";
-
-function parseModelStringArray(response: ModelResponse): string[] {
-  const text = response.content
-    .filter((item) => item.type === "text")
-    .map((item) => item.text!)
-    .join("\n")
-    .trim();
-  if (!text) {
-    return [];
-  }
-  try {
-    const parsed: unknown = JSON.parse(text);
-    if (Array.isArray(parsed)) {
-      return parsed.filter((item): item is string => typeof item === "string");
-    }
-  } catch {
-    // 模型未按 JSON 输出时保守返回空，避免误伤
-  }
-  return [];
-}
+  "根据给定的《三国演义》原文片段，用一句话归纳结论，以「按原文，」开头；只依据片段内容作答，不得补充片段之外的信息，不得评价、纠正、对比原文。引用的原文片段长度以10字内为佳，最长不得超过20汉字。";
 
 export type LocalToolHandler = (
   args: Record<string, unknown>
@@ -120,10 +96,8 @@ export interface AgentOptions {
   localTools?: Record<string, LocalToolHandler>;
   /** 测试注入点：注入后 processQuery 直接调用，不注入走 callModel 现实现 */
   modelCaller?: ModelCaller;
-  /** feat-A004 引用硬校验注入点（测试用）；不注入使用默认实现（LLM 提取 / NER / 结论归纳） */
+  /** feat-A004 引用硬校验注入点（测试用）；不注入使用默认实现（本地别名表扫描 + LLM 结论归纳） */
   aliasTable?: Map<string, string>;
-  extractPersonNames?: (text: string) => Promise<string[]>;
-  resolveNer?: (name: string) => Promise<string[]>;
   fallbackConcluder?: (fragments: RecallFragment[]) => Promise<string>;
 }
 
@@ -292,6 +266,15 @@ export class Agent {
     }
   }
 
+  /** sango-novel 快路径：直接调检索工具（不经模型决策）；测试可用 localTools 注入 */
+  private async searchNovel(query: string): Promise<ToolCallResult> {
+    const args = { source: "sanguo-yanyi", query, limit: 5 };
+    const localTool = this.options.localTools?.[SANGO_NOVEL_SEARCH_TOOL];
+    return localTool
+      ? await localTool(args)
+      : await this.callTransportTool(SANGO_NOVEL_SEARCH_TOOL, args);
+  }
+
   private invokeModel(
     messages: any[],
     tools: MCPToolDefinition[]
@@ -335,42 +318,6 @@ export class Agent {
     return this.aliasTable;
   }
 
-  private extractAnswerNames(text: string): Promise<string[]> {
-    if (this.options.extractPersonNames) {
-      return this.options.extractPersonNames(text);
-    }
-    return this.extractPersonNamesViaModel(text);
-  }
-
-  private async extractPersonNamesViaModel(text: string): Promise<string[]> {
-    const response = await this.invokeModel(
-      [
-        { role: "system", content: CITATION_NAME_EXTRACTION_PROMPT },
-        { role: "user", content: text },
-      ],
-      []
-    );
-    return parseModelStringArray(response);
-  }
-
-  private resolveNerIds(name: string): Promise<string[]> {
-    if (this.options.resolveNer) {
-      return this.options.resolveNer(name);
-    }
-    return this.resolveNerIdsViaModel(name);
-  }
-
-  private async resolveNerIdsViaModel(name: string): Promise<string[]> {
-    const response = await this.invokeModel(
-      [
-        { role: "system", content: CITATION_NER_PROMPT },
-        { role: "user", content: name },
-      ],
-      []
-    );
-    return parseModelStringArray(response);
-  }
-
   private concludeFallback(fragments: RecallFragment[]): Promise<string> {
     if (this.options.fallbackConcluder) {
       return this.options.fallbackConcluder(fragments);
@@ -398,7 +345,7 @@ export class Agent {
       .trim();
   }
 
-  /** feat-A004：引用硬校验 + 兜底（检索无命中 / 校验不过 → 不做归纳生成） */
+  /** feat-A004：引用硬校验（本地别名表扫描，0 次 LLM）+ 固定格式；校验 / 格式不过 → 兜底 */
   private async applyNovelCitationGuard(
     answer: string,
     fragments: RecallFragment[]
@@ -409,14 +356,21 @@ export class Agent {
     const aliasTable = this.getAliasTable();
     const recallText = fragments.map((fragment) => fragment.text).join("\n");
     const recallPersonIds = scanRecallPersonIds(recallText, aliasTable);
-    const asserted = await buildAssertedPersons(
-      answer,
-      aliasTable,
-      this.extractAnswerNames.bind(this),
-      this.resolveNerIds.bind(this)
+    // 出处头（第X回 回目）是元数据：回目可能含他人名（如「三英战吕布」），不参与断言扫描
+    const assertedIds = scanRecallPersonIds(
+      answer.replace(/（出处：[^）]*）/g, ""),
+      aliasTable
     );
+    // 软性域：问候 / 天气等非原著问句（无别名人物、无出处标记）不套用原著检索格式
+    const isNovelAnswer =
+      assertedIds.size > 0 || /（出处：第\d+回/.test(answer);
+    if (!isNovelAnswer) {
+      return answer;
+    }
+    const formatOk = /「[^」]+」（出处：第\d+回[^）]*）/.test(answer);
+    const asserted = [...assertedIds].map((id) => ({ name: id, id }));
     const check = verifyCitation(asserted, recallText, recallPersonIds);
-    if (check.ok) {
+    if (formatOk && check.ok) {
       return answer;
     }
     const conclusion = await this.concludeFallback(fragments);
@@ -427,12 +381,41 @@ export class Agent {
     // feat-A004 域提示：sango=风云三国题库（硬锁），sango-novel=三国演义原著解读（软性，不拦截非原著问句）
     const domainHints: Record<string, string> = {
       sango: "\n当前用户已明确选择了“风云三国题库”场景。用户接下来的提问应一律视为风云三国游戏内的招募武将问答题，必须先调用 sango_query 工具查询题库。",
-      "sango-novel": "\n当前用户已明确选择了“三国演义原著解读”场景。用户接下来的提问应优先视为《三国演义》原著情节/人物/事件问句，先调用 sango_novel_search（source=sanguo-yanyi）检索原文再作答；若提问明显不属于原著检索（如问候、天气等），按普通对话处理。",
+      "sango-novel": "\n当前用户已明确选择了“三国演义原著解读”场景。系统已预先调用 sango_novel_search（source=sanguo-yanyi）检索《三国演义》原文并附在问题下方【已检索到的《三国演义》原文片段】中；请直接依据这些片段作答，不要再调用 sango_novel_search，并按能力三第 6 条固定格式输出：第一行只写一句结论，随后每条「引用的原文」（出处：第X回 回目），禁止输出解释、总结或格式以外的内容。若提问明显不属于原著检索（如问候、天气等），按普通对话处理。",
     };
     const systemContent =
       domain && domainHints[domain]
         ? this.systemPrompt + domainHints[domain]
         : this.systemPrompt;
+
+    let availableTools =
+      this.options.tools ?? (await this.transport.listTools());
+
+    // feat-A004 快路径（domain=sango-novel）：预先检索并注入原文片段 → 单次 LLM 生成，
+    // 避免 agent 多轮 tool-use 的 2+ 次串行 LLM 调用（响应 5~10s → 1~2s）
+    const novelFastPath = domain === "sango-novel";
+    let novelSearched = false;
+    const novelFragments: RecallFragment[] = [];
+    let userContent = query;
+    if (novelFastPath) {
+      const result = await this.searchNovel(query);
+      const fragments = this.collectRecallFragments(result, {
+        source: "sanguo-yanyi",
+        query,
+        limit: 5,
+      });
+      novelFragments.push(
+        ...fragments.filter((fragment) => !fragment.text.includes("未召回"))
+      );
+      novelSearched = true;
+      const injected = novelFragments.length
+        ? novelFragments.map((fragment) => fragment.text).join("\n\n")
+        : "（检索无命中）";
+      userContent = `${query}\n\n【已检索到的《三国演义》原文片段，请直接依据它们作答，不要再调用 sango_novel_search】\n${injected}`;
+      availableTools = availableTools.filter(
+        (tool) => tool.name !== SANGO_NOVEL_SEARCH_TOOL
+      );
+    }
 
     let messages: any[] = [
       {
@@ -441,18 +424,11 @@ export class Agent {
       },
       {
         role: "user",
-        content: query,
+        content: userContent,
       },
     ];
 
-    const availableTools =
-      this.options.tools ?? (await this.transport.listTools());
-
     let currentResponse = await this.invokeModel(messages, availableTools);
-
-    // feat-A004：记录是否调用过 sango_novel_search 及其召回原文片段（引用硬校验输入）
-    let novelSearched = false;
-    const novelFragments: RecallFragment[] = [];
 
     while (true) {
       let hasToolUse = false;

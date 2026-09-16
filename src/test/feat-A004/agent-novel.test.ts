@@ -78,9 +78,12 @@ const RECALL_TEXT =
 
 test("domain=sango-novel 时 system 追加三国演义域提示（软性，不拦截非原著问句）", async () => {
   let capturedSystem = "";
+  let callCount = 0;
   const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
-    const system = messages.find((m) => m.role === "system")?.content ?? "";
-    capturedSystem = system;
+    callCount += 1;
+    if (callCount === 1) {
+      capturedSystem = messages.find((m) => m.role === "system")?.content ?? "";
+    }
     return textResponse("按原文，斩华雄者系关羽。");
   };
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
@@ -102,7 +105,7 @@ test("① 引用校验通过：答案原样返回，无额外模型调用", asyn
           query: "谁斩了华雄？",
           limit: 5,
         })
-      : textResponse("按原文，斩华雄者系关羽。");
+      : textResponse("斩华雄者系关羽。「云长提刀出阵，斩华雄于帐前。」（出处：第5回 破关兵三英战吕布）");
   };
 
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
@@ -113,14 +116,15 @@ test("① 引用校验通过：答案原样返回，无额外模型调用", asyn
         content: [{ type: "text", text: RECALL_TEXT }],
       }),
     },
-    extractPersonNames: async () => ["关羽", "华雄"],
-    resolveNer: async () => [],
     fallbackConcluder: async () => "斩华雄者系关羽",
     modelCaller,
   });
 
   const answer = await agent.processQuery("谁斩了华雄？");
-  assert.equal(answer, "按原文，斩华雄者系关羽。");
+  assert.equal(
+    answer,
+    "斩华雄者系关羽。「云长提刀出阵，斩华雄于帐前。」（出处：第5回 破关兵三英战吕布）"
+  );
   assert.equal(modelCallCount, 2, "校验通过不应有额外模型调用");
 });
 
@@ -145,8 +149,6 @@ test("② 引用校验不通过：输出兜底「原文片段 + 出处 + 结论�
         content: [{ type: "text", text: RECALL_TEXT }],
       }),
     },
-    extractPersonNames: async () => ["曹操"],
-    resolveNer: async () => [],
     fallbackConcluder: async () => "斩华雄者系关羽",
     modelCaller,
   });
@@ -207,17 +209,15 @@ test("④ 未调原著工具的其他域：不触发引用校验，无额外模�
   assert.equal(modelCallCount, 2, "天气域不应触发引用校验的额外模型调用");
 });
 
-test("⑤ 默认链路（LLM 提取 / NER / 结论归纳）：校验不过走兜底", async () => {
+test("⑤ 默认链路（本地别名表扫描 + 兜底结论）：校验不过走兜底", async () => {
   const responses = [
     toolUseResponse("sango_novel_search", {
       source: "sanguo-yanyi",
       query: "谁斩了华雄？",
       limit: 5,
     }),
-    textResponse("许褚斩华雄。"),
-    textResponse('["许褚"]'), // 提取断言人名
-    textResponse("[]"), // 许褚 NER 无 ID
-    textResponse("按原文，斩华雄者系关羽"), // 兜底结论
+    textResponse("许褚斩华雄。"), // 主问答答案（格式不符 + 许褚不在召回 → 触发兜底）
+    textResponse("按原文，斩华雄者系关羽"), // 兜底结论（本地扫描，无提取/NER 模型调用）
   ];
   let callIndex = 0;
   const modelCaller = async (
@@ -247,5 +247,5 @@ test("⑤ 默认链路（LLM 提取 / NER / 结论归纳）：校验不过走兜
   assert.match(answer, /【原文片段】/);
   assert.match(answer, /第五回：云长提刀出阵，斩华雄于帐前。/);
   assert.match(answer, /按原文，斩华雄者系关羽/);
-  assert.equal(callIndex, 5, "主问答 + 提取 + NER + 结论共 5 次模型调用");
+  assert.equal(callIndex, 3, "主问答 + 兜底结论共 3 次模型调用（无提取/NER）");
 });

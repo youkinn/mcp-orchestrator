@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   NOVEL_NO_HIT_ANSWER,
-  buildAssertedPersons,
   buildFallback,
   loadAliasTable,
   scanRecallPersonIds,
@@ -47,50 +46,6 @@ test("③ 召回侧 ID 化：扫描召回原文中的别名 → 规范 ID 集合
   assert.ok(ids.has("P002"), "云长 → P002（关羽）");
   assert.ok(ids.has("P013"), "华雄 → P013");
   assert.equal(ids.has("P001"), false, "原文未提曹操，不应命中 P001");
-});
-
-test("④ 断言人名解析：别名表命中优先，不触发 NER", async () => {
-  const table = loadAliasTable("missing-file");
-  let nerCalls = 0;
-  const mentions = await buildAssertedPersons(
-    "关羽斩华雄。",
-    table,
-    async () => ["关羽", "华雄"],
-    async () => {
-      nerCalls += 1;
-      return [];
-    }
-  );
-  assert.deepEqual(mentions, [
-    { name: "关羽", id: "P002" },
-    { name: "华雄", id: "P013" },
-  ]);
-  assert.equal(nerCalls, 0, "别名表命中的名字不应走 NER");
-});
-
-test("⑤ 断言人名解析：别名表未命中走全量 NER 生成候选 ID", async () => {
-  const table = loadAliasTable("missing-file");
-  const mentions = await buildAssertedPersons(
-    "许褚斩华雄。",
-    table,
-    async () => ["许褚"],
-    async (name) => {
-      assert.equal(name, "许褚");
-      return ["P030"];
-    }
-  );
-  assert.deepEqual(mentions, [{ name: "许褚", id: "P030" }]);
-});
-
-test("⑥ 断言人名解析：别名表未命中且 NER 无 ID → 无 ID 次要人物（走字符串退化）", async () => {
-  const table = loadAliasTable("missing-file");
-  const mentions = await buildAssertedPersons(
-    "潘凤被斩。",
-    table,
-    async () => ["潘凤"],
-    async () => []
-  );
-  assert.deepEqual(mentions, [{ name: "潘凤", id: undefined }]);
 });
 
 test("⑦ 集合包含判定·通过：断言人物 ⊆ 召回人物", () => {
