@@ -76,6 +76,22 @@ const ALIAS_TABLE = loadAliasTable("a004-not-exist"); // stub 别名表（关羽
 const RECALL_TEXT =
   "第五回：云长提刀出阵，斩华雄于帐前。众皆大惊，尽皆失色。";
 
+test("domain=sango-novel 时 system 追加三国演义域提示（软性，不拦截非原著问句）", async () => {
+  let capturedSystem = "";
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    const system = messages.find((m) => m.role === "system")?.content ?? "";
+    capturedSystem = system;
+    return textResponse("按原文，斩华雄者系关羽。");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    modelCaller,
+  });
+  await agent.processQuery("谁斩了华雄？", "sango-novel");
+  assert.ok(capturedSystem.includes("三国演义原著解读"), "应追加三国演义域提示");
+  assert.ok(capturedSystem.includes("sango_novel_search"), "域提示应指向原著检索工具");
+});
+
 test("① 引用校验通过：答案原样返回，无额外模型调用", async () => {
   let modelCallCount = 0;
   const modelCaller = async (): Promise<ModelResponse> => {

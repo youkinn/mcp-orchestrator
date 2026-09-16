@@ -424,10 +424,15 @@ export class Agent {
   }
 
   async processQuery(query: string, domain?: string): Promise<string> {
-    const domainHint = "\n当前用户已明确选择了“风云三国题库”场景。用户接下来的提问应一律视为风云三国游戏内的招募武将问答题，必须先调用 sango_query 工具查询题库。";
-    const systemContent = domain === "sango"
-      ? this.systemPrompt + domainHint
-      : this.systemPrompt;
+    // feat-A004 域提示：sango=风云三国题库（硬锁），sango-novel=三国演义原著解读（软性，不拦截非原著问句）
+    const domainHints: Record<string, string> = {
+      sango: "\n当前用户已明确选择了“风云三国题库”场景。用户接下来的提问应一律视为风云三国游戏内的招募武将问答题，必须先调用 sango_query 工具查询题库。",
+      "sango-novel": "\n当前用户已明确选择了“三国演义原著解读”场景。用户接下来的提问应优先视为《三国演义》原著情节/人物/事件问句，先调用 sango_novel_search（source=sanguo-yanyi）检索原文再作答；若提问明显不属于原著检索（如问候、天气等），按普通对话处理。",
+    };
+    const systemContent =
+      domain && domainHints[domain]
+        ? this.systemPrompt + domainHints[domain]
+        : this.systemPrompt;
 
     let messages: any[] = [
       {
