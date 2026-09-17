@@ -588,7 +588,7 @@ export class Agent {
     }
 
     const systemContent = resolvedContent ? ROUTE_HINTS[route] : this.systemPrompt;
-    let messages = [
+    let messages: any[] = [
       { role: "system", content: systemContent, },
       { role: "user", content: userContent, },
     ];
@@ -597,6 +597,59 @@ export class Agent {
     }
     let availableTools = this.options.tools ?? (await this.transport.listTools());
     let currentResponse = await this.invokeModel(messages, availableTools); // 调LLM
+
+    const MAX_TOOL_ROUNDS = 8
+    let toolRounds = 0
+    while (true) {
+      let hasToolUse = false;
+
+      for (const item of currentResponse.content) {
+        if (item.type !== "tool_use") {
+          continue;
+        }
+        hasToolUse = true;
+        const toolName = item.name!;
+        const toolArgs = item.input!;
+
+        const localTool = this.options.localTools?.[toolName];
+        const result = localTool
+          ? await localTool(toolArgs)
+          : await this.callTransportTool(toolName, toolArgs);
+        const assistantMessage: any = {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: item.id,
+              type: "function",
+              function: {
+                name: toolName,
+                arguments: JSON.stringify(toolArgs),
+              },
+            },
+          ],
+        };
+
+        if (currentResponse.reasoningContent) {
+          assistantMessage.reasoning_content = currentResponse.reasoningContent;
+        }
+
+        messages.push(assistantMessage);
+        messages.push({
+          role: "tool",
+          tool_call_id: item.id,
+          content: JSON.stringify(result.content),
+        });
+      }
+
+      if (!hasToolUse || toolRounds >= MAX_TOOL_ROUNDS) {
+        break;
+      }
+      toolRounds++;
+
+      currentResponse = await this.invokeModel(messages, availableTools);
+    }
+
     let answer = currentResponse.content
       .filter((item) => item.type === "text")
       .map((item) => item.text!)
