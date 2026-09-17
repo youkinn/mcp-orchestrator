@@ -19,8 +19,7 @@ import {
   type RecallFragment,
 } from "./citation.js";
 
-// 统一路由提示词（feat-A003）：单 Agent 自主决定调不调工具、调哪个；
-// 分域兜底规则只写在这里，HTTP 层不再有 scenario / service 等路由概念。
+// 统一路由提示词（feat-A003）：单 Agent 自主决定调不调工具、调哪个
 export const UNIFIED_SYSTEM_PROMPT = [
   // 身份与总原则
   "你是统一对话助手，用简体中文回答用户问题。",
@@ -76,6 +75,18 @@ export const UNIFIED_SYSTEM_PROMPT = [
   "【输出格式约束】",
   "一律输出简体中文纯文本；只有天气域、题库域与原著检索域有强制格式（见上），其余域按普通对话作答，不加无关模板、不解释自己的判断过程、不提及工具名。",
 ].join("\n");
+
+/** 域提示：命中域后追加在统一提示词之后（域内工具已预调并注入结果，模型不再自行调工具） */
+const ROUTE_HINTS: Record<string, string> = {
+  sango: ["当前用户已明确选择了“风云三国题库”场景（题库域硬锁）。系统已预先调用 sango_query 检索题库，候选题目附在问题下方【已检索到的题库候选】中；请直接依据候选作答，不要再调用 sango_query：候选中含义相同的那道题只输出该题答案原文，候选为「未召回到任何候选题目」时只回复「题库未收录该题，请换个问法」。"].join('\n'),
+  "sango-novel":
+    ['当前用户已明确选择了“三国演义原著解读”场景。系统已预先调用 sango_novel_search（source=sanguo-yanyi）检索《三国演义》原文并附在问题下方【已检索到的《三国演义》原文片段】中；请直接依据这些片段作答，不要再调用 sango_novel_search。',
+      '1. 给出一句结论，结论必须直接回答用户问题的主体。例如用户问“谁温酒斩华雄”，结论应写「关羽温酒斩华雄」；不能只写「酒尚温时斩华雄」。人名用原文中的称呼，关羽、云长、关公均可。',
+      '2. 结论后写一条「引用的原文」，格式为`「原文短句」（出处：第X回 回目）`，出处只到回目，不写段落编号。',
+      '3. 只依据片段作答；片段中确实没有相关内容时才回复「演义中未涉及」。',
+      '4. 正常回答不要以「按原文，」开头，禁止输出解释、总结或格式以外的内容。若提问明显不属于原著检索（如问候、天气等），按普通对话处理。'
+    ].join("\n"),
+};
 
 // feat-A004：引用硬校验的兜底结论归纳提示词（校验 / 格式不过时调用）
 const CITATION_FALLBACK_CONCLUSION_PROMPT =
@@ -162,14 +173,6 @@ const WEATHER_KEYWORDS = [
 
 // 重叠题校正（文档 §二 第三层 4）：字 / 籍贯 在题库与文史两域都高频出现，命中后不直接路由
 const AMBIGUOUS_KEYWORDS = ["字", "籍贯"];
-
-/** 域提示：命中域后追加在统一提示词之后（域内工具已预调并注入结果，模型不再自行调工具） */
-const ROUTE_HINTS: Record<string, string> = {
-  sango:
-    "\n当前提问属于“风云三国题库”场景（题库域硬锁）。系统已预先调用 sango_query 检索题库，候选题目附在问题下方【已检索到的题库候选】中；请直接依据候选作答，不要再调用 sango_query：候选中含义相同的那道题只输出该题答案原文，候选为「未召回到任何候选题目」时只回复「题库未收录该题，请换个问法」。",
-  "sango-novel":
-    "\n当前用户已明确选择了“三国演义原著解读”场景。系统已预先调用 sango_novel_search（source=sanguo-yanyi）检索《三国演义》原文并附在问题下方【已检索到的《三国演义》原文片段】中；请直接依据这些片段作答，不要再调用 sango_novel_search。\n1. 先给出一句结论，结论必须直接回答用户问题的主体。例如用户问“谁温酒斩华雄”，结论应写「关羽温酒斩华雄」；不能只写「酒尚温时斩华雄」。人名用原文中的称呼，关羽、云长、关公均可。\n2. 结论后写一条「引用的原文」，格式为`「原文短句」（出处：第X回 回目）`，出处只到回目，不写段落编号。\n3. 只依据片段作答；片段中确实没有相关内容时才回复「演义中未涉及」。\n4. 正常回答不要以「按原文，」开头，禁止输出解释、总结或格式以外的内容。若提问明显不属于原著检索（如问候、天气等），按普通对话处理。",
-};
 
 export type LocalToolHandler = (
   args: Record<string, unknown>
@@ -267,48 +270,12 @@ export class Agent {
     messages: any[],
     tools: MCPToolDefinition[]
   ): Promise<ModelResponse> {
-    if (this.config.provider === "anthropic") {
-      if (!this.anthropic) {
-        throw new Error("Anthropic client not initialized");
-      }
-
-      const systemMessage = messages.find(
-        (message: any) => message?.role === "system"
-      );
-      const apiMessages = messages.filter(
-        (message: any) => message?.role !== "system"
-      );
-
-      const response = await this.anthropic.messages.create({
-        model: this.config.model,
-        max_tokens: 1000,
-        system: systemMessage?.content,
-        messages: apiMessages,
-        tools: this.getAnthropicTools(tools),
-      });
-
-      return {
-        content: response.content.map((item: any) => {
-          if (item.type === "text") {
-            return { type: "text", text: item.text };
-          }
-          if (item.type === "tool_use") {
-            return {
-              type: "tool_use",
-              id: item.id,
-              name: item.name,
-              input: item.input,
-            };
-          }
-          return { type: "text", text: JSON.stringify(item) };
-        }),
-      };
-    }
-
     if (!this.openai) {
       throw new Error("OpenAI-compatible client not initialized");
     }
 
+    console.error('[callModel]', 'messages:', messages);
+    console.time('callModel');
     const response = await this.openai.chat.completions.create({
       model: this.config.model,
       messages,
@@ -316,6 +283,7 @@ export class Agent {
       max_tokens: 1000,
       temperature: 0.7,
     });
+    console.timeEnd('callModel');
 
     const message = response.choices[0]?.message;
     const normalizedContent: any[] = [];
@@ -507,76 +475,6 @@ export class Agent {
     return buildFallback(fragments, conclusion, query);
   }
 
-  /**
-   * 路由判定（零 LLM）：L1 前端标签 → L2 本地关键词硬匹配。
-   * 返回 "auto" 表示前两层未命中，交统一 Agent 按语义自主决策（即 L3 向量 / L4 大模型兜底的现有承载）。
-   */
-  resolveRoute(query: string, domain?: string): RouteTarget {
-    if (domain && DOMAIN_ROUTES[domain]) {
-      return DOMAIN_ROUTES[domain];
-    }
-    const lowered = query.toLowerCase();
-    const hit = (keywords: string[]) =>
-      keywords.some((keyword) => lowered.includes(keyword.toLowerCase()));
-    if (hit(SANGO_KEYWORDS)) {
-      return "sango";
-    }
-    // 重叠题校正：字 / 籍贯 两个域都高频出现，不直接路由文史域，交 L3 / L4 判定
-    if (hit(AMBIGUOUS_KEYWORDS)) {
-      return "auto";
-    }
-    if (hit(NOVEL_KEYWORDS)) {
-      return "sango-novel";
-    }
-    if (hit(WEATHER_KEYWORDS)) {
-      return "weather";
-    }
-    return "auto";
-  }
-
-  /**
-   * 四层路由收口：L1 标签 → L2 关键词 → L3 向量匹配 → L4 轻量分类。
-   * 默认不注入 L3 / L4 时，auto 沿用统一 Agent 自主决策，保证向后兼容。
-   */
-  private async resolveFinalRoute(
-    query: string,
-    domain?: string
-  ): Promise<RouteDecision> {
-    const route = this.resolveRoute(query, domain);
-    if (route !== "auto") {
-      return route;
-    }
-
-    const sangoHit = await this.options.sangoVectorMatcher?.(query);
-    if (sangoHit === true || sangoHit === "sango") {
-      return "sango";
-    }
-
-    if (this.options.routeClassifier) {
-      const decision = await this.options.routeClassifier(query);
-      if (
-        decision === "weather" ||
-        decision === "sango" ||
-        decision === "sango-novel" ||
-        decision === "auto" ||
-        decision === "irrelevant"
-      ) {
-        return decision;
-      }
-    }
-
-    // 默认 L4：生产路径（未注入测试 modelCaller / 分类器）由轻量路由模型兜底；
-    // 测试注入 modelCaller 时保持统一 Agent 现状，避免路由与生成脚本串扰。
-    if (
-      !this.options.modelCaller &&
-      this.systemPrompt === UNIFIED_SYSTEM_PROMPT
-    ) {
-      return this.classifyRouteViaModel(query);
-    }
-
-    return "auto";
-  }
-
   /** L4 默认实现：四分类轻量模型，只解析数字编号；解析失败回退 auto */
   private async classifyRouteViaModel(query: string): Promise<RouteDecision> {
     const prompt = ROUTE_CLASSIFIER_PROMPT.replace("{{用户问题}}", query);
@@ -606,158 +504,106 @@ export class Agent {
   }
 
   /**
-   * 处理提问：先做四层路由判定（L1 标签 → L2 关键词 → L3 向量 → L4 轻量分类），
+   * 路由判定（零 LLM）：L1 前端标签 → L2 本地关键词硬匹配。
+   * 返回 "auto" 表示前两层未命中，交统一 Agent 按语义自主决策（即 L3 向量 / L4 大模型兜底的现有承载）。
+   */
+  resolveRoute(query: string, domain?: string): RouteTarget {
+    if (domain && DOMAIN_ROUTES[domain]) {
+      return DOMAIN_ROUTES[domain];
+    }
+    const lowered = query.toLowerCase();
+    const hit = (keywords: string[]) =>
+      keywords.some((keyword) => lowered.includes(keyword.toLowerCase()));
+    if (hit(SANGO_KEYWORDS)) {
+      return "sango";
+    }
+    if (hit(NOVEL_KEYWORDS)) {
+      return "sango-novel";
+    }
+    if (hit(WEATHER_KEYWORDS)) {
+      return "weather";
+    }
+    return "auto";
+  }
+
+  private async resolveUserContent(query: string, domain?: string): Promise<{ result: string, novelFragments?: RecallFragment[] }> {
+    if (domain && DOMAIN_ROUTES[domain]) {
+      const novelFragments: RecallFragment[] = [];
+      if (domain === DOMAIN_ROUTES["sango-novel"]) {
+        const result = await this.searchNovel(query);
+        const fragments = this.collectRecallFragments(result, {
+          source: "sanguo-yanyi",
+          query,
+          limit: 5,
+        });
+        novelFragments.push(
+          ...fragments.filter((fragment) => !fragment.text.includes("未召回"))
+        );
+
+        // 注入收窄：只取最符合的前 3 段，每段截为「出处头 + 检索词附近窗口」（LLM 输入 2500→~500 字）
+        // TODO: 收窄后可能导致最相关的原文片段被忽略，导致LLM生成的结论不准确，比如输入“演义中未涉及”。
+        const injected = novelFragments.length
+          ? novelFragments
+            .slice(0, 5)
+            .map((fragment) => trimFragmentToWindow(fragment, query).text)
+            .join("\n\n")
+          : "（检索无命中）";
+        return { result: injected, novelFragments };
+      } else if (domain === DOMAIN_ROUTES["sango"]) {
+        const result = await this.searchSangoQuestions(query);
+        return { result: this.collectTexts(result).join("\n") };
+      } else if (domain === DOMAIN_ROUTES["weather"]) {
+        // Handle weather domain
+      }
+    }
+    return { result: '' };
+  }
+
+  /**
+   * 处理用户提问并回答
+   * 先做四层路由判定（L1 标签 → L2 关键词 → L3 向量 → L4 轻量分类），
    * 命中 sango / sango-novel 走域内快路径；L4 判为无关问题直接返回引导话术；
    * 未注入 L3 / L4 时 auto 保持统一 Agent 语义自主决策。
    */
   async processQuery(query: string, domain?: string): Promise<string> {
-    const route = await this.resolveFinalRoute(query, domain);
-    if (route === "irrelevant") {
-      return IRRELEVANT_ROUTE_RESPONSE;
-    }
-    const domainHint = ROUTE_HINTS[route];
-    const systemContent = domainHint
-      ? domainHint
-      : this.systemPrompt;
+    let novelFragments: RecallFragment[] = [];
+    const userContent = query.trim();
+    let resolvedContent = '';
 
-    let availableTools =
-      this.options.tools ?? (await this.transport.listTools());
-
-    // 快路径：路由目标已确定（L1/L2/L3/L4 命中 sango / sango-novel）；
-    // weather / auto 保持统一 Agent 现状，由模型按语义调度。
-    let novelSearched = false;
-    const novelFragments: RecallFragment[] = [];
-    let userContent = query;
-
-    if (route === "sango-novel") {
-      const result = await this.searchNovel(query);
-      const fragments = this.collectRecallFragments(result, {
-        source: "sanguo-yanyi",
-        query,
-        limit: 5,
-      });
-      novelFragments.push(
-        ...fragments.filter((fragment) => !fragment.text.includes("未召回"))
-      );
-      novelSearched = true;
-      // 注入收窄：只取最符合的前 3 段，每段截为「出处头 + 检索词附近窗口」（LLM 输入 2500→~500 字）
-      const injected = novelFragments.length
-        ? novelFragments
-          .slice(0, 3)
-          .map((fragment) => trimFragmentToWindow(fragment, query).text)
-          .join("\n\n")
-        : "（检索无命中）";
-      userContent = `${query}\n\n【已检索到的《三国演义》原文片段，请直接依据它们作答，不要再调用 sango_novel_search】\n${injected}`;
-      availableTools = availableTools.filter(
-        (tool) => tool.name !== SANGO_NOVEL_SEARCH_TOOL
-      );
-    } else if (route === "sango") {
-      const result = await this.searchSangoQuestions(query);
-      const candidates = this.collectTexts(result).join("\n");
-      userContent = `${query}\n\n【已检索到的题库候选，请直接依据它们作答，不要再调用 sango_query】\n${candidates || "（未召回到任何候选题目）"}`;
-      availableTools = availableTools.filter(
-        (tool) => tool.name !== SANGO_QUERY_TOOL
-      );
+    // L1 / L2 已命中专用域，直接走域内快路径（不经 L3 / L4）
+    let route = this.resolveRoute(query, domain);
+    if (Object.values(DOMAIN_ROUTES).includes(route)) {
+      const result = await this.resolveUserContent(query, domain || route);
+      resolvedContent = result.result;
+      if (domain === DOMAIN_ROUTES["sango-novel"]) { }
+      novelFragments = result.novelFragments || [];
     }
 
-    let messages: any[] = [
-      {
-        role: "system",
-        content: systemContent,
-      },
-      {
-        role: "user",
-        content: userContent,
-      },
+    // L3 向量匹配注入点：只做风云三国高置信正向识别，命中 sango 后走题库快路径
+    const sangoHit = await this.options.sangoVectorMatcher?.(query);
+    if (sangoHit === true || sangoHit === "sango") {
+      route = DOMAIN_ROUTES.sango
+      const { result } = await this.resolveUserContent(query, route);
+      resolvedContent = result;
+    }
+
+    const systemContent = resolvedContent ? ROUTE_HINTS[route] : this.systemPrompt;
+    let messages = [
+      { role: "system", content: systemContent, },
+      { role: "user", content: userContent, },
     ];
-
-    let currentResponse = await this.invokeModel(messages, availableTools);
-
-    while (true) {
-      let hasToolUse = false;
-
-      for (const item of currentResponse.content) {
-        if (item.type !== "tool_use") {
-          continue;
-        }
-
-        hasToolUse = true;
-        const toolName = item.name!;
-        const toolArgs = item.input!;
-
-        const localTool = this.options.localTools?.[toolName];
-        const result = localTool
-          ? await localTool(toolArgs)
-          : await this.callTransportTool(toolName, toolArgs);
-
-        if (toolName === SANGO_NOVEL_SEARCH_TOOL) {
-          novelSearched = true;
-          novelFragments.push(...this.collectRecallFragments(result, toolArgs));
-        }
-
-        if (this.config.provider === "anthropic") {
-          messages.push({
-            role: "assistant",
-            content: currentResponse.content,
-          });
-
-          messages.push({
-            role: "user",
-            content: [
-              {
-                type: "tool_result",
-                tool_use_id: item.id,
-                content: [
-                  { type: "text", text: JSON.stringify(result.content) },
-                ],
-              },
-            ],
-          });
-        } else {
-          const assistantMessage: any = {
-            role: "assistant",
-            content: null,
-            tool_calls: [
-              {
-                id: item.id,
-                type: "function",
-                function: {
-                  name: toolName,
-                  arguments: JSON.stringify(toolArgs),
-                },
-              },
-            ],
-          };
-
-          if (currentResponse.reasoningContent) {
-            assistantMessage.reasoning_content =
-              currentResponse.reasoningContent;
-          }
-
-          messages.push(assistantMessage);
-
-          messages.push({
-            role: "tool",
-            tool_call_id: item.id,
-            content: JSON.stringify(result.content),
-          });
-        }
-      }
-
-      if (!hasToolUse) {
-        break;
-      }
-
-      currentResponse = await this.invokeModel(messages, availableTools);
+    if (resolvedContent) {
+      messages.push({ role: "system", content: resolvedContent, });
     }
-
+    let availableTools = this.options.tools ?? (await this.transport.listTools());
+    let currentResponse = await this.invokeModel(messages, availableTools); // 调LLM
     let answer = currentResponse.content
       .filter((item) => item.type === "text")
       .map((item) => item.text!)
       .join("\n")
       .trim();
 
-    if (novelSearched) {
+    if (novelFragments.length > 0) {
       answer = await this.applyNovelCitationGuard(answer, novelFragments, query);
     }
 

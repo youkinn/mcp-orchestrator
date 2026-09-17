@@ -39,26 +39,9 @@ function readLLMConfig() {
     process.env.LLM_PROVIDER || 'deepseek'
   ).toLowerCase() as LLMProvider;
 
-  if (!['anthropic', 'deepseek', 'openai'].includes(provider)) {
-    throw new Error('LLM_PROVIDER must be anthropic / deepseek / openai');
-  }
-
-  const model =
-    process.env.LLM_MODEL ||
-    (provider === 'anthropic'
-      ? 'claude-3-5-sonnet-20241022'
-      : provider === 'openai'
-        ? 'gpt-4o-mini'
-        : 'deepseek-v4-flash');
-
-  const apiKey = process.env.API_KEY;
-  const apiBaseUrl =
-    process.env.API_BASE_URL ||
-    (provider === 'anthropic'
-      ? 'https://api.anthropic.com'
-      : provider === 'openai'
-        ? 'https://api.openai.com/v1'
-        : 'https://api.deepseek.com');
+  const model = process.env.LLM_MODEL || ''
+  const apiKey = process.env.API_KEY || '';
+  const apiBaseUrl = process.env.API_BASE_URL || '';
 
   if (!apiKey) {
     throw new Error('Missing API_KEY in .env');
