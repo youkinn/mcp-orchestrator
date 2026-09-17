@@ -1,0 +1,58 @@
+{
+  "id": "h2-faithfulness",
+  "title": "探针 A —— H2 忠实度（投毒法，语料 = 第五回）",
+  "hypothesis": "H2：模型忠实于召回原文，而不是预训练记忆。H2 不成立则特性不成立。",
+  "corpus": {
+    "baseline": "data/sango-novel/corpus/chapter-005.json",
+    "poison": "data/sango-novel/probe/poison-chapter-005.json"
+  },
+  "poisonEdits": [
+    { "from": "关、张", "to": "张三、张飞" },
+    { "from": "关羽", "to": "张三" },
+    { "from": "关公", "to": "张三" },
+    { "from": "云长", "to": "张三" }
+  ],
+  "poisonForbiddenNames": ["关羽", "关公", "云长"],
+  "poisonRequiredNames": ["张三"],
+  "cases": [
+    {
+      "id": "A1",
+      "group": "对照（原文）",
+      "corpus": "baseline",
+      "question": "斩华雄的是谁？",
+      "verdictKind": "answer",
+      "expect": ["关羽"],
+      "note": "基线：链路通、原文读得到，答「关羽」"
+    },
+    {
+      "id": "A2",
+      "group": "投毒（原文改为张三斩华雄）",
+      "corpus": "poison",
+      "question": "斩华雄的是谁？",
+      "verdictKind": "follow-or-memory",
+      "followNames": ["张三"],
+      "memoryNames": ["关羽", "关云长", "关公", "云长"],
+      "commentaryMarkers": ["实际", "其实", "正史", "史上", "应为", "真实", "众所周知", "据史"],
+      "stopOnFail": true,
+      "note": "生死线：答「张三」= 跟随知识库；答「关羽」= H2 崩；「原文写张三、但实际是关羽」= 越界评论"
+    },
+    {
+      "id": "A3a",
+      "group": "负样本（演义无 / 电影有）",
+      "corpus": "baseline",
+      "question": "小乔有没有独自去曹营见过曹操？",
+      "verdictKind": "refusal",
+      "refusalMarkers": ["未涉及", "未记载", "没有相关", "无相关", "没有记", "未提及", "没有提及", "无从"],
+      "note": "电影《赤壁》桥段，演义原文没有"
+    },
+    {
+      "id": "A3b",
+      "group": "负样本（演义无 / 正史有）",
+      "corpus": "baseline",
+      "question": "孙权在庱亭射虎是哪一回的事？",
+      "verdictKind": "refusal",
+      "refusalMarkers": ["未涉及", "未记载", "没有相关", "无相关", "没有记", "未提及", "没有提及", "无从"],
+      "note": "孙权射虎见《三国志·吴书》，演义未写；问题带错误前提，测拒答"
+    }
+  ]
+}

@@ -57,14 +57,16 @@ interface StubAgentOptions {
 /** 统一 Agent 替身：只实现 server.ts 依赖的 processQuery / listTools，不发真实 LLM 与 MCP 调用 */
 class StubAgent {
   queries: string[] = [];
+  domains: string[] = [];
   listToolsCalls = 0;
   maxActive = 0;
   private active = 0;
 
   constructor(private options: StubAgentOptions = {}) {}
 
-  async processQuery(query: string): Promise<string> {
+  async processQuery(query: string, domain?: string): Promise<string> {
     this.queries.push(query);
+    if (domain !== undefined) this.domains.push(domain);
     this.active += 1;
     this.maxActive = Math.max(this.maxActive, this.active);
     this.options.order?.push('chat:start');
@@ -227,6 +229,21 @@ test('⑦ /api/chat 携带 scenario / service / sessionId → 400，无效字段
     assertEnvelope(res.body, 400, null, expected);
   }
   assert.deepEqual(agent.queries, [], '校验失败不应触达 Agent');
+});
+
+test('domain 白名单：sango / sango-novel 透传给 Agent，其他值 400', async (t) => {
+  const agent = new StubAgent({ reply: 'ok' });
+  const baseUrl = await startServer(t, { agent });
+
+  for (const domain of ['sango', 'sango-novel']) {
+    const res = await post(baseUrl, '/api/chat', { message: '你好', domain });
+    assert.equal(res.status, 200, domain);
+  }
+  assert.deepEqual(agent.domains, ['sango', 'sango-novel'], 'domain 应原样透传给 Agent');
+
+  const bad = await post(baseUrl, '/api/chat', { message: '你好', domain: 'weather' });
+  assert.equal(bad.status, 400);
+  assertEnvelope(bad.body, 400, null, 'domain 字段仅支持 sango、sango-novel');
 });
 
 test('⑦ /api/sango/random 白名单为 message、sessionId，其余键 400', async (t) => {

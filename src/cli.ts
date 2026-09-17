@@ -1,13 +1,20 @@
 ﻿import dotenv from "dotenv";
 import * as readline from "node:readline";
-import { MCPTransport } from "./transport.js";
+import {
+  MCPTransport,
+  resolveMCPServerConfigs,
+  WEATHER_SERVER_NAME,
+} from "./transport.js";
 import { Agent } from "./agent.js";
 import type { LLMProvider } from "./types.js";
 
 dotenv.config();
 
-if (process.argv.length < 3) {
-  console.log("Usage: node build/cli.js <server-script-path>");
+const mcpServerConfigs = resolveMCPServerConfigs(process.env);
+if (!mcpServerConfigs.some((config) => config.name === WEATHER_SERVER_NAME)) {
+  console.log(
+    "Usage: set MCP_WEATHER_SCRIPT in .env (sango optional via MCP_SANGO_SCRIPT), then run npm start."
+  );
   process.exit(1);
 }
 
@@ -20,22 +27,9 @@ function readLLMConfig() {
     throw new Error("LLM_PROVIDER must be anthropic / deepseek / openai");
   }
 
-  const model =
-    process.env.LLM_MODEL ||
-    (provider === "anthropic"
-      ? "claude-3-5-sonnet-20241022"
-      : provider === "openai"
-        ? "gpt-4o-mini"
-        : "deepseek-v4-flash");
-
-  const apiKey = process.env.API_KEY;
-  const apiBaseUrl =
-    process.env.API_BASE_URL ||
-    (provider === "anthropic"
-      ? "https://api.anthropic.com"
-      : provider === "openai"
-        ? "https://api.openai.com/v1"
-        : "https://api.deepseek.com");
+  const model = process.env.LLM_MODEL || ''
+  const apiKey = process.env.API_KEY || '';
+  const apiBaseUrl = process.env.API_BASE_URL || '';
 
   if (!apiKey) {
     throw new Error("Missing API_KEY in .env");
@@ -45,7 +39,7 @@ function readLLMConfig() {
 }
 
 async function main() {
-  const transport = new MCPTransport(process.argv[2]);
+  const transport = new MCPTransport(mcpServerConfigs);
   await transport.connect();
 
   const llmConfig = readLLMConfig();

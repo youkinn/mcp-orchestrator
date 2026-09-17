@@ -7,6 +7,7 @@ import { ToolExecutionError } from './types.js';
 const MAX_MESSAGE_LENGTH = 300;
 const CHAT_ALLOWED_KEYS = ['message', 'domain'];
 const CHAT_ALLOWED_LABEL = 'message、domain';
+const CHAT_ALLOWED_DOMAINS = ['sango', 'sango-novel'];
 const RANDOM_ALLOWED_KEYS = ['message', 'sessionId'];
 const RANDOM_ALLOWED_LABEL = 'message、sessionId';
 
@@ -46,8 +47,15 @@ function parseBody(
   }
 
   const rawDomain = body.domain;
-  if (rawDomain !== undefined && rawDomain !== "sango") {
-    return { ok: false, code: 400, message: "domain 字段仅支持 \"sango\"" };
+  if (
+    rawDomain !== undefined &&
+    (typeof rawDomain !== 'string' || !CHAT_ALLOWED_DOMAINS.includes(rawDomain))
+  ) {
+    return {
+      ok: false,
+      code: 400,
+      message: `domain 字段仅支持 ${CHAT_ALLOWED_DOMAINS.join('、')}`
+    };
   }
 
   const session = body.sessionId;
@@ -55,7 +63,10 @@ function parseBody(
     ok: true,
     value: {
       message: raw.trim(),
-      domain: rawDomain === "sango" ? "sango" : undefined,
+      domain:
+        typeof rawDomain === 'string' && CHAT_ALLOWED_DOMAINS.includes(rawDomain)
+          ? rawDomain
+          : undefined,
       sessionId:
         typeof session === 'string' && session.trim()
           ? session.trim()

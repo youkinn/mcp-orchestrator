@@ -1,5 +1,9 @@
-import dotenv from 'dotenv';
-import { MCPTransport } from './transport.js';
+﻿import dotenv from 'dotenv';
+import {
+  MCPTransport,
+  resolveMCPServerConfigs,
+  WEATHER_SERVER_NAME,
+} from './transport.js';
 import { Agent, UNIFIED_SYSTEM_PROMPT } from './agent.js';
 import { SangoService } from './sango.js';
 import { createServer } from './server.js';
@@ -8,7 +12,6 @@ import type { LLMProvider, MCPToolDefinition } from './types.js';
 dotenv.config();
 
 const port = Number(process.env.PORT || 3000);
-const serverScriptPath = process.argv[2] || process.env.MCP_SERVER_SCRIPT;
 const allowedOrigin = process.env.WEB_ORIGIN || 'http://localhost:8001';
 
 // 本地题库工具：走 agent localTools，不经 MCP；描述限定适用域，供模型自主路由
@@ -22,9 +25,11 @@ const SANGO_QUERY_TOOL: MCPToolDefinition = {
   },
 };
 
-if (!serverScriptPath) {
+// 多 server 注册表：weather 必需（MCP_WEATHER_SCRIPT 必填），sango 可缺配（MCP_SANGO_SCRIPT）
+const mcpServerConfigs = resolveMCPServerConfigs(process.env);
+if (!mcpServerConfigs.some((config) => config.name === WEATHER_SERVER_NAME)) {
   console.error(
-    'Missing MCP Server path. Use npm run web -- <server.js path> or set MCP_SERVER_SCRIPT.'
+    'Missing MCP weather server path. Set MCP_WEATHER_SCRIPT in .env (sango optional via MCP_SANGO_SCRIPT), then run npm run dev.'
   );
   process.exit(1);
 }
@@ -34,26 +39,9 @@ function readLLMConfig() {
     process.env.LLM_PROVIDER || 'deepseek'
   ).toLowerCase() as LLMProvider;
 
-  if (!['anthropic', 'deepseek', 'openai'].includes(provider)) {
-    throw new Error('LLM_PROVIDER must be anthropic / deepseek / openai');
-  }
-
-  const model =
-    process.env.LLM_MODEL ||
-    (provider === 'anthropic'
-      ? 'claude-3-5-sonnet-20241022'
-      : provider === 'openai'
-        ? 'gpt-4o-mini'
-        : 'deepseek-v4-flash');
-
-  const apiKey = process.env.API_KEY;
-  const apiBaseUrl =
-    process.env.API_BASE_URL ||
-    (provider === 'anthropic'
-      ? 'https://api.anthropic.com'
-      : provider === 'openai'
-        ? 'https://api.openai.com/v1'
-        : 'https://api.deepseek.com');
+  const model = process.env.LLM_MODEL || ''
+  const apiKey = process.env.API_KEY || '';
+  const apiBaseUrl = process.env.API_BASE_URL || '';
 
   if (!apiKey) {
     throw new Error('Missing API_KEY in .env');
@@ -69,13 +57,13 @@ async function shutdown(signal: string, transport: MCPTransport) {
 }
 
 async function main() {
-  const transport = new MCPTransport(serverScriptPath!);
+  const transport = new MCPTransport(mcpServerConfigs);
   await transport.connect();
 
   const llmConfig = readLLMConfig();
   const sangoService = new SangoService();
 
-  // 统一 Agent：工具集 = MCP 工具 + 本地题库工具，调不调、调哪个由模型按语义自主决定
+  // 统一 Agent：工具集 = MCP 工具（合并 weather + sango）+ 本地题库工具；调不调、调哪个由模型按语义自主决定
   const mcpTools = await transport.listTools();
   const agent = new Agent(transport, llmConfig, {
     systemPrompt: UNIFIED_SYSTEM_PROMPT,
@@ -101,6 +89,9 @@ async function main() {
         };
       },
     },
+    // L3：无 domain 且 L2 未命中时，先做题库向量高置信识别，命中直接走 sango 快路径
+    sangoVectorMatcher: (query) =>
+      Promise.resolve(sangoService.isHighConfidenceSangoQuery(query)),
   });
 
   const app = createServer(agent, sangoService, { port, allowedOrigin });
