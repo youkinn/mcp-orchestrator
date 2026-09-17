@@ -540,8 +540,8 @@ export class Agent {
           ...fragments.filter((fragment) => !fragment.text.includes("未召回"))
         );
 
-        // 注入收窄：只取最符合的前 3 段，每段截为「出处头 + 检索词附近窗口」（LLM 输入 2500→~500 字）
-        // TODO: 收窄后可能导致最相关的原文片段被忽略，导致LLM生成的结论不准确，比如输入“演义中未涉及”。
+        // 注入收窄：只取最符合的前 5 段（与上方 collectRecallFragments 的 limit: 5 对齐，
+        // 此处的 slice 仅作防御性兜底），每段截为「出处头 + 最稀有检索词附近窗口」（LLM 输入 2500→~1000 字）
         const injected = novelFragments.length
           ? novelFragments
             .slice(0, 5)

@@ -153,7 +153,96 @@ function extractQueryKeys(query: string): string[] {
   return [...keys];
 }
 
-/** 截取「出处头 + 检索词附近窗口」：定位 query 关键词最后一次出现，前后各取 60 字；
+/** 窗口单侧半径（字）：以锚点前后各取该长度 */
+const WINDOW_RADIUS = 60;
+/** 注入窗口总长上限（字）：多锚点并集不超过该值，避免注入随锚点数变长失控 */
+const WINDOW_BUDGET = 280;
+/** 未命中任何关键词时的兜底长度（字） */
+const WINDOW_FALLBACK = 120;
+
+/** 一个 query key 在段内的全部出现位置 */
+interface KeyAnchor {
+  key: string;
+  occurrences: number[];
+}
+
+/** 段内窗口区间 [start, end) */
+type WindowSpan = [number, number];
+
+/**
+ * 稀有度代理排序（编排侧无语料 df，只能看段内证据）：
+ *   1. key 长度降序 —— 长 key 信息量大（「辕门射戟」优于「吕布」）；
+ *   2. 段内出现次数升序 —— 同一段内出现越多，越像该段的背景主语（如主案例段内
+ *      「孙权」2 次、「荆州」11 次），而非答案句的标志词；
+ *   3. 首次出现位置升序 —— 仅作稳定排序兜底。
+ * 旧逻辑取「最后一个 key 的最后一次出现」，长 query 里恰好把窗口钉在背景主语上，
+ * 答案句被整句切掉（主案例窗口 [277,399)，答案句在 455）。
+ */
+function rankKeyAnchors(anchors: KeyAnchor[]): KeyAnchor[] {
+  return [...anchors].sort(
+    (a, b) =>
+      b.key.length - a.key.length ||
+      a.occurrences.length - b.occurrences.length ||
+      a.occurrences[0] - b.occurrences[0]
+  );
+}
+
+/** 把同一 key 相邻/重叠的窗口合并，避免同一处出现被拆成多段 */
+function mergeSpans(spans: WindowSpan[]): WindowSpan[] {
+  const sorted = [...spans].sort((a, b) => a[0] - b[0]);
+  const merged: WindowSpan[] = [];
+  for (const span of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && span[0] <= last[1]) {
+      last[1] = Math.max(last[1], span[1]);
+    } else {
+      merged.push([span[0], span[1]]);
+    }
+  }
+  return merged;
+}
+
+/** 合并后区间总长（字） */
+function totalSpanLength(spans: WindowSpan[]): number {
+  return spans.reduce((sum, [start, end]) => sum + (end - start), 0);
+}
+
+/** 按稀有度顺序取窗口并集，总长不超过 budget；返回按位置排序的区间。
+ * 预算按「合并后并集长度」计算，重叠部分只算一次，避免重复锚点白吃预算。 */
+function selectWindowSpans(
+  body: string,
+  anchors: KeyAnchor[],
+  budget = WINDOW_BUDGET,
+  radius = WINDOW_RADIUS
+): WindowSpan[] {
+  let picked: WindowSpan[] = [];
+  for (const anchor of rankKeyAnchors(anchors)) {
+    const spans = mergeSpans(
+      anchor.occurrences.map(
+        (at): WindowSpan => [
+          Math.max(0, at - radius),
+          Math.min(body.length, at + anchor.key.length + radius),
+        ]
+      )
+    );
+    for (const span of spans) {
+      const candidate = mergeSpans([...picked, span]);
+      if (totalSpanLength(candidate) > budget) {
+        continue;
+      }
+      picked = candidate;
+    }
+  }
+  if (picked.length === 0 && anchors.length > 0) {
+    // 单个窗口就超预算（超长段 + 大 key）：至少保住最稀有 key 处的窗口
+    const first = anchors[0].occurrences[0];
+    const start = Math.max(0, first - radius);
+    picked = [[start, Math.min(body.length, start + budget)]];
+  }
+  return picked;
+}
+
+/** 截取「出处头 + 最稀有检索词附近窗口」：按稀有度锚定 query 关键词，取并集且总长受限；
  * 找不到关键词时取正文开头 120 字。注入与兜底共用，避免整段全文刷屏。 */
 export function trimFragmentToWindow(
   fragment: RecallFragment,
@@ -162,24 +251,28 @@ export function trimFragmentToWindow(
   const m = fragment.text.match(/^(\【出处\】[^\n]*\n?)([\s\S]*)$/);
   const header = m ? m[1] : "";
   const body = m ? m[2] : fragment.text;
-  const WINDOW = 60;
-  const FALLBACK = 120;
-  let start = 0;
-  let end = Math.min(body.length, FALLBACK);
+  const anchors: KeyAnchor[] = [];
   for (const key of extractQueryKeys(query)) {
-    let idx = -1;
+    const occurrences: number[] = [];
     let cursor = body.indexOf(key);
     while (cursor >= 0) {
-      idx = cursor;
+      occurrences.push(cursor);
       cursor = body.indexOf(key, cursor + key.length);
     }
-    if (idx >= 0) {
-      start = Math.max(0, idx - WINDOW);
-      end = Math.min(body.length, idx + key.length + WINDOW);
-      break;
+    if (occurrences.length > 0) {
+      anchors.push({ key, occurrences });
     }
   }
-  return { text: header + body.slice(start, end), source: fragment.source };
+  if (anchors.length === 0) {
+    return {
+      text: header + body.slice(0, WINDOW_FALLBACK),
+      source: fragment.source,
+    };
+  }
+  const text = selectWindowSpans(body, anchors)
+    .map(([start, end]) => body.slice(start, end))
+    .join("……");
+  return { text: header + text, source: fragment.source };
 }
 
 /** 兜底输出：不做归纳生成，只输出最符合的一段（检索词附近窗口）+ 出处 + 一句结论 */
