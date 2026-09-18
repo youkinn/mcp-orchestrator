@@ -540,11 +540,10 @@ export class Agent {
           ...fragments.filter((fragment) => !fragment.text.includes("未召回"))
         );
 
-        // 注入收窄：只取最符合的前 5 段（与上方 collectRecallFragments 的 limit: 5 对齐，
-        // 此处的 slice 仅作防御性兜底），每段截为「出处头 + 最稀有检索词附近窗口」（LLM 输入 2500→~1000 字）
+        // 注入收窄：只取最符合的前 3 段，每段截为「出处头 + 检索词附近窗口」（LLM 输入 2500→~500 字）
         const injected = novelFragments.length
           ? novelFragments
-            .slice(0, 5)
+            .slice(0, 3)
             .map((fragment) => trimFragmentToWindow(fragment, query).text)
             .join("\n\n")
           : "（检索无命中）";
