@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 /**
- * bug-00003 注入侧验收探针：直接调用 mcp-orchestrator 生产函数 trimFragmentToWindow
- * （非复刻），复跑 dev-docs/docs/sango-recall-bench.mjs 的 24 例用例集与语料。
+ * bug-00003 注入侧验收探针：直接调用 mcp-orchestrator 生产函数 buildInjectionView
+ * （非复刻），复跑 scripts/probe/recall-bench.mjs 的 24 例用例集与语料。
+ *
+ * 注：注入路径已改为「纯原文 + 指针」视图（feat-A004 §6.3），原 trimFragmentToWindow
+ * 已重构为 citation.ts 内部的窗口裁剪实现（不再导出），本探针改用其对外入口 buildInjectionView。
  *
  * 运行：node --experimental-strip-types scripts/probe/verify-injection-window.mjs
  *
@@ -9,20 +12,40 @@
  *   1. 主案例（孙权遣人向关羽求亲）目标段窗口是否包含答案句「吾虎女安肯嫁犬子乎」
  *   2. 24 例中 top5 已召回正确答案的用例的注入窗口截断率（旧逻辑 vs 新逻辑）
  */
-import { readFileSync } from 'node:fs';
-import { SangoIndex } from 'file:///D:/workplace/mcp-server/sango/src/search/sango-index.ts';
-import { tokenize } from 'file:///D:/workplace/mcp-server/sango/src/utils/text.ts';
-import { trimFragmentToWindow } from '../../src/citation.ts';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
-const SANGO_DIR = 'D:/workplace/mcp-server/sango';
+// 路径解析：与同目录 chunk-sweep.mjs / recall-bench.mjs 同一口径。
+const WORKSPACE_ROOT = resolve(import.meta.dirname, '../../..');
+const SANGO_DIR = resolve(process.env.SANGO_DIR ?? resolve(WORKSPACE_ROOT, 'mcp-server', 'sango'));
+const { tokenize } = await import(pathToFileURL(resolve(SANGO_DIR, 'src', 'utils', 'text.ts')).href);
+const { buildInjectionView } = await import(pathToFileURL(resolve(WORKSPACE_ROOT, 'mcp-orchestrator', 'src', 'citation.ts')).href);
+
 const MAIN_CASE = '孙权遣人向关羽求亲，关羽是怎么回复使者的';
 
-const idx = new SangoIndex();
-idx.load();
-const origTexts = idx.docs.map((d) => d.text);
+// 段级语料取自构建期中间产物 _segments/（SangoIndex 已改读 schema v2 的 chunks[]，
+// 段级数据不再从索引取；见 dev-docs/docs/sango-corpus-spec.md §5）。
+const SEGMENTS_DIR = resolve(SANGO_DIR, 'data', 'corpus', '_segments', 'sanguo-yanyi');
+const docs = [];
+if (existsSync(SEGMENTS_DIR)) {
+  for (const f of readdirSync(SEGMENTS_DIR).filter((x) => /^\d{3}\.json$/.test(x)).sort()) {
+    const ch = JSON.parse(readFileSync(resolve(SEGMENTS_DIR, f), 'utf8'));
+    for (const seg of ch.segments) {
+      docs.push({ chapter: ch.chapter, title: ch.title, segIndex: seg.index, type: seg.type, text: seg.text });
+    }
+  }
+}
+if (docs.length === 0) {
+  console.error(`[probe] 段级语料不存在或为空：${SEGMENTS_DIR}`);
+  console.error('[probe] 该产物由 build_corpus.py 生成，请先重建语料：');
+  console.error(`[probe]   py -3 ${resolve(SANGO_DIR, 'scripts', 'build_corpus.py')}`);
+  process.exit(1);
+}
+const origTexts = docs.map((d) => d.text);
 const headerOf = (d) => `【出处】第${d.chapter}回 ${d.title} · 段${d.segIndex}`;
 
-// --- 别名归一化：与 sango-index.ts / 评测脚本同一套规则（规范名取语料最高频写法） ---
+// --- 别名归一化：与评测脚本同一套规则（规范名取段级语料内最高频写法） ---
 const aliasRaw = JSON.parse(readFileSync(`${SANGO_DIR}/data/alias.json`, 'utf8'));
 const pidOf = new Map(Object.entries(aliasRaw));
 const byPid = new Map();
@@ -30,9 +53,11 @@ for (const [name, pid] of Object.entries(aliasRaw)) {
   if (!byPid.has(pid)) byPid.set(pid, []);
   byPid.get(pid).push(name);
 }
+const segDf = new Map();
+for (const t of origTexts) for (const tok of new Set(tokenize(t))) segDf.set(tok, (segDf.get(tok) ?? 0) + 1);
 const canonOf = new Map();
 for (const [pid, names] of byPid) {
-  canonOf.set(pid, names.slice().sort((a, b) => (idx.df.get(b) ?? 0) - (idx.df.get(a) ?? 0))[0]);
+  canonOf.set(pid, names.slice().sort((a, b) => (segDf.get(b) ?? 0) - (segDf.get(a) ?? 0))[0]);
 }
 const aliasNames = [...pidOf.keys()].sort((a, b) => b.length - a.length);
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -138,20 +163,21 @@ function legacyWindowOf(body, query) {
   return body.slice(start, end);
 }
 
-// --- 新逻辑：调用生产函数（带【出处】头，与运行时片段形态一致） ---
+// --- 新逻辑：调用生产函数 buildInjectionView（纯原文 + [片段N] 前缀，无出处头） ---
 function newWindowOf(docIndex, query) {
-  const d = idx.docs[docIndex];
-  const fragment = { text: `${headerOf(d)}\n${origTexts[docIndex]}`, source: 'sanguo-yanyi' };
-  return trimFragmentToWindow(fragment, query).text;
+  const d = docs[docIndex];
+  const fragment = { text: origTexts[docIndex], source: 'sanguo-yanyi', chapter: d.chapter, title: d.title };
+  const view = buildInjectionView([fragment], query);
+  return view.text.replace(/^\[片段\d+\]\s*/, '');
 }
-/** 去掉【出处】头，只留正文窗口，便于与旧逻辑同口径比较长度 */
+/** 去掉可能的片段前缀，只留正文窗口，便于与旧逻辑同口径比较长度 */
 function bodyOfWindow(text) {
-  return text.replace(/^\【出处\】[^\n]*\n?/, '');
+  return text.replace(/^\[片段\d+\]\s*/, '');
 }
 
 // ========== 验收 1：主案例 ==========
 console.log('\n=== 验收 1：主案例「' + MAIN_CASE + '」===');
-const mainDocIndex = idx.docs.findIndex((d) => d.chapter === 73 && d.segIndex === 5);
+const mainDocIndex = docs.findIndex((d) => d.chapter === 73 && d.segIndex === 5);
 console.log(`目标段：第73回 段5（docs[${mainDocIndex}]），段长 ${origTexts[mainDocIndex].length}，答案句位置 ${origTexts[mainDocIndex].indexOf('吾虎女安肯嫁犬子乎')}`);
 const ANSWER = '吾虎女安肯嫁犬子乎';
 const legacyMain = legacyWindowOf(origTexts[mainDocIndex], MAIN_CASE);
