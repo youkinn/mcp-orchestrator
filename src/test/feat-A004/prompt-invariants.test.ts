@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { UNIFIED_SYSTEM_PROMPT } from "../../agent.js";
 
-/** feat-A004 能力三 5 条不变量（定稿，措辞微调后语义不得改） */
+/** feat-A004 能力三 6 条不变量（定稿，措辞微调后语义不得改） */
 const NOVEL_RULES = [
   "1. 回答前必须先调用 sango_novel_search 工具检索《三国演义》原文。",
   "2. 只依据工具返回的原文作答：人物、情节、数字都必须能在原文里找到。",
@@ -11,7 +11,7 @@ const NOVEL_RULES = [
   "5. 不评价、不纠正、不对比：不得说原文写错，不得提正史/影视/游戏，不得出现「实际上是…」这类转折。",
 ];
 
-test("① prompt·能力三：5 条生成约束不变量原文照搬", () => {
+test("① prompt·能力三：6 条生成约束不变量原文照搬（第 6 条 = 引语指针格式）", () => {
   assert.match(
     UNIFIED_SYSTEM_PROMPT,
     /【能力三 ·《三国演义》原著检索（sango_novel_search）】/
@@ -20,6 +20,19 @@ test("① prompt·能力三：5 条生成约束不变量原文照搬", () => {
     assert.ok(
       UNIFIED_SYSTEM_PROMPT.includes(rule),
       `原著检索规则原文缺失：${rule}`
+    );
+  }
+});
+
+test("①.1 prompt·能力三：标题声明条数与实际规则条数一致（防漂移）", () => {
+  assert.match(
+    UNIFIED_SYSTEM_PROMPT,
+    /调了之后怎么答（以下 6 条必须严格遵守）：/
+  );
+  for (let i = 1; i <= 6; i++) {
+    assert.ok(
+      UNIFIED_SYSTEM_PROMPT.includes(`${i}. `),
+      `能力三规则 ${i} 缺失`
     );
   }
 });
