@@ -150,9 +150,10 @@ function bm25(bi, query, useNorm) {
     .sort((a, b) => score[b] - score[a]);
 }
 
-// --- V0：现状 search()（BM25 + 哈希向量混合）；出参已改为结构化条目数组，用 chapter + segFrom 折算回段下标 ---
-function ranksFromSearch(query, limit) {
-  const out = idx.search(query, limit);
+// --- V0：现状 search()（BM25 + 真向量混合，Step 2 起 query 侧运行期 BGE-M3 编码）；
+//     出参已改为结构化条目数组，用 chapter + segFrom 折算回段下标 ---
+async function ranksFromSearch(query, limit) {
+  const out = await idx.search(query, limit);
   if (!Array.isArray(out) || out.length === 0) return [];
   const ranks = [];
   for (const e of out) {
@@ -216,7 +217,7 @@ const biOrig = buildIndex(origTexts);
 const biNorm = buildIndex(normTexts);
 const biChunk = buildIndex(CH.chunks);
 const CONFIGS = [
-  ['V0 现状：混合召回/整段/无别名', (q, re) => bestRank(ranksFromSearch(q, 50), null, re)],
+  ['V0 现状：混合召回/整段/无别名', async (q, re) => bestRank(await ranksFromSearch(q, 50), null, re)],
   ['V1 纯BM25/整段/无别名', (q, re) => bestRank(bm25(biOrig, q, false), null, re)],
   ['V2 纯BM25/整段/+别名归一化', (q, re) => bestRank(bm25(biNorm, q, true), null, re)],
   ['V3 纯BM25/chunk250/+别名归一化', (q, re) => bestRank(bm25(biChunk, q, true), CH.docOf, re)],
@@ -224,7 +225,7 @@ const CONFIGS = [
 console.log('配置'.padEnd(32) + '@1'.padEnd(9) + '@3'.padEnd(9) + '@5');
 const allRanks = {};
 for (const [label, fn] of CONFIGS) {
-  const ranks = CASES.map(([q, re]) => fn(q, re));
+  const ranks = await Promise.all(CASES.map(([q, re]) => fn(q, re)));
   allRanks[label] = ranks;
   const hit = (n) => `${ranks.filter((r) => r > 0 && r <= n).length}/${CASES.length}`;
   console.log(label.padEnd(32) + hit(1).padEnd(7) + hit(3).padEnd(7) + hit(5));
