@@ -1,6 +1,9 @@
 ﻿// feat-A004：《三国演义》原著检索的引用硬校验模块
 // 校验规则：答案断言人物集合（ID 级）⊆ 召回原文人物集合（ID 级），不成立走兜底。
 // 人物 ID 化：本地别名表（封闭集合）扫描；无 ID 的次要人物退化为字符串包含校验。
+// 引用与出处改服务端渲染（spec §6.3）：模型只输出指针 `[Qn]`，引语原文与出处由本模块按
+// quotes[] / chapter / title 字段渲染；注入视图只给纯原文 + 服务端编号（`[片段N]` / `⟨Qn⟩`），
+// 不带回目、段号、分数。
 import { readFileSync } from "node:fs";
 
 export const SANGO_NOVEL_SEARCH_TOOL = "sango_novel_search";
@@ -77,10 +80,59 @@ export interface PersonMention {
   id?: string;
 }
 
-/** 召回原文片段：text 为原文（含出处信息由工具带回），source 为来源标识 */
+/** spec §5 语料 schema v2：一条引语（qid 只在 chunk 内唯一，注入期由服务端重编号为全局序号） */
+export interface RecallQuote {
+  qid: string;
+  /** 引语纯原文内容（不含成对引号） */
+  text: string;
+  /** 引语内容在 chunk.text 中的起始下标（成对引号位于 offset-1 与 offset+text.length） */
+  offset: number;
+  speaker?: string;
+}
+
+/** spec §5 检索工具出参条目（C4 定稿：裸数组，字段逐字为 id/text/chapter/title/type/segFrom/segTo/quoteBalanced/quotes） */
+export interface RecallEntry {
+  id?: string;
+  text: string;
+  /** 回号；逐条携带（单次召回的多条可来自不同回，出处只能逐条渲染） */
+  chapter?: number;
+  /** 回目；逐条携带 */
+  title?: string;
+  type?: string;
+  segFrom?: number;
+  segTo?: number;
+  quoteBalanced?: boolean;
+  quotes?: RecallQuote[];
+}
+
+/** 召回原文片段：text 为纯原文（不含出处 / 段号 / 分数），出处由 chapter / title 字段渲染 */
 export interface RecallFragment {
   text: string;
   source: string;
+  chapter?: number;
+  title?: string;
+  /** 该片段携带的引语（qid 为 chunk 内序号，渲染前由 buildInjectionView 重编号） */
+  quotes?: RecallQuote[];
+}
+
+/** 注入视图的片段条数上限（注入收窄，与 agent 侧口径一致） */
+export const INJECT_FRAGMENT_LIMIT = 3;
+
+/** 长引语安全网阈值（字）：模型输出里超过该长度的「…」视为违规抄写 */
+export const MAX_MODEL_QUOTE_LENGTH = 30;
+
+/** 引语渲染所需的元数据：逐字可信的原文 + 出处字段 */
+export interface RenderedQuote {
+  text: string;
+  chapter?: number;
+  title?: string;
+  source: string;
+}
+
+/** 注入视图：注入给模型的纯原文（带 `[片段N]` / `⟨Qn⟩` 标记）+ 全局 qid → 引语元数据 */
+export interface InjectionView {
+  text: string;
+  quotes: Map<string, RenderedQuote>;
 }
 
 
@@ -242,40 +294,192 @@ function selectWindowSpans(
   return picked;
 }
 
-/** 截取「出处头 + 最稀有检索词附近窗口」：按稀有度锚定 query 关键词，取并集且总长受限；
- * 找不到关键词时取正文开头 120 字。注入与兜底共用，避免整段全文刷屏。 */
-export function trimFragmentToWindow(
-  fragment: RecallFragment,
-  query: string
-): RecallFragment {
-  const m = fragment.text.match(/^(\【出处\】[^\n]*\n?)([\s\S]*)$/);
-  const header = m ? m[1] : "";
-  const body = m ? m[2] : fragment.text;
+/** 按稀有度锚定检索词取窗口：取并集且总长受限，找不到关键词时取开头 120 字 */
+function trimTextToWindow(text: string, query: string): string {
   const anchors: KeyAnchor[] = [];
   for (const key of extractQueryKeys(query)) {
     const occurrences: number[] = [];
-    let cursor = body.indexOf(key);
+    let cursor = text.indexOf(key);
     while (cursor >= 0) {
       occurrences.push(cursor);
-      cursor = body.indexOf(key, cursor + key.length);
+      cursor = text.indexOf(key, cursor + key.length);
     }
     if (occurrences.length > 0) {
       anchors.push({ key, occurrences });
     }
   }
   if (anchors.length === 0) {
-    return {
-      text: header + body.slice(0, WINDOW_FALLBACK),
-      source: fragment.source,
-    };
+    return text.slice(0, WINDOW_FALLBACK);
   }
-  const text = selectWindowSpans(body, anchors)
-    .map(([start, end]) => body.slice(start, end))
+  return selectWindowSpans(text, anchors)
+    .map(([start, end]) => text.slice(start, end))
     .join("……");
-  return { text: header + text, source: fragment.source };
 }
 
-/** 兜底输出：不做归纳生成，只输出最符合的一段（检索词附近窗口）+ 出处 + 一句结论 */
+/** 工具出参文本 → 结构化条目（C4 定稿：出参只有裸 JSON 数组一种形态；非数组视为无出参） */
+function parseRecallEntries(text: string): RecallEntry[] {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("[")) {
+    return [];
+  }
+  try {
+    const data = JSON.parse(trimmed) as unknown;
+    return Array.isArray(data) ? (data as RecallEntry[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 工具出参文本 → 召回片段：解析裸数组条目，元数据（chapter / title）逐条携带，正文只留纯原文 */
+export function toRecallFragments(
+  texts: string[],
+  source: string
+): RecallFragment[] {
+  const fragments: RecallFragment[] = [];
+  for (const text of texts) {
+    for (const entry of parseRecallEntries(text)) {
+      if (!entry || typeof entry.text !== "string" || !entry.text.trim()) {
+        continue;
+      }
+      fragments.push({
+        text: entry.text,
+        source,
+        chapter: typeof entry.chapter === "number" ? entry.chapter : undefined,
+        title:
+          typeof entry.title === "string" && entry.title.trim()
+            ? entry.title.trim()
+            : undefined,
+        quotes: Array.isArray(entry.quotes)
+          ? entry.quotes.filter(
+              (quote) => quote && typeof quote.text === "string" && quote.text
+            )
+          : undefined,
+      });
+    }
+  }
+  return fragments;
+}
+
+/** 在一个片段内标出引语：`⟨Qn⟩` 插在开引号前，qid 从 start 起按正文顺序全局编号 */
+function markFragmentQuotes(
+  fragment: RecallFragment,
+  start: number
+): { marked: string; assigned: Array<{ qid: string; quote: RecallQuote }>; next: number } {
+  const located: Array<{ at: number; quote: RecallQuote }> = [];
+  for (const quote of fragment.quotes ?? []) {
+    if (!quote || !quote.text) {
+      continue;
+    }
+    const offset = quote.offset;
+    const aligned =
+      typeof offset === "number" &&
+      offset > 0 &&
+      fragment.text.slice(offset, offset + quote.text.length) === quote.text;
+    const at = aligned ? offset - 1 : fragment.text.indexOf(`“${quote.text}”`);
+    if (at >= 0) {
+      located.push({ at, quote });
+    }
+  }
+  located.sort((a, b) => a.at - b.at);
+  const assigned = located.map((item, index) => ({
+    qid: `Q${start + index}`,
+    quote: item.quote,
+  }));
+  let marked = fragment.text;
+  for (let index = assigned.length - 1; index >= 0; index--) {
+    marked =
+      marked.slice(0, located[index].at) +
+      `⟨${assigned[index].qid}⟩` +
+      marked.slice(located[index].at);
+  }
+  return { marked, assigned, next: start + assigned.length };
+}
+
+/**
+ * 注入视图（spec §6.3）：纯原文 + 服务端编号。
+ * 片段带 `[片段N]`，片段内引语带 `⟨Qn⟩`；**不带回目、段号、分数**，模型无从抄写出处。
+ * qid 按注入顺序全局编号；窗口裁掉引语后其指针一并失效（quotes 只保留可见项）。
+ */
+export function buildInjectionView(
+  fragments: RecallFragment[],
+  query = ""
+): InjectionView {
+  const quotes = new Map<string, RenderedQuote>();
+  const parts: string[] = [];
+  let next = 1;
+  fragments.slice(0, INJECT_FRAGMENT_LIMIT).forEach((fragment, index) => {
+    const { marked, assigned, next: after } = markFragmentQuotes(fragment, next);
+    next = after;
+    const visible = trimTextToWindow(marked, query);
+    for (const { qid, quote } of assigned) {
+      if (!visible.includes(`⟨${qid}⟩`)) {
+        continue;
+      }
+      quotes.set(qid, {
+        text: quote.text,
+        chapter: fragment.chapter,
+        title: fragment.title,
+        source: fragment.source,
+      });
+    }
+    parts.push(`[片段${index + 1}] ${visible}`);
+  });
+  return { text: parts.join("\n\n"), quotes };
+}
+
+/** 模型输出里的引语指针（`[Qn]`） */
+export function extractQuotePointers(answer: string): string[] {
+  return [...answer.matchAll(/\[(Q\d+)\]/g)].map((matched) => matched[1]);
+}
+
+/** 指针校验（spec §6.4）：至少含一个指针，且指针全部 ∈ 本次注入的 qid 集合 */
+export function validateQuotePointers(
+  answer: string,
+  injected: Map<string, RenderedQuote>
+): { ok: boolean; pointers: string[]; invalid: string[] } {
+  const pointers = extractQuotePointers(answer);
+  const invalid = pointers.filter((qid) => !injected.has(qid));
+  return { ok: pointers.length > 0 && invalid.length === 0, pointers, invalid };
+}
+
+/** 长引语安全网（spec §6.4）：丢弃模型违规抄写的超长「…」（其原文由指针 + 字段渲染提供） */
+export function stripOverlongModelQuotes(answer: string): string {
+  return answer.replace(/「([^」]*)」/g, (whole, inner: string) =>
+    inner.length > MAX_MODEL_QUOTE_LENGTH ? "" : whole
+  );
+}
+
+/** 出处渲染：只到回目、不展示段号（spec §6.6）；无回号时退回来源标识 */
+export function formatQuoteSource(quote: {
+  chapter?: number;
+  title?: string;
+  source: string;
+}): string {
+  if (typeof quote.chapter === "number") {
+    return quote.title
+      ? `第${quote.chapter}回 ${quote.title}`
+      : `第${quote.chapter}回`;
+  }
+  return quote.source;
+}
+
+/** 服务端渲染引用与出处（spec §6.4 步骤 3）：`[Qn]` → `「原文」（出处：第N回 回目）` */
+export function renderAnswerWithQuotes(
+  answer: string,
+  injected: Map<string, RenderedQuote>
+): string {
+  return answer.replace(/\[(Q\d+)\]/g, (whole, qid: string) => {
+    const quote = injected.get(qid);
+    return quote
+      ? `「${quote.text}」（出处：${formatQuoteSource(quote)}）`
+      : whole;
+  });
+}
+
+/**
+ * 兜底输出（spec §6.4 步骤 4）：不做归纳生成，只输出最符合的一段 + 出处 + 一句结论。
+ * 原文取纯原文窗口（不含 `[片段N]` / `⟨Qn⟩` 注入标记），出处由 chapter / title 字段渲染、只到回目。
+ */
 export function buildFallback(
   fragments: RecallFragment[],
   conclusion: string,
@@ -287,10 +491,10 @@ export function buildFallback(
   if (fragments.length === 0) {
     return conclusionLine;
   }
-  const top = trimFragmentToWindow(fragments[0], query);
+  const top = fragments[0];
   return [
     "【原文片段】",
-    `${top.text}\n（出处：${top.source}）`,
+    `${trimTextToWindow(top.text, query)}\n（出处：${formatQuoteSource(top)}）`,
     "",
     conclusionLine,
   ].join("\n");

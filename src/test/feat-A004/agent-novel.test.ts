@@ -73,8 +73,24 @@ function textResponse(text: string): ModelResponse {
 
 const ALIAS_TABLE = loadAliasTable("a004-not-exist"); // stub 别名表（关羽=P002）
 
-const RECALL_TEXT =
-  "第五回：云长提刀出阵，斩华雄于帐前。众皆大惊，尽皆失色。";
+/** 召回出参（C4 定稿：裸 JSON 数组）：正文纯原文，出处逐条走 chapter / title，引语走 quotes[] */
+const RECALL_CHAPTER = 5;
+const RECALL_TITLE = "发矫诏诸镇应曹公　破关兵三英战吕布";
+const RECALL_QUOTE = "云长提刀出阵，斩华雄于帐前！";
+const RECALL_BODY = `众皆大惊曰：“${RECALL_QUOTE}”`;
+const RECALL_TEXT = JSON.stringify([
+  {
+    id: "sanguo-yanyi:0005:c0001",
+    text: RECALL_BODY,
+    chapter: RECALL_CHAPTER,
+    title: RECALL_TITLE,
+    type: "narration",
+    segFrom: 4,
+    segTo: 4,
+    quoteBalanced: true,
+    quotes: [{ qid: "Q1", text: RECALL_QUOTE, offset: 7, speaker: "众" }],
+  },
+]);
 
 test("domain=sango-novel 时 system 追加三国演义域提示（软性，不拦截非原著问句）", async () => {
   let capturedSystem = "";
@@ -95,7 +111,7 @@ test("domain=sango-novel 时 system 追加三国演义域提示（软性，不�
   assert.ok(capturedSystem.includes("sango_novel_search"), "域提示应指向原著检索工具");
 });
 
-test("① 引用校验通过：答案原样返回，无额外模型调用", async () => {
+test("① 指针合法：模型只给结论 + 指针，服务端渲染引用与出处（无额外模型调用）", async () => {
   let modelCallCount = 0;
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
@@ -105,7 +121,7 @@ test("① 引用校验通过：答案原样返回，无额外模型调用", asyn
           query: "谁斩了华雄？",
           limit: 5,
         })
-      : textResponse("斩华雄者系关羽。「云长提刀出阵，斩华雄于帐前。」（出处：第5回 破关兵三英战吕布）");
+      : textResponse("斩华雄者系关羽，原文见[Q1]。");
   };
 
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
@@ -123,12 +139,14 @@ test("① 引用校验通过：答案原样返回，无额外模型调用", asyn
   const answer = await agent.processQuery("谁斩了华雄？");
   assert.equal(
     answer,
-    "斩华雄者系关羽。「云长提刀出阵，斩华雄于帐前。」（出处：第5回 破关兵三英战吕布）"
+    `斩华雄者系关羽，原文见「${RECALL_QUOTE}」（出处：第${RECALL_CHAPTER}回 ${RECALL_TITLE}）。`
   );
+  assert.doesNotMatch(answer, /\[Q1\]/, "指针应已被服务端渲染替换");
+  assert.doesNotMatch(answer, /段\d/, "出处只到回目，不展示段号");
   assert.equal(modelCallCount, 2, "校验通过不应有额外模型调用");
 });
 
-test("② 引用校验不通过：输出兜底「原文片段 + 出处 + 结论归纳」", async () => {
+test("② 断言人物不在召回原文（曹操）：丢弃模型输出，输出兜底「原文片段 + 出处 + 结论归纳」", async () => {
   let modelCallCount = 0;
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
@@ -155,11 +173,109 @@ test("② 引用校验不通过：输出兜底「原文片段 + 出处 + 结论�
 
   const answer = await agent.processQuery("谁斩了华雄？");
   assert.match(answer, /【原文片段】/);
-  assert.match(answer, /第五回：云长提刀出阵，斩华雄于帐前。/);
-  assert.match(answer, /（出处：sanguo-yanyi）/);
+  assert.match(answer, /众皆大惊曰：“云长提刀出阵，斩华雄于帐前！”/);
+  assert.match(answer, /（出处：第5回 发矫诏诸镇应曹公　破关兵三英战吕布）/);
+  assert.doesNotMatch(answer, /段\d/, "出处只到回目，不展示段号");
   assert.match(answer, /按原文，斩华雄者系关羽/);
   assert.doesNotMatch(answer, /曹操斩了华雄/);
   assert.equal(modelCallCount, 2, "注入提取/结论后不增加模型调用");
+});
+
+test("②.1 指针非法（不在本次注入集合内）：丢弃模型输出，走兜底", async () => {
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return modelCallCount === 1
+      ? toolUseResponse("sango_novel_search", {
+          source: "sanguo-yanyi",
+          query: "谁斩了华雄？",
+          limit: 5,
+        })
+      : textResponse("斩华雄者系关羽，原文见[Q9]。");
+  };
+
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: RECALL_TEXT }],
+      }),
+    },
+    fallbackConcluder: async () => "斩华雄者系关羽",
+    modelCaller,
+  });
+
+  const answer = await agent.processQuery("谁斩了华雄？");
+  assert.match(answer, /【原文片段】/, "越界指针即走兜底");
+  assert.doesNotMatch(answer, /\[Q9\]/, "非法指针不得进入最终答案");
+  assert.equal(modelCallCount, 2, "兜底走注入的结论归纳，不额外调模型");
+});
+
+test("②.2 缺指针（结论无引用）：丢弃模型输出，走兜底", async () => {
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return modelCallCount === 1
+      ? toolUseResponse("sango_novel_search", {
+          source: "sanguo-yanyi",
+          query: "谁斩了华雄？",
+          limit: 5,
+        })
+      : textResponse("斩华雄者系关羽。");
+  };
+
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: RECALL_TEXT }],
+      }),
+    },
+    fallbackConcluder: async () => "斩华雄者系关羽",
+    modelCaller,
+  });
+
+  const answer = await agent.processQuery("谁斩了华雄？");
+  assert.match(answer, /【原文片段】/, "无指针即无出处，走兜底补出处");
+  assert.equal(modelCallCount, 2);
+});
+
+test("②.3 长引语安全网：模型违规抄写超 30 字引语被丢弃，原文改由指针渲染", async () => {
+  const longQuote = "云长提刀出阵，斩华雄于帐前，众皆大惊失色，尽皆低头不语，莫敢仰视其面。";
+  assert.ok(longQuote.length > 30);
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return modelCallCount === 1
+      ? toolUseResponse("sango_novel_search", {
+          source: "sanguo-yanyi",
+          query: "谁斩了华雄？",
+          limit: 5,
+        })
+      : textResponse(`斩华雄者系关羽，曰「${longQuote}」[Q1]。`);
+  };
+
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: RECALL_TEXT }],
+      }),
+    },
+    fallbackConcluder: async () => "斩华雄者系关羽",
+    modelCaller,
+  });
+
+  const answer = await agent.processQuery("谁斩了华雄？");
+  assert.doesNotMatch(answer, new RegExp(longQuote), "违规抄写应被丢弃");
+  assert.ok(
+    answer.includes(`「${RECALL_QUOTE}」（出处：第5回 ${RECALL_TITLE}）`),
+    "原文改由指针 + 字段渲染，逐字可信"
+  );
+  assert.equal(modelCallCount, 2, "安全网是确定性回收，不额外调模型");
 });
 
 test("③ 检索无命中：回答「演义中未涉及」，不做归纳生成", async () => {
@@ -245,24 +361,73 @@ test("⑤ 默认链路（本地别名表扫描 + 兜底结论）：校验不过�
 
   const answer = await agent.processQuery("谁斩了华雄？");
   assert.match(answer, /【原文片段】/);
-  assert.match(answer, /第五回：云长提刀出阵，斩华雄于帐前。/);
+  assert.match(answer, /众皆大惊曰：“云长提刀出阵，斩华雄于帐前！”/);
+  assert.match(answer, /（出处：第5回 发矫诏诸镇应曹公　破关兵三英战吕布）/);
   assert.match(answer, /按原文，斩华雄者系关羽/);
   assert.equal(callIndex, 3, "主问答 + 兜底结论共 3 次模型调用（无提取/NER）");
 });
-test("⑥ 快路径注入收窄：只取最符合前 3 段且每段窗口截断（不整段刷屏）", async () => {
+test("⑥ 快路径注入收窄：只取最符合前 3 段、每段窗口截断，且注入不含回目 / 段号 / 分数", async () => {
   let capturedUser = "";
   const filler = "先叙无关内容。".repeat(40);
   const key = "孙权遣人向关羽求亲，关羽怒曰“吾虎女安肯嫁犬子乎！”";
   const tailText = "后叙无关内容。".repeat(40);
-  // 4 段召回（按相关度降序）：第一段命中关键词、其余为无关长段
-  const multiText = [
-    "【出处】第73回 玄德进位汉中王 云长攻拔襄阳郡 · 段5（叙述）\n" + filler + key + tailText,
-    "【出处】第1回 宴桃园豪杰三结义 斩黄巾英雄首立功 · 段1（叙述）\n" + "桃园结义无关内容。".repeat(40),
-    "【出处】第5回 发矫诏诸镇应曹公 破关兵三英战吕布 · 段4（叙述）\n" + "三英战吕布无关内容。".repeat(40),
-    "【出处】第82回 孙权降魏受九锡 先主征吴赏六军 · 段1（叙述）\n" + "章武元年无关内容。".repeat(40),
-  ].join("\n\n");
+  // 4 条召回（按相关度降序、跨回）：第一条命中关键词、其余为无关长段
+  const multiText = JSON.stringify([
+    {
+      id: "sanguo-yanyi:0073:c0007",
+      text: filler + key + tailText,
+      chapter: 73,
+      title: "玄德进位汉中王　云长攻拔襄阳郡",
+      type: "narration",
+      segFrom: 5,
+      segTo: 5,
+      quoteBalanced: true,
+      quotes: [],
+    },
+    {
+      id: "sanguo-yanyi:0001:c0001",
+      text: "桃园结义无关内容。".repeat(40),
+      chapter: 1,
+      title: "宴桃园豪杰三结义　斩黄巾英雄首立功",
+      type: "narration",
+      segFrom: 1,
+      segTo: 1,
+      quoteBalanced: true,
+      quotes: [],
+    },
+    {
+      id: "sanguo-yanyi:0005:c0004",
+      text: "三英战吕布无关内容。".repeat(40),
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      type: "narration",
+      segFrom: 4,
+      segTo: 4,
+      quoteBalanced: true,
+      quotes: [],
+    },
+    {
+      id: "sanguo-yanyi:0082:c0001",
+      text: "章武元年无关内容。".repeat(40),
+      chapter: 82,
+      title: "孙权降魏受九锡　先主征吴赏六军",
+      type: "narration",
+      segFrom: 1,
+      segTo: 1,
+      quoteBalanced: true,
+      quotes: [],
+    },
+  ]);
+  let callCount = 0;
   const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
-    capturedUser = messages.find((m) => m.role === "user")?.content ?? "";
+    callCount += 1;
+    // 只取第一次（主问答）调用：注入的片段走 system 消息，user 消息只有原问题
+    if (callCount === 1) {
+      capturedUser = messages
+        .filter((m) => m.role === "system")
+        .map((m) => m.content ?? "")
+        .join("\n");
+    }
     return textResponse("斩华雄者系关羽。");
   };
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
@@ -278,4 +443,7 @@ test("⑥ 快路径注入收窄：只取最符合前 3 段且每段窗口截断�
   assert.ok(capturedUser.includes("求亲"), "注入应含最符合段的关键句");
   assert.ok(!capturedUser.includes("章武元年"), "注入只取前 3 段，不应含第 4 段");
   assert.ok(!capturedUser.includes("桃园结义无关内容。".repeat(40)), "每段应被窗口截断，不整段注入");
+  assert.ok(!capturedUser.includes("第73回"), "注入不带回目：模型无从抄写出处");
+  assert.ok(!capturedUser.includes("· 段"), "注入不带段号");
+  assert.match(capturedUser, /\[片段1\]/, "片段带服务端编号，模型据此定位");
 });
