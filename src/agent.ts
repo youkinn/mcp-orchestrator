@@ -89,7 +89,7 @@ const ROUTE_HINTS: Record<string, string> = {
   "sango-novel":
     ['当前用户已明确选择了“三国演义原著解读”场景。系统已预先调用 sango_novel_search（source=sanguo-yanyi）检索《三国演义》原文并附在问题下方【已检索到的《三国演义》原文片段】中；请直接依据这些片段作答，不要再调用 sango_novel_search。',
       '1. 给出一句结论，结论必须直接回答用户问题的主体。例如用户问“谁温酒斩华雄”，结论应写「关羽温酒斩华雄」；不能只写「酒尚温时斩华雄」。人名用原文中的称呼，关羽、云长、关公均可。',
-      '2. 结论后用指针引用原文：引语原文与出处由服务端按字段渲染，你不得抄写，只输出 `[Qn]` 指针（n 为片段中 `⟨Qn⟩` 标记的序号，如 [Q2]）；严禁输出引语原文、回目、出处或段号。',
+      '2. 结论后用指针引用原文：对应答案句是引语时输出 `[Qn]`（n 为 `⟨Qn⟩` 标记序号，如 [Q2]）；答案句是无引号的叙述句时输出 `[片段N]`（n 为该片段编号，如 [片段1]）。引语原文与出处由服务端按字段渲染，你不得抄写；严禁输出引语原文、回目、出处或段号。',
       '3. 只依据片段作答；片段中确实没有相关内容时才回复「演义中未涉及」。',
       '4. 正常回答不要以「按原文，」开头，禁止输出解释、总结或格式以外的内容。若提问明显不属于原著检索（如问候、天气等），按普通对话处理。'
     ].join("\n"),
@@ -338,7 +338,8 @@ export class Agent {
 
   /** sango-novel 快路径：直接调检索工具（不经模型决策）；测试可用 localTools 注入 */
   private async searchNovel(query: string): Promise<ToolCallResult> {
-    const args = { source: "sanguo-yanyi", query, limit: 5 };
+    // 返回收缩到 10 条（候选人来自 mcp-server 侧 50 路候选 + 重排），与 INJECT_FRAGMENT_LIMIT 联动
+    const args = { source: "sanguo-yanyi", query, limit: 10 };
     const localTool = this.options.localTools?.[SANGO_NOVEL_SEARCH_TOOL];
     return localTool
       ? await localTool(args)
@@ -450,7 +451,8 @@ export class Agent {
     answer: string,
     fragments: RecallFragment[],
     query: string,
-    injectedQuotes: Map<string, RenderedQuote>
+    injectedQuotes: Map<string, RenderedQuote>,
+    injectedTargets?: Map<string, RenderedQuote>
   ): Promise<string> {
     if (fragments.length === 0) {
       return NOVEL_NO_HIT_ANSWER;
@@ -463,6 +465,7 @@ export class Agent {
     const isNovelAnswer =
       scanRecallPersonIds(answer, aliasTable).size > 0 ||
       /\[Q\d+\]/.test(answer) ||
+      /\[片段\d+\]/.test(answer) ||
       /按原文，/.test(answer);
     if (!isNovelAnswer) {
       return answer;
@@ -471,11 +474,15 @@ export class Agent {
     // 断言扫描对象是丢弃违规抄写后的答案正文人名（抄写内容不参与断言）
     const cleaned = stripOverlongModelQuotes(answer);
     const assertedIds = scanRecallPersonIds(cleaned, aliasTable);
-    const pointer = validateQuotePointers(cleaned, injectedQuotes);
+    const pointer = validateQuotePointers(
+      cleaned,
+      injectedQuotes,
+      injectedTargets
+    );
     const asserted = [...assertedIds].map((id) => ({ name: id, id }));
     const check = verifyCitation(asserted, recallText, recallPersonIds);
     if (pointer.ok && check.ok) {
-      return renderAnswerWithQuotes(cleaned, injectedQuotes);
+      return renderAnswerWithQuotes(cleaned, injectedQuotes, injectedTargets);
     }
     const conclusion = await this.concludeFallback(fragments, query);
     return buildFallback(fragments, conclusion, query);
@@ -532,7 +539,7 @@ export class Agent {
     return "auto";
   }
 
-  private async resolveUserContent(query: string, domain?: string): Promise<{ result: string, novelFragments?: RecallFragment[], novelQuotes?: Map<string, RenderedQuote> }> {
+  private async resolveUserContent(query: string, domain?: string): Promise<{ result: string, novelFragments?: RecallFragment[], novelQuotes?: Map<string, RenderedQuote>, novelTargets?: Map<string, RenderedQuote> }> {
     if (domain && DOMAIN_ROUTES[domain]) {
       const novelFragments: RecallFragment[] = [];
       if (domain === DOMAIN_ROUTES["sango-novel"]) {
@@ -540,7 +547,7 @@ export class Agent {
         const fragments = this.collectRecallFragments(result, {
           source: "sanguo-yanyi",
           query,
-          limit: 5,
+          limit: 10,
         });
         novelFragments.push(
           ...fragments.filter((fragment) => !fragment.text.includes("未召回"))
@@ -550,7 +557,12 @@ export class Agent {
         // （`[片段N]` / `⟨Qn⟩`），不带回目、段号、分数（spec §6.3）
         const view = buildInjectionView(novelFragments, query);
         const injected = novelFragments.length ? view.text : "（检索无命中）";
-        return { result: injected, novelFragments, novelQuotes: view.quotes };
+        return {
+          result: injected,
+          novelFragments,
+          novelQuotes: view.quotes,
+          novelTargets: view.fragments,
+        };
       } else if (domain === DOMAIN_ROUTES["sango"]) {
         const result = await this.searchSangoQuestions(query);
         return { result: this.collectTexts(result).join("\n") };
@@ -570,6 +582,7 @@ export class Agent {
   async processQuery(query: string, domain?: string): Promise<string> {
     let novelFragments: RecallFragment[] = [];
     let novelQuotes = new Map<string, RenderedQuote>();
+    let novelTargets = new Map<string, RenderedQuote>();
     let novelSearched = false;
     const userContent = query.trim();
     let resolvedContent = '';
@@ -581,6 +594,7 @@ export class Agent {
       resolvedContent = result.result;
       novelFragments = result.novelFragments || [];
       novelQuotes = result.novelQuotes || novelQuotes;
+      novelTargets = result.novelTargets || novelTargets;
       novelSearched = result.novelFragments !== undefined;
     }
 
@@ -628,6 +642,7 @@ export class Agent {
           novelFragments.push(...this.collectRecallFragments(result, toolArgs));
           const view = buildInjectionView(novelFragments, query);
           novelQuotes = view.quotes;
+          novelTargets = view.fragments;
           toolContent = view.text;
         }
         const assistantMessage: any = {
@@ -677,7 +692,8 @@ export class Agent {
         answer,
         novelFragments,
         query,
-        novelQuotes
+        novelQuotes,
+        novelTargets
       );
     }
 

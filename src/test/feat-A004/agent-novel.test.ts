@@ -427,7 +427,7 @@ test("⑤ 默认链路（本地别名表扫描 + 兜底结论）：校验不过�
   assert.match(answer, /按原文，斩华雄者系关羽/);
   assert.equal(callIndex, 3, "主问答 + 兜底结论共 3 次模型调用（无提取/NER）");
 });
-test("⑥ 快路径注入收窄：只取最符合前 3 段、每段窗口截断，且注入不含回目 / 段号 / 分数", async () => {
+test("⑥ 快路径注入收窄：按上限 10 段注入、每段窗口截断，且注入不含回目 / 段号 / 分数", async () => {
   let capturedUser = "";
   const filler = "先叙无关内容。".repeat(40);
   const key = "孙权遣人向关羽求亲，关羽怒曰“吾虎女安肯嫁犬子乎！”";
@@ -502,9 +502,63 @@ test("⑥ 快路径注入收窄：只取最符合前 3 段、每段窗口截断�
   });
   await agent.processQuery("孙权遣人向关羽求亲，关羽是怎么回复使者的", "sango-novel");
   assert.ok(capturedUser.includes("求亲"), "注入应含最符合段的关键句");
-  assert.ok(!capturedUser.includes("章武元年"), "注入只取前 3 段，不应含第 4 段");
+  assert.ok(
+    !capturedUser.includes("章武元年无关内容。".repeat(40)),
+    "无锚点段按 120 字截断，不整段注入"
+  );
   assert.ok(!capturedUser.includes("桃园结义无关内容。".repeat(40)), "每段应被窗口截断，不整段注入");
   assert.ok(!capturedUser.includes("第73回"), "注入不带回目：模型无从抄写出处");
   assert.ok(!capturedUser.includes("· 段"), "注入不带段号");
   assert.match(capturedUser, /\[片段1\]/, "片段带服务端编号，模型据此定位");
+});
+
+test("⑦ 注入上限放宽到 10 + 叙述段指针（bug-00009 张飞题）：证据段排 #5 也进注入，模型 [片段5] 指针对应叙述答案句", async () => {
+  const filler = "无关内容。".repeat(30);
+  const entries = [
+    { id: "sanguo-yanyi:0016:c0014", text: `宋宪告布曰：“买马被张飞劫走。”${filler}`, chapter: 16, title: "吕奉先射戟辕门　曹孟德败师淯水", type: "narration", quotes: [] },
+    { id: "sanguo-yanyi:0065:c0008", text: `张飞与马超斗百余合。${filler}`, chapter: 65, title: "马超大战葭萌关　刘备自领益州牧", type: "narration", quotes: [] },
+    { id: "sanguo-yanyi:0065:c0007", text: `玄德望见马超阵上人马皆倦。${filler}`, chapter: 65, title: "马超大战葭萌关　刘备自领益州牧", type: "narration", quotes: [] },
+    { id: "sanguo-yanyi:0042:c0005", text: `曹操回顾左右曰：“翼德于百万军中”。${filler}`, chapter: 42, title: "张翼德大闹长坂桥　刘豫州败走汉津口", type: "narration", quotes: [] },
+    {
+      id: "sanguo-yanyi:0081:c0007",
+      text: "范、张二贼，探知消息，初更时分，各藏短刀，密入帐中，直至床前。原来张飞每睡不合眼；当夜寝于帐中，二贼以短刀刺入飞腹。飞大叫一声而亡。时年五十五。",
+      chapter: 81,
+      title: "急兄仇张飞遇害　雪弟恨先主兴兵",
+      type: "narration",
+      quotes: [],
+    },
+    { id: "sanguo-yanyi:0002:c0010", text: `张飞怒鞭督邮。${filler}`, chapter: 2, title: "张翼德怒鞭督邮　何国舅谋诛宦竖", type: "narration", quotes: [] },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return modelCallCount === 1
+      ? toolUseResponse("sango_novel_search", {
+          source: "sanguo-yanyi",
+          query: "张飞怎么死的",
+          limit: 5,
+        })
+      : textResponse("张飞被范疆、张达刺死。[片段5]");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "张飞被范疆、张达所杀",
+    modelCaller,
+  });
+  const answer = await agent.processQuery("张飞怎么死的");
+  assert.ok(
+    answer.includes(`张飞被范疆、张达刺死。「范、张二贼`),
+    "叙述句指针 [片段5] 应渲染证据段原文窗口"
+  );
+  assert.match(answer, /密入帐中/, "渲染原文含杀张飞过程");
+  assert.match(answer, /（出处：第81回 急兄仇张飞遇害　雪弟恨先主兴兵）/);
+  assert.doesNotMatch(answer, /\[片段5\]/, "指针已被服务端渲染替换");
+  assert.doesNotMatch(answer, /【原文片段】/, "指针合法不走兜底");
+  assert.equal(modelCallCount, 2, "校验通过不触发兜底结论归纳");
 });

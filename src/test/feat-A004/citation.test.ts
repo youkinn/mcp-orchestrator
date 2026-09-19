@@ -149,6 +149,7 @@ test("⑬ 注入视图只给纯原文 + 服务端编号：片段带 [片段N]、
   assert.doesNotMatch(view.text, /·\s*段\d/, "注入不带段号");
   assert.doesNotMatch(view.text, /分数|score/i, "注入不带分数");
   assert.equal(view.quotes.size, 2, "指针表应含两条可见引语");
+  assert.equal(view.fragments.size, 1, "叙述段指针表应含该片段窗口");
   assert.equal(view.quotes.get("Q2")!.chapter, 73, "指针表保留出处字段供服务端渲染");
 });
 
@@ -201,6 +202,28 @@ test("⑬.2 注入编号连续无空洞：窗口裁掉片段引语时并入首�
   );
   assert.equal(view.quotes.get("Q2")!.text, "酒且斟下，某去便来。", "证据段引语被并回窗口保底");
   assert.match(view.text, /⟨Q2⟩“酒且斟下，某去便来。”/, "并入的引语带可见编号");
+});
+
+test("⑬.3 注入上限 10（bug-00009 张飞题）：证据段排 #5 仍注入，整段叙述（无引语）不走指针也可被归纳", () => {
+  const filler = "无关内容。".repeat(30);
+  const fragments = [
+    { text: `宋宪告布曰：“买马被张飞劫走。”${filler}`, source: "sanguo-yanyi", chapter: 16, title: "吕奉先射戟辕门　曹孟德败师淯水", quotes: [] },
+    { text: `张飞与马超斗百余合。${filler}`, source: "sanguo-yanyi", chapter: 65, title: "马超大战葭萌关　刘备自领益州牧", quotes: [] },
+    { text: `玄德望见马超阵上人马皆倦。${filler}`, source: "sanguo-yanyi", chapter: 65, title: "马超大战葭萌关　刘备自领益州牧", quotes: [] },
+    { text: `曹操回顾左右曰：“翼德百万军中取上将之首”。${filler}`, source: "sanguo-yanyi", chapter: 42, title: "张翼德大闹长坂桥　刘豫州败走汉津口", quotes: [] },
+    {
+      text: "范、张二贼，密入帐中，直至床前。张飞每睡不合眼；二贼以短刀刺入飞腹。飞大叫一声而亡。时年五十五。",
+      source: "sanguo-yanyi",
+      chapter: 81,
+      title: "急兄仇张飞遇害　雪弟恨先主兴兵",
+      quotes: [],
+    },
+    { text: `张飞怒鞭督邮。${filler}`, source: "sanguo-yanyi", chapter: 2, title: "张翼德怒鞭督邮　何国舅谋诛宦竖", quotes: [] },
+  ];
+  const view = buildInjectionView(fragments, "张飞怎么死的");
+  assert.ok(view.text.includes("[片段5]"), "注入上限放宽到 10：第 5 段应注入");
+  assert.ok(view.text.includes("范、张二贼，密入帐中"), "证据段叙述整体可见，模型可据此归纳");
+  assert.equal(view.quotes.size, 0, "该题无引语可指针，兜底路径负责叙述窗口输出");
 });
 
 test("⑭ buildFallback 只输出最符合的一段：多段召回不长篇大论", () => {
@@ -290,6 +313,24 @@ test("⑮ 指针校验：指针 ∈ 本次注入 qid 集合才通过，缺指针
   assert.deepEqual(outOfRange.invalid, ["Q9"]);
 });
 
+test("⑮.1 指针校验支持叙述段指针：`[片段N]` ∈ 本次注入片段编号集合才通过（bug-00009）", () => {
+  const injected = new Map([
+    ["Q1", { text: "吾虎女安肯嫁犬子乎！", chapter: 73, source: "sanguo-yanyi" }],
+  ]);
+  const targets = new Map([
+    ["片段5", { text: "范、张二贼，密入帐中，以短刀刺入飞腹。", chapter: 81, source: "sanguo-yanyi" }],
+  ]);
+  const ok = validateQuotePointers("张飞被范疆、张达刺死。[片段5]", injected, targets);
+  assert.equal(ok.ok, true);
+  assert.deepEqual(ok.pointers, ["片段5"]);
+  assert.deepEqual(ok.invalid, []);
+  const unknown = validateQuotePointers("张飞被害[片段9]", injected, targets);
+  assert.equal(unknown.ok, false, "片段编号不在注入集合内即不合法");
+  assert.deepEqual(unknown.invalid, ["片段9"]);
+  const noTargets = validateQuotePointers("张飞被害[片段5]", injected);
+  assert.equal(noTargets.ok, false, "未携带片段指针表时 [片段N] 判非法（向后兼容）");
+});
+
 test("⑯ 服务端渲染引用与出处：指针 → 「原文」（出处：第N回 回目），不展示段号", () => {
   const injected = new Map([
     [
@@ -314,6 +355,30 @@ test("⑯ 服务端渲染引用与出处：指针 → 「原文」（出处：�
 test("⑯.1 出处渲染：无回号时退回来源标识，不伪造回目", () => {
   assert.equal(formatQuoteSource({ chapter: 5, source: "sanguo-yanyi" }), "第5回");
   assert.equal(formatQuoteSource({ source: "sanguo-yanyi" }), "sanguo-yanyi");
+});
+
+test("⑯.2 叙述段指针渲染：`[片段N]` → 该片段窗口原文 + 出处（bug-00009 张飞题）", () => {
+  const fragments = new Map([
+    [
+      "片段5",
+      {
+        text: "范、张二贼，密入帐中，以短刀刺入飞腹。飞大叫一声而亡。",
+        chapter: 81,
+        title: "急兄仇张飞遇害　雪弟恨先主兴兵",
+        source: "sanguo-yanyi",
+      },
+    ],
+  ]);
+  const rendered = renderAnswerWithQuotes(
+    "张飞被范疆、张达刺死。[片段5]",
+    new Map(),
+    fragments
+  );
+  assert.equal(
+    rendered,
+    "张飞被范疆、张达刺死。「范、张二贼，密入帐中，以短刀刺入飞腹。飞大叫一声而亡。」（出处：第81回 急兄仇张飞遇害　雪弟恨先主兴兵）"
+  );
+  assert.doesNotMatch(rendered, /\[片段5\]/, "指针已渲染替换");
 });
 
 test("⑰ 长引语安全网：超 30 字的「…」视为违规抄写被丢弃，短引语原样保留", () => {

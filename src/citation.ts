@@ -115,8 +115,9 @@ export interface RecallFragment {
   quotes?: RecallQuote[];
 }
 
-/** 注入视图的片段条数上限（注入收窄，与 agent 侧口径一致） */
-export const INJECT_FRAGMENT_LIMIT = 3;
+/** 注入视图的片段条数上限：与检索返回条数联动（返回收缩到 10 条即全部注入）。
+ * 放宽后第 4~10 名对模型可见——张飞题证据段排 #5，旧值 3 把它挡在模型视野外（bug-00009 同类）。 */
+export const INJECT_FRAGMENT_LIMIT = 10;
 
 /** 长引语安全网阈值（字）：模型输出里超过该长度的「…」视为违规抄写 */
 export const MAX_MODEL_QUOTE_LENGTH = 30;
@@ -133,6 +134,8 @@ export interface RenderedQuote {
 export interface InjectionView {
   text: string;
   quotes: Map<string, RenderedQuote>;
+  /** 全局片段编号 → 该片段原文窗口（叙述句答案的引用目标：`[片段N]` 指针渲染用，bug-00009） */
+  fragments: Map<string, RenderedQuote>;
 }
 
 
@@ -209,6 +212,8 @@ function extractQueryKeys(query: string): string[] {
 const WINDOW_RADIUS = 60;
 /** 注入窗口总长上限（字）：多锚点并集不超过该值，避免注入随锚点数变长失控 */
 const WINDOW_BUDGET = 280;
+/** 注入视图全问总预算（字）：10 段召回共享，避免 limit/注入段数放宽后 token 随段数线性膨胀 */
+const INJECT_TOTAL_BUDGET = 1600;
 /** 未命中任何关键词时的兜底长度（字） */
 const WINDOW_FALLBACK = 120;
 
@@ -294,8 +299,13 @@ function selectWindowSpans(
   return picked;
 }
 
-/** 按稀有度锚定检索词取窗口：取并集且总长受限，找不到关键词时取开头 120 字 */
-function trimTextToWindow(text: string, query: string): string {
+/** 按稀有度锚定检索词取窗口：取并集且总长受限，找不到关键词时取开头 120 字。
+ * budget 可按调用方预算传入（注入视图多段共享总预算，兜底单段用默认值）。 */
+function trimTextToWindow(
+  text: string,
+  query: string,
+  budget = WINDOW_BUDGET
+): string {
   const anchors: KeyAnchor[] = [];
   for (const key of extractQueryKeys(query)) {
     const occurrences: number[] = [];
@@ -311,7 +321,7 @@ function trimTextToWindow(text: string, query: string): string {
   if (anchors.length === 0) {
     return text.slice(0, WINDOW_FALLBACK);
   }
-  return selectWindowSpans(text, anchors)
+  return selectWindowSpans(text, anchors, budget)
     .map(([start, end]) => text.slice(start, end))
     .join("……");
 }
@@ -423,11 +433,27 @@ export function buildInjectionView(
   query = ""
 ): InjectionView {
   const quotes = new Map<string, RenderedQuote>();
+  const targets = new Map<string, RenderedQuote>();
   const parts: string[] = [];
   let next = 1;
-  fragments.slice(0, INJECT_FRAGMENT_LIMIT).forEach((fragment, index) => {
-    const windowed = trimTextToWindow(fragment.text, query);
+  const injected = fragments.slice(0, INJECT_FRAGMENT_LIMIT);
+  // 多段共享总预算：段数越多单段窗口越短，余额给到命中答案句的段（引语保底不受此限）
+  const perBudget = Math.max(
+    WINDOW_FALLBACK,
+    Math.min(
+      WINDOW_BUDGET,
+      Math.floor(INJECT_TOTAL_BUDGET / Math.max(1, injected.length))
+    )
+  );
+  injected.forEach((fragment, index) => {
+    const windowed = trimTextToWindow(fragment.text, query, perBudget);
     const visible = mergeFirstQuoteIntoWindow(windowed, fragment);
+    targets.set(`片段${index + 1}`, {
+      text: windowed,
+      chapter: fragment.chapter,
+      title: fragment.title,
+      source: fragment.source,
+    });
     const { marked, assigned, next: after } = markQuotesInWindow(
       visible,
       fragment,
@@ -444,21 +470,34 @@ export function buildInjectionView(
     }
     parts.push(`[片段${index + 1}] ${marked}`);
   });
-  return { text: parts.join("\n\n"), quotes };
+  return { text: parts.join("\n\n"), quotes, fragments: targets };
+}
+
+/** 模型输出里的引用指针（`[Qn]` 引语 / `[片段N]` 叙述段） */
+export function extractCitePointers(answer: string): string[] {
+  return [
+    ...[...answer.matchAll(/\[(Q\d+)\]/g)].map((matched) => matched[1]),
+    ...[...answer.matchAll(/\[片段(\d+)\]/g)].map(
+      (matched) => `片段${matched[1]}`
+    ),
+  ];
 }
 
 /** 模型输出里的引语指针（`[Qn]`） */
 export function extractQuotePointers(answer: string): string[] {
-  return [...answer.matchAll(/\[(Q\d+)\]/g)].map((matched) => matched[1]);
+  return extractCitePointers(answer).filter((ref) => ref.startsWith("Q"));
 }
 
-/** 指针校验（spec §6.4）：至少含一个指针，且指针全部 ∈ 本次注入的 qid 集合 */
+/** 指针校验（spec §6.4）：至少含一个指针，且指针全部 ∈ 本次注入的 qid / 片段编号集合 */
 export function validateQuotePointers(
   answer: string,
-  injected: Map<string, RenderedQuote>
+  injected: Map<string, RenderedQuote>,
+  injectedFragments?: Map<string, RenderedQuote>
 ): { ok: boolean; pointers: string[]; invalid: string[] } {
-  const pointers = extractQuotePointers(answer);
-  const invalid = pointers.filter((qid) => !injected.has(qid));
+  const pointers = extractCitePointers(answer);
+  const invalid = pointers.filter((ref) =>
+    ref.startsWith("Q") ? !injected.has(ref) : !injectedFragments?.has(ref)
+  );
   return { ok: pointers.length > 0 && invalid.length === 0, pointers, invalid };
 }
 
@@ -483,13 +522,17 @@ export function formatQuoteSource(quote: {
   return quote.source;
 }
 
-/** 服务端渲染引用与出处（spec §6.4 步骤 3）：`[Qn]` → `「原文」（出处：第N回 回目）` */
+/** 服务端渲染引用与出处（spec §6.4 步骤 3）：`[Qn]` → 引语、`[片段N]` → 叙述段窗口，
+ * 均渲染为 `「原文」（出处：第N回 回目）`；未注册的指针原样保留。 */
 export function renderAnswerWithQuotes(
   answer: string,
-  injected: Map<string, RenderedQuote>
+  injected: Map<string, RenderedQuote>,
+  injectedFragments?: Map<string, RenderedQuote>
 ): string {
-  return answer.replace(/\[(Q\d+)\]/g, (whole, qid: string) => {
-    const quote = injected.get(qid);
+  return answer.replace(/\[(Q\d+|片段\d+)\]/g, (whole, ref: string) => {
+    const quote = ref.startsWith("Q")
+      ? injected.get(ref)
+      : injectedFragments?.get(ref);
     return quote
       ? `「${quote.text}」（出处：${formatQuoteSource(quote)}）`
       : whole;
