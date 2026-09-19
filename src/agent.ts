@@ -12,11 +12,18 @@ import {
   NOVEL_NO_HIT_ANSWER,
   SANGO_NOVEL_SEARCH_TOOL,
   buildFallback,
+  buildInjectionView,
+  formatQuoteSource,
   loadAliasTable,
+  pickBestFallbackFragment,
+  renderAnswerWithQuotes,
   scanRecallPersonIds,
-  trimFragmentToWindow,
+  stripOverlongModelQuotes,
+  toRecallFragments,
+  validateQuotePointers,
   verifyCitation,
   type RecallFragment,
+  type RenderedQuote,
 } from "./citation.js";
 
 // 统一路由提示词（feat-A003）：单 Agent 自主决定调不调工具、调哪个
@@ -48,19 +55,19 @@ export const UNIFIED_SYSTEM_PROMPT = [
   "",
   "【能力三 ·《三国演义》原著检索（sango_novel_search）】",
   "什么时候调：用户询问《三国演义》原著情节、人物、事件等需要原文依据的问题时，调用 sango_novel_search 工具检索原文（参数 source=sanguo-yanyi、query=用户白话问句、limit 默认 5）。",
-  "调了之后怎么答（以下 5 条必须严格遵守）：",
+  "调了之后怎么答（以下 6 条必须严格遵守）：",
   "1. 回答前必须先调用 sango_novel_search 工具检索《三国演义》原文。",
   "2. 只依据工具返回的原文作答：人物、情节、数字都必须能在原文里找到。",
   "3. 人名一律以召回原文为准：原文写谁就是谁，不得按常识/记忆替换、不得补别名、不得解释成别人。",
   "4. 原文里没有相关内容的问句，必须回答「演义中未涉及」，禁止用先验知识补全。",
   "5. 不评价、不纠正、不对比：不得说原文写错，不得提正史/影视/游戏，不得出现「实际上是…」这类转折。",
-  "6. 回答格式固定：先写一句结论，然后写「引用的原文」（出处：第X回 回目），出处只到回目、不写段落编号；有多段时匹配优先度最高的那一段即可。",
+  "6. 回答格式固定：先写一句结论，再用指针引用原文。引语原文与出处一律由服务端按字段渲染，你不得抄写；你只输出指针 `[Qn]`（n 为注入片段中 `⟨Qn⟩` 标记的序号，如 `[Q2]`）。示例：「关羽拒绝了孙权的联姻，回以[Q2]。」严禁输出引语原文、回目、出处或段号。",
   "",
   // 优先级判断次序
   "【判断次序（自上而下，命中即停）】",
   "三个专用域互斥，按语义命中即停：",
   "1. 意图是否命中风云三国游戏内招募武将问答题 → 命中：调 sango_query，按能力二的 5 条作答。",
-  "1.1 意图是否命中《三国演义》原著情节 / 人物 / 事件等需要原文依据的问句 → 命中：调 sango_novel_search（参数 source=sanguo-yanyi、query=用户白话问句、limit 默认 5），按能力三的 5 条作答。",
+  "1.1 意图是否命中《三国演义》原著情节 / 人物 / 事件等需要原文依据的问句 → 命中：调 sango_novel_search（参数 source=sanguo-yanyi、query=用户白话问句、limit 默认 5），按能力三的 6 条作答。",
   "2. 意图是否命中美国境内城市的天气 / 地铁通勤出行 → 命中：调 get-forecast（必要时 get-alerts），按能力一的 5 条作答。",
   "3. 以上都未命中 → 不调用任何工具，转入分域兜底。",
   "",
@@ -82,7 +89,7 @@ const ROUTE_HINTS: Record<string, string> = {
   "sango-novel":
     ['当前用户已明确选择了“三国演义原著解读”场景。系统已预先调用 sango_novel_search（source=sanguo-yanyi）检索《三国演义》原文并附在问题下方【已检索到的《三国演义》原文片段】中；请直接依据这些片段作答，不要再调用 sango_novel_search。',
       '1. 给出一句结论，结论必须直接回答用户问题的主体。例如用户问“谁温酒斩华雄”，结论应写「关羽温酒斩华雄」；不能只写「酒尚温时斩华雄」。人名用原文中的称呼，关羽、云长、关公均可。',
-      '2. 结论后写一条「引用的原文」，格式为`「原文短句」（出处：第X回 回目）`，出处只到回目，不写段落编号。',
+      '2. 结论后用指针引用原文：对应答案句是引语时输出 `[Qn]`（n 为 `⟨Qn⟩` 标记序号，如 [Q2]）；答案句是无引号的叙述句时输出 `[片段N]`（n 为该片段编号，如 [片段1]）。引语原文与出处由服务端按字段渲染，你不得抄写；严禁输出引语原文、回目、出处或段号。',
       '3. 只依据片段作答；片段中确实没有相关内容时才回复「演义中未涉及」。',
       '4. 正常回答不要以「按原文，」开头，禁止输出解释、总结或格式以外的内容。若提问明显不属于原著检索（如问候、天气等），按普通对话处理。'
     ].join("\n"),
@@ -331,7 +338,8 @@ export class Agent {
 
   /** sango-novel 快路径：直接调检索工具（不经模型决策）；测试可用 localTools 注入 */
   private async searchNovel(query: string): Promise<ToolCallResult> {
-    const args = { source: "sanguo-yanyi", query, limit: 5 };
+    // 返回收缩到 10 条（候选人来自 mcp-server 侧 50 路候选 + 重排），与 INJECT_FRAGMENT_LIMIT 联动
+    const args = { source: "sanguo-yanyi", query, limit: 10 };
     const localTool = this.options.localTools?.[SANGO_NOVEL_SEARCH_TOOL];
     return localTool
       ? await localTool(args)
@@ -382,18 +390,8 @@ export class Agent {
       typeof args.source === "string" && args.source.trim()
         ? args.source
         : "《三国演义》";
-    // 工具按相关度降序返回多段（每段以【出处】开头），拆成独立片段供「取最符合一段」与注入收窄
-    const fragments: RecallFragment[] = [];
-    for (const text of texts) {
-      const parts = text.split(/(?=\【出处\】第\d+回)/);
-      for (const part of parts) {
-        const trimmed = part.trim();
-        if (trimmed) {
-          fragments.push({ text: trimmed, source });
-        }
-      }
-    }
-    return fragments;
+    // 工具按相关度降序返回结构化条目（spec §5）；出处 / 段号 / 分数走字段，正文只留纯原文
+    return toRecallFragments(texts, source);
   }
 
   private getAliasTable(): Map<string, string> {
@@ -420,12 +418,14 @@ export class Agent {
     fragments: RecallFragment[],
     query: string
   ): Promise<string> {
-    // 只取最符合的一段（检索词附近窗口），避免结论归纳被无关长文带偏
+    // 只取最符合的一段（检索词附近窗口），避免结论归纳被无关长文带偏；
+    // 选段与兜底展示同口径（pickBestFallbackFragment 锚点评分），不再盲取 fragments[0]；
+    // 片段与出处同样由字段渲染（纯原文 + 回目），模型只归纳一句结论
     const top = fragments.length
-      ? trimFragmentToWindow(fragments[0], query)
+      ? pickBestFallbackFragment(fragments, query)
       : null;
     const fragmentText = top
-      ? `${top.text}\n（出处：${top.source}）`
+      ? `${buildInjectionView([top], query).text}\n（出处：${formatQuoteSource(top)}）`
       : "（无原文片段）";
     const content = `用户问题：${query}\n\n${fragmentText}`;
     const response = await this.invokeModel(
@@ -442,11 +442,17 @@ export class Agent {
       .trim();
   }
 
-  /** feat-A004：引用硬校验（本地别名表扫描，0 次 LLM）+ 固定格式；校验 / 格式不过 → 兜底 */
+  /**
+   * feat-A004：引用硬校验（本地别名表扫描，0 次 LLM）+ 指针校验 + 服务端渲染引用与出处。
+   * 模型只输出「结论 + 指针」（`[Qn]`）：指针合法（∈ 本次注入的 qid）且断言人物 ⊆ 召回人物 →
+   * 由字段渲染 `「原文」（出处：第N回 回目）`；指针非法 / 抄写超长引语 / 断言不成立 → 兜底。
+   */
   private async applyNovelCitationGuard(
     answer: string,
     fragments: RecallFragment[],
-    query: string
+    query: string,
+    injectedQuotes: Map<string, RenderedQuote>,
+    injectedTargets?: Map<string, RenderedQuote>
   ): Promise<string> {
     if (fragments.length === 0) {
       return NOVEL_NO_HIT_ANSWER;
@@ -454,22 +460,29 @@ export class Agent {
     const aliasTable = this.getAliasTable();
     const recallText = fragments.map((fragment) => fragment.text).join("\n");
     const recallPersonIds = scanRecallPersonIds(recallText, aliasTable);
-    // 出处头（第X回 回目）是元数据：回目可能含他人名（如「三英战吕布」），不参与断言扫描
-    const assertedIds = scanRecallPersonIds(
-      answer.replace(/（出处：[^）]*）/g, ""),
-      aliasTable
-    );
-    // 软性域：问候 / 天气等非原著问句（无别名人物、无出处标记）不套用原著检索格式
+    // 软性域：问候 / 天气等非原著问句（无别名人物、无指针）不套用原著检索格式
+    // 判定基于原始输出：安全网只做内容回收，不得把非原著答案误吞成空串
     const isNovelAnswer =
-      assertedIds.size > 0 || /（出处：第\d+回/.test(answer) || /按原文，/.test(answer);
+      scanRecallPersonIds(answer, aliasTable).size > 0 ||
+      /\[Q\d+\]/.test(answer) ||
+      /\[片段\d+\]/.test(answer) ||
+      /按原文，/.test(answer);
     if (!isNovelAnswer) {
       return answer;
     }
-    const formatOk = /「[^」]+」（出处：第\d+回[^）]*）/.test(answer);
+    // H4 长引语安全网：模型输出里的超长「…」是违规抄写，直接丢弃；原文改由指针 + 字段渲染提供。
+    // 断言扫描对象是丢弃违规抄写后的答案正文人名（抄写内容不参与断言）
+    const cleaned = stripOverlongModelQuotes(answer);
+    const assertedIds = scanRecallPersonIds(cleaned, aliasTable);
+    const pointer = validateQuotePointers(
+      cleaned,
+      injectedQuotes,
+      injectedTargets
+    );
     const asserted = [...assertedIds].map((id) => ({ name: id, id }));
     const check = verifyCitation(asserted, recallText, recallPersonIds);
-    if (formatOk && check.ok) {
-      return answer;
+    if (pointer.ok && check.ok) {
+      return renderAnswerWithQuotes(cleaned, injectedQuotes, injectedTargets);
     }
     const conclusion = await this.concludeFallback(fragments, query);
     return buildFallback(fragments, conclusion, query);
@@ -526,7 +539,7 @@ export class Agent {
     return "auto";
   }
 
-  private async resolveUserContent(query: string, domain?: string): Promise<{ result: string, novelFragments?: RecallFragment[] }> {
+  private async resolveUserContent(query: string, domain?: string): Promise<{ result: string, novelFragments?: RecallFragment[], novelQuotes?: Map<string, RenderedQuote>, novelTargets?: Map<string, RenderedQuote> }> {
     if (domain && DOMAIN_ROUTES[domain]) {
       const novelFragments: RecallFragment[] = [];
       if (domain === DOMAIN_ROUTES["sango-novel"]) {
@@ -534,21 +547,22 @@ export class Agent {
         const fragments = this.collectRecallFragments(result, {
           source: "sanguo-yanyi",
           query,
-          limit: 5,
+          limit: 10,
         });
         novelFragments.push(
           ...fragments.filter((fragment) => !fragment.text.includes("未召回"))
         );
 
-        // 注入收窄：只取最符合的前 3 段，每段截为「出处头 + 检索词附近窗口」（LLM 输入 2500→~500 字）
-        // TODO: 收窄后可能导致最相关的原文片段被忽略，导致LLM生成的结论不准确，比如输入“演义中未涉及”。
-        const injected = novelFragments.length
-          ? novelFragments
-            .slice(0, 5)
-            .map((fragment) => trimFragmentToWindow(fragment, query).text)
-            .join("\n\n")
-          : "（检索无命中）";
-        return { result: injected, novelFragments };
+        // 注入收窄：只取最符合的前 3 段，每段截为检索词附近窗口；注入视图只给纯原文 + 服务端编号
+        // （`[片段N]` / `⟨Qn⟩`），不带回目、段号、分数（spec §6.3）
+        const view = buildInjectionView(novelFragments, query);
+        const injected = novelFragments.length ? view.text : "（检索无命中）";
+        return {
+          result: injected,
+          novelFragments,
+          novelQuotes: view.quotes,
+          novelTargets: view.fragments,
+        };
       } else if (domain === DOMAIN_ROUTES["sango"]) {
         const result = await this.searchSangoQuestions(query);
         return { result: this.collectTexts(result).join("\n") };
@@ -567,6 +581,9 @@ export class Agent {
    */
   async processQuery(query: string, domain?: string): Promise<string> {
     let novelFragments: RecallFragment[] = [];
+    let novelQuotes = new Map<string, RenderedQuote>();
+    let novelTargets = new Map<string, RenderedQuote>();
+    let novelSearched = false;
     const userContent = query.trim();
     let resolvedContent = '';
 
@@ -575,8 +592,10 @@ export class Agent {
     if (Object.values(DOMAIN_ROUTES).includes(route)) {
       const result = await this.resolveUserContent(query, domain || route);
       resolvedContent = result.result;
-      if (domain === DOMAIN_ROUTES["sango-novel"]) { }
       novelFragments = result.novelFragments || [];
+      novelQuotes = result.novelQuotes || novelQuotes;
+      novelTargets = result.novelTargets || novelTargets;
+      novelSearched = result.novelFragments !== undefined;
     }
 
     // L3 向量匹配注入点：只做风云三国高置信正向识别，命中 sango 后走题库快路径
@@ -615,6 +634,17 @@ export class Agent {
         const result = localTool
           ? await localTool(toolArgs)
           : await this.callTransportTool(toolName, toolArgs);
+        // 模型自行调原著检索工具：与快路径同源收集片段，并把注入视图（纯原文 + 服务端编号）
+        // 作为工具出参回填——模型看到的 `⟨Qn⟩` 与指针校验用的 qid 集合同源
+        let toolContent = JSON.stringify(result.content);
+        if (toolName === SANGO_NOVEL_SEARCH_TOOL) {
+          novelSearched = true;
+          novelFragments.push(...this.collectRecallFragments(result, toolArgs));
+          const view = buildInjectionView(novelFragments, query);
+          novelQuotes = view.quotes;
+          novelTargets = view.fragments;
+          toolContent = view.text;
+        }
         const assistantMessage: any = {
           role: "assistant",
           content: null,
@@ -638,7 +668,7 @@ export class Agent {
         messages.push({
           role: "tool",
           tool_call_id: item.id,
-          content: JSON.stringify(result.content),
+          content: toolContent,
         });
       }
 
@@ -656,8 +686,15 @@ export class Agent {
       .join("\n")
       .trim();
 
-    if (novelFragments.length > 0) {
-      answer = await this.applyNovelCitationGuard(answer, novelFragments, query);
+    // 调过原著检索即进校验：无命中（片段为空）由 guard 统一回「演义中未涉及」
+    if (novelSearched) {
+      answer = await this.applyNovelCitationGuard(
+        answer,
+        novelFragments,
+        query,
+        novelQuotes,
+        novelTargets
+      );
     }
 
     return answer;
