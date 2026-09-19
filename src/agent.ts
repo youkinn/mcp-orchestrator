@@ -15,6 +15,7 @@ import {
   buildInjectionView,
   formatQuoteSource,
   loadAliasTable,
+  pickBestFallbackFragment,
   renderAnswerWithQuotes,
   scanRecallPersonIds,
   stripOverlongModelQuotes,
@@ -417,8 +418,11 @@ export class Agent {
     query: string
   ): Promise<string> {
     // 只取最符合的一段（检索词附近窗口），避免结论归纳被无关长文带偏；
+    // 选段与兜底展示同口径（pickBestFallbackFragment 锚点评分），不再盲取 fragments[0]；
     // 片段与出处同样由字段渲染（纯原文 + 回目），模型只归纳一句结论
-    const top = fragments.length ? fragments[0] : null;
+    const top = fragments.length
+      ? pickBestFallbackFragment(fragments, query)
+      : null;
     const fragmentText = top
       ? `${buildInjectionView([top], query).text}\n（出处：${formatQuoteSource(top)}）`
       : "（无原文片段）";

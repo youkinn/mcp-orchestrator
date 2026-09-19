@@ -278,6 +278,67 @@ test("②.3 长引语安全网：模型违规抄写超 30 字引语被丢弃，�
   assert.equal(modelCallCount, 2, "安全网是确定性回收，不额外调模型");
 });
 
+test("②.4 注入编号连续（bug-00009）：窗口裁掉证据段引语时并入保底，模型 [Q2] 指针合法，答案不被 Guard 改坏", async () => {
+  const filler = "先叙无关内容。".repeat(30);
+  const recallEntries = [
+    {
+      id: "sanguo-yanyi:0005:c0011",
+      text: "祖茂曰：“主公头上赤帻射目，可脱帻与某戴之。”是夜孙坚正遇华雄，两马相交。",
+      chapter: 5,
+      title: RECALL_TITLE,
+      type: "narration",
+      quotes: [{ qid: "Q1", text: "主公头上赤帻射目，可脱帻与某戴之。" }],
+    },
+    {
+      id: "sanguo-yanyi:0005:c0015",
+      text: `关公曰：“酒且斟下，某去便来。”出帐提刀，飞身上马。${filler}马到中军，云长提华雄之头，掷于地上。其酒尚温。`,
+      chapter: 5,
+      title: RECALL_TITLE,
+      type: "narration",
+      quotes: [{ qid: "Q1", text: "酒且斟下，某去便来。" }],
+    },
+    {
+      id: "sanguo-yanyi:0005:c0014",
+      text: "太守韩馥曰：“吾有上将潘凤，可斩华雄。”绍急令出战。",
+      chapter: 5,
+      title: RECALL_TITLE,
+      type: "narration",
+      quotes: [{ qid: "Q1", text: "吾有上将潘凤，可斩华雄。" }],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return modelCallCount === 1
+      ? toolUseResponse("sango_novel_search", {
+          source: "sanguo-yanyi",
+          query: "华雄是怎么死的",
+          limit: 5,
+        })
+      : textResponse("关羽（云长）温酒斩华雄。[Q2]");
+  };
+
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(recallEntries) }],
+      }),
+    },
+    fallbackConcluder: async () => "斩华雄者系关羽",
+    modelCaller,
+  });
+
+  const answer = await agent.processQuery("华雄是怎么死的");
+  assert.ok(
+    answer.includes(`「酒且斟下，某去便来。」（出处：第5回 ${RECALL_TITLE}）`),
+    "Q2 应指向被并回窗口的证据段引语，答案原样保留"
+  );
+  assert.doesNotMatch(answer, /【原文片段】/, "指针合法不应走兜底");
+  assert.equal(modelCallCount, 2, "校验通过不触发兜底结论归纳");
+});
+
 test("③ 检索无命中：回答「演义中未涉及」，不做归纳生成", async () => {
   let modelCallCount = 0;
   const modelCaller = async (): Promise<ModelResponse> => {

@@ -360,8 +360,11 @@ export function toRecallFragments(
   return fragments;
 }
 
-/** 在一个片段内标出引语：`⟨Qn⟩` 插在开引号前，qid 从 start 起按正文顺序全局编号 */
-function markFragmentQuotes(
+/** 在窗口文本内标出引语：`⟨Qn⟩` 插在开引号前，qid 从 start 起按可见引语连续编号。
+ * 只认完整可见的 `“……“XXX”……”` 引语——被窗口切半的引语模型本就看不清，不允许引用。
+ * 先裁窗口再编号 ⇒ 可见编号天然连续，不会出现「Q1 后直接 Q3」的空洞引模型误用。 */
+function markQuotesInWindow(
+  text: string,
   fragment: RecallFragment,
   start: number
 ): { marked: string; assigned: Array<{ qid: string; quote: RecallQuote }>; next: number } {
@@ -370,12 +373,7 @@ function markFragmentQuotes(
     if (!quote || !quote.text) {
       continue;
     }
-    const offset = quote.offset;
-    const aligned =
-      typeof offset === "number" &&
-      offset > 0 &&
-      fragment.text.slice(offset, offset + quote.text.length) === quote.text;
-    const at = aligned ? offset - 1 : fragment.text.indexOf(`“${quote.text}”`);
+    const at = text.indexOf(`“${quote.text}”`);
     if (at >= 0) {
       located.push({ at, quote });
     }
@@ -385,7 +383,7 @@ function markFragmentQuotes(
     qid: `Q${start + index}`,
     quote: item.quote,
   }));
-  let marked = fragment.text;
+  let marked = text;
   for (let index = assigned.length - 1; index >= 0; index--) {
     marked =
       marked.slice(0, located[index].at) +
@@ -395,10 +393,30 @@ function markFragmentQuotes(
   return { marked, assigned, next: start + assigned.length };
 }
 
+/** 窗口保底一条引语：检索词窗口把片段引语全部裁掉时，把片段首条引语原文并入窗口尾部，
+ * 否则该片段一个可用指针都没有（华雄题证据段引语在锚点窗口之前即此场景，见 bug-00009）。 */
+function mergeFirstQuoteIntoWindow(
+  windowText: string,
+  fragment: RecallFragment
+): string {
+  const first = (fragment.quotes ?? []).find((quote) => quote && quote.text);
+  if (!first) {
+    return windowText;
+  }
+  const quoteText = `“${first.text}”`;
+  if (windowText.includes(quoteText)) {
+    return windowText;
+  }
+  return fragment.text.includes(quoteText)
+    ? `${windowText}……${quoteText}`
+    : windowText;
+}
+
 /**
  * 注入视图（spec §6.3）：纯原文 + 服务端编号。
  * 片段带 `[片段N]`，片段内引语带 `⟨Qn⟩`；**不带回目、段号、分数**，模型无从抄写出处。
- * qid 按注入顺序全局编号；窗口裁掉引语后其指针一并失效（quotes 只保留可见项）。
+ * 流程：先按检索词裁窗口，再对窗口内可见引语连续编号（无空洞）；窗口裁掉全部引语时并入
+ * 首条引语保底，保证每个片段至少有一个可用指针。
  */
 export function buildInjectionView(
   fragments: RecallFragment[],
@@ -408,13 +426,15 @@ export function buildInjectionView(
   const parts: string[] = [];
   let next = 1;
   fragments.slice(0, INJECT_FRAGMENT_LIMIT).forEach((fragment, index) => {
-    const { marked, assigned, next: after } = markFragmentQuotes(fragment, next);
+    const windowed = trimTextToWindow(fragment.text, query);
+    const visible = mergeFirstQuoteIntoWindow(windowed, fragment);
+    const { marked, assigned, next: after } = markQuotesInWindow(
+      visible,
+      fragment,
+      next
+    );
     next = after;
-    const visible = trimTextToWindow(marked, query);
     for (const { qid, quote } of assigned) {
-      if (!visible.includes(`⟨${qid}⟩`)) {
-        continue;
-      }
       quotes.set(qid, {
         text: quote.text,
         chapter: fragment.chapter,
@@ -422,7 +442,7 @@ export function buildInjectionView(
         source: fragment.source,
       });
     }
-    parts.push(`[片段${index + 1}] ${visible}`);
+    parts.push(`[片段${index + 1}] ${marked}`);
   });
   return { text: parts.join("\n\n"), quotes };
 }
@@ -476,9 +496,87 @@ export function renderAnswerWithQuotes(
   });
 }
 
+/** query 锚点稀有度：命中最稀有 key 的 [key 长度, -段内出现次数, -首次位置]；无命中为 null。
+ * 与窗口锚定同一套排序（长 key 信息量大；同长时段内出现越少越像答案句标志，如证据段
+ * 「华雄」只 1 次 vs 孙坚夜战段 3 次）。 */
+function anchorScore(
+  text: string,
+  query: string
+): [number, number, number] | null {
+  const anchors: KeyAnchor[] = [];
+  for (const key of extractQueryKeys(query)) {
+    const occurrences: number[] = [];
+    let cursor = text.indexOf(key);
+    while (cursor >= 0) {
+      occurrences.push(cursor);
+      cursor = text.indexOf(key, cursor + key.length);
+    }
+    if (occurrences.length > 0) {
+      anchors.push({ key, occurrences });
+    }
+  }
+  const ranked = rankKeyAnchors(anchors);
+  if (ranked.length === 0) {
+    return null;
+  }
+  const best = ranked[0];
+  return [best.key.length, -best.occurrences.length, -best.occurrences[0]];
+}
+
+function isAnchorBetter(
+  a: [number, number, number] | null,
+  b: [number, number, number] | null
+): boolean {
+  if (a && b) {
+    return (
+      a[0] > b[0] ||
+      (a[0] === b[0] && (a[1] > b[1] || (a[1] === b[1] && a[2] > b[2])))
+    );
+  }
+  return a !== null && b === null;
+}
+
+/**
+ * 兜底选段：不盲取 fragments[0]（相关度排序会被实体高频干扰段把持，如孙坚夜战段）。
+ * 双层评分，逐层决出：
+ *   1. 结论断言人物覆盖 —— 结论是归纳出的真答案，用其人物锚定证据段（如「被关羽所杀」→
+ *      选含「云长/关羽」的段，排除纯「华雄」共现的夜战段）；
+ *   2. query 锚点稀有度 —— 结论无人物（如「被斩于帐前」）时退化为纯锚点比较。
+ * 平局保持原顺序（工具相关度降序）。
+ */
+export function pickBestFallbackFragment(
+  fragments: RecallFragment[],
+  query = "",
+  conclusion = ""
+): RecallFragment {
+  const aliasTable = loadAliasTable();
+  const asserted = scanRecallPersonIds(conclusion, aliasTable);
+  let best = fragments[0];
+  let bestAssert = -1;
+  let bestAnchor: [number, number, number] | null = null;
+  for (const fragment of fragments) {
+    const assertHit = asserted.size
+      ? [...scanRecallPersonIds(fragment.text, aliasTable)].filter((id) =>
+          asserted.has(id)
+        ).length
+      : 0;
+    const anchor = anchorScore(fragment.text, query);
+    const better =
+      assertHit > bestAssert ||
+      (assertHit === bestAssert && isAnchorBetter(anchor, bestAnchor));
+    if (better) {
+      best = fragment;
+      bestAssert = assertHit;
+      bestAnchor = anchor;
+    }
+  }
+  return best;
+}
+
 /**
  * 兜底输出（spec §6.4 步骤 4）：不做归纳生成，只输出最符合的一段 + 出处 + 一句结论。
  * 原文取纯原文窗口（不含 `[片段N]` / `⟨Qn⟩` 注入标记），出处由 chapter / title 字段渲染、只到回目。
+ * 选段走 pickBestFallbackFragment（先裁窗口再编号的同套锚点口径），不再盲取 fragments[0]。
  */
 export function buildFallback(
   fragments: RecallFragment[],
@@ -491,7 +589,7 @@ export function buildFallback(
   if (fragments.length === 0) {
     return conclusionLine;
   }
-  const top = fragments[0];
+  const top = pickBestFallbackFragment(fragments, query, conclusion);
   return [
     "【原文片段】",
     `${trimTextToWindow(top.text, query)}\n（出处：${formatQuoteSource(top)}）`,

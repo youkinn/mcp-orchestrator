@@ -10,6 +10,7 @@ import {
   buildInjectionView,
   formatQuoteSource,
   loadAliasTable,
+  pickBestFallbackFragment,
   renderAnswerWithQuotes,
   scanRecallPersonIds,
   stripOverlongModelQuotes,
@@ -164,6 +165,44 @@ test("⑬.1 注入视图窗口裁掉引语时，其指针一并失效（不留�
   assert.equal(view.quotes.size, 1);
 });
 
+test("⑬.2 注入编号连续无空洞：窗口裁掉片段引语时并入首条引语保底，可见编号紧邻（bug-00009）", () => {
+  const filler = "先叙无关内容。".repeat(30);
+  const fragments = [
+    // 片段1：引语完整可见（Q1）
+    {
+      text: "祖茂曰：“主公头上赤帻射目，可脱帻与某戴之。”是夜孙坚正遇华雄，两马相交。",
+      source: "sanguo-yanyi",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      quotes: [{ qid: "Q1", text: "主公头上赤帻射目，可脱帻与某戴之。", offset: 5 }],
+    },
+    // 片段2：引语在检索词窗口之前被裁掉 → 并入首条引语保底（Q2）
+    {
+      text: `关公曰：“酒且斟下，某去便来。”出帐提刀，飞身上马。${filler}马到中军，云长提华雄之头，掷于地上。其酒尚温。`,
+      source: "sanguo-yanyi",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      quotes: [{ qid: "Q1", text: "酒且斟下，某去便来。", offset: 5 }],
+    },
+    // 片段3：引语完整可见（Q3），验证跨片段编号连续
+    {
+      text: "太守韩馥曰：“吾有上将潘凤，可斩华雄。”绍急令出战。",
+      source: "sanguo-yanyi",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      quotes: [{ qid: "Q1", text: "吾有上将潘凤，可斩华雄。", offset: 7 }],
+    },
+  ];
+  const view = buildInjectionView(fragments, "华雄是怎么死的");
+  assert.deepEqual(
+    [...view.quotes.keys()],
+    ["Q1", "Q2", "Q3"],
+    "窗口裁掉引语后不得留下 Q1 后直接 Q3 的编号空洞"
+  );
+  assert.equal(view.quotes.get("Q2")!.text, "酒且斟下，某去便来。", "证据段引语被并回窗口保底");
+  assert.match(view.text, /⟨Q2⟩“酒且斟下，某去便来。”/, "并入的引语带可见编号");
+});
+
 test("⑭ buildFallback 只输出最符合的一段：多段召回不长篇大论", () => {
   const out = buildFallback(
     [
@@ -188,6 +227,49 @@ test("⑭ buildFallback 只输出最符合的一段：多段召回不长篇大�
   assert.ok(!out.includes("章武元年"), "不应输出第二段全文");
   assert.match(out, /（出处：第73回 玄德进位汉中王　云长攻拔襄阳郡）/);
   assert.match(out, /按原文，关羽怒斥求亲使者/);
+});
+
+test("⑭.1 兜底选段不盲取 fragments[0]：干扰段在前时按结论人物锚定证据段（bug-00009）", () => {
+  const out = buildFallback(
+    [
+      {
+        text: "是夜月白风清。孙坚正遇华雄，两马相交，斗不数合。",
+        source: "sanguo-yanyi",
+        chapter: 5,
+        title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      },
+      {
+        text: "众将见云长提华雄之头，掷于地上。其酒尚温。",
+        source: "sanguo-yanyi",
+        chapter: 5,
+        title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      },
+    ],
+    "被关羽所杀",
+    "华雄是怎么死的"
+  );
+  assert.ok(out.includes("云长提华雄之头"), "应输出证据段（结论人物覆盖）而非 fragments[0]");
+  assert.ok(!out.includes("是夜月白风清"), "孙坚夜战干扰段不得作为兜底片段");
+});
+
+test("⑭.2 兜底选段：结论无人物时按 query 锚点稀有度（同段命中次数少者优先）", () => {
+  const top = pickBestFallbackFragment(
+    [
+      {
+        text: "孙坚夜战华雄，华雄追来，华雄躲过三箭。",
+        source: "sanguo-yanyi",
+        chapter: 5,
+      },
+      {
+        text: "云长提华雄之头，掷于地上。",
+        source: "sanguo-yanyi",
+        chapter: 5,
+      },
+    ],
+    "华雄是怎么死的",
+    "被斩于帐前"
+  );
+  assert.ok(top.text.includes("云长提华雄之头"), "华雄只出现 1 次的片段更稀有，应胜出");
 });
 
 test("⑮ 指针校验：指针 ∈ 本次注入 qid 集合才通过，缺指针 / 越界指针一律不通过", () => {
