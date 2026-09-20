@@ -26,3 +26,6 @@ pnpm-debug.log*
 
 # project guidance
 !CLAUDE.md
+
+# feat-A007 runtime SQLite database
+data/logs.db
