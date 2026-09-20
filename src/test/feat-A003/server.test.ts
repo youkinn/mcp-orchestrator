@@ -470,7 +470,7 @@ test('装配回归：index.ts 工具集全部来自 MCP、L3 走 fengyunsanguo_q
   assert.match(source, /new Agent\(transport, llmConfig, \{/);
   assert.match(
     source,
-    /fengyunsanguoVectorMatcher: async \(query\) => \{\s+const hit = await transport\.fengyunsanguo_quiz_route\(query\);/
+    /fengyunsanguoVectorMatcher: \(query\) => transport\.fengyunsanguo_quiz_route\(query\)/
   );
   assert.match(
     source,

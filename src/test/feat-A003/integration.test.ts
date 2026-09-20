@@ -421,10 +421,7 @@ async function startApp(
     systemPrompt: UNIFIED_SYSTEM_PROMPT,
     tools: MCP_TOOLS,
     // 与 index.ts 同形：L3 无 domain 自动路由走 transport 的 fengyunsanguo_quiz_route
-    fengyunsanguoVectorMatcher: async (query) => {
-      const hit = await transport.fengyunsanguo_quiz_route(query);
-      return hit === "sango" ? "fengyunsanguo" : hit;
-    },
+    fengyunsanguoVectorMatcher: (query) => transport.fengyunsanguo_quiz_route(query),
     modelCaller: model.respond,
   });
 

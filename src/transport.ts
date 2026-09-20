@@ -207,7 +207,7 @@ export class MCPTransport {
    */
   async fengyunsanguo_quiz_route(
     text: string
-  ): Promise<boolean | "sango" | null> {
+  ): Promise<boolean | null> {
     try {
       const result = await this.callTool(FENGYUNSANGUO_QUIZ_ROUTE_TOOL, { text });
       return this.parseQuizRouteResult(result);
@@ -240,7 +240,7 @@ export class MCPTransport {
   }
 
   /** 解析 quiz_route 返回文本：纯 "true"/"false" 或 JSON 布尔 / {"hit": boolean}；无法解析按未命中（null）处理 */
-  private parseQuizRouteResult(result: ToolCallResult): boolean | "sango" | null {
+  private parseQuizRouteResult(result: ToolCallResult): boolean | null {
     const text = result.content
       .filter((item) => item.type === "text")
       .map((item) => item.text)
