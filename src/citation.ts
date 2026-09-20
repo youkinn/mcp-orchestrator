@@ -208,23 +208,18 @@ function extractQueryKeys(query: string): string[] {
   return [...keys];
 }
 
-/** 窗口单侧半径（字）：以锚点前后各取该长度 */
-const WINDOW_RADIUS = 60;
-/** 注入窗口总长上限（字）：多锚点并集不超过该值，避免注入随锚点数变长失控 */
-const WINDOW_BUDGET = 280;
-/** 注入视图全问总预算（字）：10 段召回共享，避免 limit/注入段数放宽后 token 随段数线性膨胀 */
-const INJECT_TOTAL_BUDGET = 1600;
-/** 未命中任何关键词时的兜底长度（字） */
-const WINDOW_FALLBACK = 120;
+/** 注入保底段数：前 N 段整段注入、不裁剪、不参与预算竞争（2026-09-20 注入策略定稿） */
+export const INJECT_HEAD_GUARANTEE = 5;
+/** 注入全问预算（字）：前 INJECT_HEAD_GUARANTEE 段保底可软超；其后整段在预算内依次纳入，超预算丢整段、绝不段内裁剪 */
+export const INJECT_TOTAL_BUDGET = 2000;
+/** 注入尾部兜底开关（代码常量，不读配置文件）：true=前 5 段整段保底 + 第 6–10 段预算兜底；false=固定只注入前 5 段整段 */
+export const INJECT_TAIL_FALLBACK_ENABLED = true;
 
 /** 一个 query key 在段内的全部出现位置 */
 interface KeyAnchor {
   key: string;
   occurrences: number[];
 }
-
-/** 段内窗口区间 [start, end) */
-type WindowSpan = [number, number];
 
 /**
  * 稀有度代理排序（编排侧无语料 df，只能看段内证据）：
@@ -242,88 +237,6 @@ function rankKeyAnchors(anchors: KeyAnchor[]): KeyAnchor[] {
       a.occurrences.length - b.occurrences.length ||
       a.occurrences[0] - b.occurrences[0]
   );
-}
-
-/** 把同一 key 相邻/重叠的窗口合并，避免同一处出现被拆成多段 */
-function mergeSpans(spans: WindowSpan[]): WindowSpan[] {
-  const sorted = [...spans].sort((a, b) => a[0] - b[0]);
-  const merged: WindowSpan[] = [];
-  for (const span of sorted) {
-    const last = merged[merged.length - 1];
-    if (last && span[0] <= last[1]) {
-      last[1] = Math.max(last[1], span[1]);
-    } else {
-      merged.push([span[0], span[1]]);
-    }
-  }
-  return merged;
-}
-
-/** 合并后区间总长（字） */
-function totalSpanLength(spans: WindowSpan[]): number {
-  return spans.reduce((sum, [start, end]) => sum + (end - start), 0);
-}
-
-/** 按稀有度顺序取窗口并集，总长不超过 budget；返回按位置排序的区间。
- * 预算按「合并后并集长度」计算，重叠部分只算一次，避免重复锚点白吃预算。 */
-function selectWindowSpans(
-  body: string,
-  anchors: KeyAnchor[],
-  budget = WINDOW_BUDGET,
-  radius = WINDOW_RADIUS
-): WindowSpan[] {
-  let picked: WindowSpan[] = [];
-  for (const anchor of rankKeyAnchors(anchors)) {
-    const spans = mergeSpans(
-      anchor.occurrences.map(
-        (at): WindowSpan => [
-          Math.max(0, at - radius),
-          Math.min(body.length, at + anchor.key.length + radius),
-        ]
-      )
-    );
-    for (const span of spans) {
-      const candidate = mergeSpans([...picked, span]);
-      if (totalSpanLength(candidate) > budget) {
-        continue;
-      }
-      picked = candidate;
-    }
-  }
-  if (picked.length === 0 && anchors.length > 0) {
-    // 单个窗口就超预算（超长段 + 大 key）：至少保住最稀有 key 处的窗口
-    const first = anchors[0].occurrences[0];
-    const start = Math.max(0, first - radius);
-    picked = [[start, Math.min(body.length, start + budget)]];
-  }
-  return picked;
-}
-
-/** 按稀有度锚定检索词取窗口：取并集且总长受限，找不到关键词时取开头 120 字。
- * budget 可按调用方预算传入（注入视图多段共享总预算，兜底单段用默认值）。 */
-function trimTextToWindow(
-  text: string,
-  query: string,
-  budget = WINDOW_BUDGET
-): string {
-  const anchors: KeyAnchor[] = [];
-  for (const key of extractQueryKeys(query)) {
-    const occurrences: number[] = [];
-    let cursor = text.indexOf(key);
-    while (cursor >= 0) {
-      occurrences.push(cursor);
-      cursor = text.indexOf(key, cursor + key.length);
-    }
-    if (occurrences.length > 0) {
-      anchors.push({ key, occurrences });
-    }
-  }
-  if (anchors.length === 0) {
-    return text.slice(0, WINDOW_FALLBACK);
-  }
-  return selectWindowSpans(text, anchors, budget)
-    .map(([start, end]) => text.slice(start, end))
-    .join("……");
 }
 
 /** 工具出参文本 → 结构化条目（C4 定稿：出参只有裸 JSON 数组一种形态；非数组视为无出参） */
@@ -403,59 +316,45 @@ function markQuotesInWindow(
   return { marked, assigned, next: start + assigned.length };
 }
 
-/** 窗口保底一条引语：检索词窗口把片段引语全部裁掉时，把片段首条引语原文并入窗口尾部，
- * 否则该片段一个可用指针都没有（华雄题证据段引语在锚点窗口之前即此场景，见 bug-00009）。 */
-function mergeFirstQuoteIntoWindow(
-  windowText: string,
-  fragment: RecallFragment
-): string {
-  const first = (fragment.quotes ?? []).find((quote) => quote && quote.text);
-  if (!first) {
-    return windowText;
-  }
-  const quoteText = `“${first.text}”`;
-  if (windowText.includes(quoteText)) {
-    return windowText;
-  }
-  return fragment.text.includes(quoteText)
-    ? `${windowText}……${quoteText}`
-    : windowText;
-}
-
 /**
  * 注入视图（spec §6.3）：纯原文 + 服务端编号。
  * 片段带 `[片段N]`，片段内引语带 `⟨Qn⟩`；**不带回目、段号、分数**，模型无从抄写出处。
- * 流程：先按检索词裁窗口，再对窗口内可见引语连续编号（无空洞）；窗口裁掉全部引语时并入
- * 首条引语保底，保证每个片段至少有一个可用指针。
+ * 注入策略（2026-09-20 定稿）：前 INJECT_HEAD_GUARANTEE 段整段保底、不裁剪、不占预算；
+ * 第 6 段起仅在开关开启且预算内整段纳入，超预算丢整段、绝不段内裁剪；整段注入下引语
+ * 完整可见，编号连续无空洞（不再需要「并入首条引语」等窗口补偿逻辑）。
  */
 export function buildInjectionView(
   fragments: RecallFragment[],
-  query = ""
+  query = "",
+  tailFallback = INJECT_TAIL_FALLBACK_ENABLED
 ): InjectionView {
   const quotes = new Map<string, RenderedQuote>();
   const targets = new Map<string, RenderedQuote>();
   const parts: string[] = [];
   let next = 1;
   const injected = fragments.slice(0, INJECT_FRAGMENT_LIMIT);
-  // 多段共享总预算：段数越多单段窗口越短，余额给到命中答案句的段（引语保底不受此限）
-  const perBudget = Math.max(
-    WINDOW_FALLBACK,
-    Math.min(
-      WINDOW_BUDGET,
-      Math.floor(INJECT_TOTAL_BUDGET / Math.max(1, injected.length))
-    )
-  );
-  injected.forEach((fragment, index) => {
-    const windowed = trimTextToWindow(fragment.text, query, perBudget);
-    const visible = mergeFirstQuoteIntoWindow(windowed, fragment);
+  // 前 INJECT_HEAD_GUARANTEE 段保底整段注入（不参与预算竞争）；
+  // tailFallback=false 时固定只注入前 5 段；开启时第 6+ 段整段在预算内依次纳入，超预算丢整段。
+  const picked = injected.slice(0, INJECT_HEAD_GUARANTEE);
+  if (tailFallback) {
+    let used = picked.reduce((sum, fragment) => sum + fragment.text.length, 0);
+    for (const fragment of injected.slice(INJECT_HEAD_GUARANTEE)) {
+      if (used + fragment.text.length > INJECT_TOTAL_BUDGET) {
+        break;
+      }
+      picked.push(fragment);
+      used += fragment.text.length;
+    }
+  }
+  picked.forEach((fragment, index) => {
     targets.set(`片段${index + 1}`, {
-      text: windowed,
+      text: fragment.text,
       chapter: fragment.chapter,
       title: fragment.title,
       source: fragment.source,
     });
     const { marked, assigned, next: after } = markQuotesInWindow(
-      visible,
+      fragment.text,
       fragment,
       next
     );
@@ -618,8 +517,8 @@ export function pickBestFallbackFragment(
 
 /**
  * 兜底输出（spec §6.4 步骤 4）：不做归纳生成，只输出最符合的一段 + 出处 + 一句结论。
- * 原文取纯原文窗口（不含 `[片段N]` / `⟨Qn⟩` 注入标记），出处由 chapter / title 字段渲染、只到回目。
- * 选段走 pickBestFallbackFragment（先裁窗口再编号的同套锚点口径），不再盲取 fragments[0]。
+ * 原文取整段纯原文（不裁剪；chunk 上限 400 字，天然防刷屏），出处由 chapter / title 字段渲染、只到回目。
+ * 选段走 pickBestFallbackFragment（结论人物 + query 锚点稀有度），不再盲取 fragments[0]。
  */
 export function buildFallback(
   fragments: RecallFragment[],
@@ -635,7 +534,7 @@ export function buildFallback(
   const top = pickBestFallbackFragment(fragments, query, conclusion);
   return [
     "【原文片段】",
-    `${trimTextToWindow(top.text, query)}\n（出处：${formatQuoteSource(top)}）`,
+    `${top.text}\n（出处：${formatQuoteSource(top)}）`,
     "",
     conclusionLine,
   ].join("\n");
