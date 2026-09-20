@@ -553,8 +553,8 @@ export class Agent {
           ...fragments.filter((fragment) => !fragment.text.includes("未召回"))
         );
 
-        // 注入收窄：只取最符合的前 3 段，每段截为检索词附近窗口；注入视图只给纯原文 + 服务端编号
-        // （`[片段N]` / `⟨Qn⟩`），不带回目、段号、分数（spec §6.3）
+        // 注入策略（2026-09-20 定稿）：前 5 段整段保底 + 第 6–10 段预算兜底（INJECT_TAIL_FALLBACK_ENABLED=false 时只注入前 5 段）；
+        // 超预算丢整段、不段内裁剪；注入视图只给纯原文 + 服务端编号（`[片段N]` / `⟨Qn⟩`），不带回目、段号、分数（spec §6.3）
         const view = buildInjectionView(novelFragments, query);
         const injected = novelFragments.length ? view.text : "（检索无命中）";
         return {
