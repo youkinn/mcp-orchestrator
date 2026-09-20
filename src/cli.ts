@@ -13,7 +13,7 @@ dotenv.config();
 const mcpServerConfigs = resolveMCPServerConfigs(process.env);
 if (!mcpServerConfigs.some((config) => config.name === WEATHER_SERVER_NAME)) {
   console.log(
-    "Usage: set MCP_WEATHER_SCRIPT in .env (sango optional via MCP_SANGO_SCRIPT), then run npm start."
+    "Usage: set MCP_WEATHER_SCRIPT in .env (sango / fengyunsanguo optional via MCP_SANGO_SCRIPT / MCP_FENGYUNSANGUO_SCRIPT), then run npm start."
   );
   process.exit(1);
 }

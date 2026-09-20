@@ -1,25 +1,41 @@
-﻿import { test } from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   resolveMCPServerConfigs,
   SANGO_SERVER_NAME,
+  FENGYUNSANGUO_SERVER_NAME,
   WEATHER_SERVER_NAME,
 } from "../../transport.js";
 
-test("MCP_WEATHER_SCRIPT + MCP_SANGO_SCRIPT：weather 必需、sango 可缺配", () => {
+test("MCP_WEATHER_SCRIPT + MCP_SANGO_SCRIPT + MCP_FENGYUNSANGUO_SCRIPT：weather 必需、sango 与 fengyunsanguo 可缺配", () => {
   assert.deepEqual(
     resolveMCPServerConfigs({
       MCP_WEATHER_SCRIPT: "D:/weather/src/index.js",
       MCP_SANGO_SCRIPT: "D:/sango/dist/index.js",
+      MCP_FENGYUNSANGUO_SCRIPT: "D:/fengyunsanguo/dist/index.js",
     }),
     [
       { name: WEATHER_SERVER_NAME, scriptPath: "D:/weather/src/index.js", required: true },
       { name: SANGO_SERVER_NAME, scriptPath: "D:/sango/dist/index.js", required: false },
+      { name: FENGYUNSANGUO_SERVER_NAME, scriptPath: "D:/fengyunsanguo/dist/index.js", required: false },
     ]
   );
 });
 
-test("缺配 sango：只注册 weather", () => {
+test("缺配 fengyunsanguo：只注册 weather + sango", () => {
+  assert.deepEqual(
+    resolveMCPServerConfigs({
+      MCP_WEATHER_SCRIPT: "w.js",
+      MCP_SANGO_SCRIPT: "s.js",
+    }),
+    [
+      { name: WEATHER_SERVER_NAME, scriptPath: "w.js", required: true },
+      { name: SANGO_SERVER_NAME, scriptPath: "s.js", required: false },
+    ]
+  );
+});
+
+test("缺配 sango / fengyunsanguo：只注册 weather", () => {
   assert.deepEqual(resolveMCPServerConfigs({ MCP_WEATHER_SCRIPT: "w.js" }), [
     { name: WEATHER_SERVER_NAME, scriptPath: "w.js", required: true },
   ]);

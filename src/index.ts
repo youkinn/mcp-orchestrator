@@ -5,31 +5,19 @@ import {
   WEATHER_SERVER_NAME,
 } from './transport.js';
 import { Agent, UNIFIED_SYSTEM_PROMPT } from './agent.js';
-import { SangoService } from './sango.js';
 import { createServer } from './server.js';
-import type { LLMProvider, MCPToolDefinition } from './types.js';
+import type { LLMProvider } from './types.js';
 
 dotenv.config();
 
 const port = Number(process.env.PORT || 3000);
 const allowedOrigin = process.env.WEB_ORIGIN || 'http://localhost:8001';
 
-// 本地题库工具：走 agent localTools，不经 MCP；描述限定适用域，供模型自主路由
-const SANGO_QUERY_TOOL: MCPToolDefinition = {
-  name: 'sango_query',
-  description:
-    '风云三国题库检索：仅当用户询问风云三国游戏内招募武将问答题时调用；参数 text 传用户原始问法，返回候选题目（题干 → 答案）',
-  inputSchema: {
-    type: 'object',
-    properties: { text: { type: 'string' } },
-  },
-};
-
-// 多 server 注册表：weather 必需（MCP_WEATHER_SCRIPT 必填），sango 可缺配（MCP_SANGO_SCRIPT）
+// 多 server 注册表：weather 必需（MCP_WEATHER_SCRIPT 必填），sango 演义与 fengyunsanguo 可缺配（MCP_SANGO_SCRIPT / MCP_FENGYUNSANGUO_SCRIPT）
 const mcpServerConfigs = resolveMCPServerConfigs(process.env);
 if (!mcpServerConfigs.some((config) => config.name === WEATHER_SERVER_NAME)) {
   console.error(
-    'Missing MCP weather server path. Set MCP_WEATHER_SCRIPT in .env (sango optional via MCP_SANGO_SCRIPT), then run npm run dev.'
+    'Missing MCP weather server path. Set MCP_WEATHER_SCRIPT in .env (sango / fengyunsanguo optional via MCP_SANGO_SCRIPT / MCP_FENGYUNSANGUO_SCRIPT), then run npm run dev.'
   );
   process.exit(1);
 }
@@ -61,40 +49,17 @@ async function main() {
   await transport.connect();
 
   const llmConfig = readLLMConfig();
-  const sangoService = new SangoService();
 
-  // 统一 Agent：工具集 = MCP 工具（合并 weather + sango）+ 本地题库工具；调不调、调哪个由模型按语义自主决定
+  // 统一 Agent：工具集全部来自 MCP server（weather / sango 演义 / fengyunsanguo），总台无本地工具
   const mcpTools = await transport.listTools();
   const agent = new Agent(transport, llmConfig, {
     systemPrompt: UNIFIED_SYSTEM_PROMPT,
-    tools: [...mcpTools, SANGO_QUERY_TOOL],
-    localTools: {
-      sango_query: async (args: Record<string, unknown>) => {
-        const text = typeof args.text === 'string' ? args.text : '';
-        const hits = sangoService.candidates(text);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: hits.length
-                ? hits
-                  .map(
-                    (hit, index) =>
-                      `${index + 1}. ${hit.question.question} → ${hit.answer}`
-                  )
-                  .join('\n')
-                : '未召回到任何候选题目',
-            },
-          ],
-        };
-      },
-    },
-    // L3：无 domain 且 L2 未命中时，先做题库向量高置信识别，命中直接走 sango 快路径
-    sangoVectorMatcher: (query) =>
-      Promise.resolve(sangoService.isHighConfidenceSangoQuery(query)),
+    tools: mcpTools,
+    // L3：无 domain 且 L2 未命中时，先调 fengyunsanguo server 做题库高置信识别（可选 server，缺配/失败不命中）
+    sangoVectorMatcher: (query) => transport.fengyunsanguo_quiz_route(query),
   });
 
-  const app = createServer(agent, sangoService, { port, allowedOrigin });
+  const app = createServer(agent, transport, { port, allowedOrigin });
 
   const server = app.listen(port, () => {
     console.log(`mcp-orchestrator Web API running at http://localhost:${port}`);

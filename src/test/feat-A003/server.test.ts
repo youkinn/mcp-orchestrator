@@ -1,18 +1,25 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import type { Agent } from '../../agent.js';
-import {
-  SangoService,
-  SANGO_NO_SESSION_PROMPT,
-  type SangoQuestion,
-} from '../../sango.js';
 import { createServer } from '../../server.js';
-import { ToolExecutionError, type MCPToolDefinition } from '../../types.js';
+import type { MCPTransport } from '../../transport.js';
+import {
+  ToolExecutionError,
+  type MCPToolDefinition,
+  type ToolCallResult,
+} from '../../types.js';
+
+type SangoOptionKey = 'A' | 'B' | 'C' | 'D';
+
+interface SangoQuestion {
+  question: string;
+  options: Record<SangoOptionKey, string>;
+  answer: string;
+}
 
 const QUESTION: SangoQuestion = {
   question: '夏侯惇的字是什么？',
@@ -20,7 +27,15 @@ const QUESTION: SangoQuestion = {
   answer: '元让',
 };
 
-const QUESTION_ANSWER = '题目：夏侯惇的字是什么？\nA. 元让\nB. 妙才\nC. 子龙\nD. 云长';
+const QUESTION_ANSWER =
+  '题目：夏侯惇的字是什么？\nA. 元让\nB. 妙才\nC. 子龙\nD. 云长';
+
+/** 与 mcp-server fengyunsanguo 的提示词同文（搬迁前 sango.ts 常量） */
+const SANGO_NO_SESSION_PROMPT = '请先发送“随机一题”开始';
+
+const OPTION_KEYS: SangoOptionKey[] = ['A', 'B', 'C', 'D'];
+const RANDOM_COMMANDS = new Set(['随机一题', '来一题']);
+const ANSWER_COMMANDS = new Set(['答案', '这题选什么']);
 
 const MCP_TOOLS: MCPToolDefinition[] = [
   {
@@ -35,8 +50,9 @@ const MCP_TOOLS: MCPToolDefinition[] = [
   },
 ];
 
-const SANGO_TOOL: MCPToolDefinition = {
-  name: 'sango_query',
+/** 风云三国候选召回：与 mcp-server fengyunsanguo_query 同名同文（来源 MCP） */
+const FENGYUNSANGUO_TOOL: MCPToolDefinition = {
+  name: 'fengyunsanguo_query',
   description: '风云三国题库检索：仅当用户询问风云三国游戏内招募武将问答题时调用',
   inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
 };
@@ -89,7 +105,7 @@ class StubAgent {
     if (this.options.listToolsError) {
       throw this.options.listToolsError;
     }
-    return this.options.tools ?? [...MCP_TOOLS, SANGO_TOOL];
+    return this.options.tools ?? [...MCP_TOOLS, FENGYUNSANGUO_TOOL];
   }
 }
 
@@ -97,39 +113,142 @@ function asAgent(stub: StubAgent): Agent {
   return stub as unknown as Agent;
 }
 
-function makeSangoService(
-  t: TestContext,
-  entries: unknown[] = [QUESTION]
-): SangoService {
-  const dir = mkdtempSync(join(tmpdir(), 'sango-a003-'));
-  const file = join(dir, 'questions.json');
-  writeFileSync(file, JSON.stringify(entries), 'utf8');
-  t.after(() => rmSync(dirname(file), { recursive: true, force: true }));
-  return new SangoService({ questionFile: file });
+/**
+ * quiz 替身：模拟 mcp-server fengyunsanguo_quiz_command 状态机（出题 / 判题 / 查答案 / 无会话），
+ * 行为与搬迁前 SangoService.handleRandom 一致；只实现 server.ts 依赖的 fengyunsanguo_quiz_command。
+ */
+class QuizSimTransport {
+  calls: Array<{ message: string; sessionId?: string }> = [];
+  private sessions = new Map<string, { question: SangoQuestion; createdAt: number }>();
+
+  constructor(
+    private options: { ttlMs?: number; error?: Error; delayMs?: number; order?: string[] } = {}
+  ) {}
+
+  getCurrentQuestion(sessionId: string): SangoQuestion | null {
+    return this.session(sessionId)?.question ?? null;
+  }
+
+  async fengyunsanguo_quiz_command(
+    message: string,
+    sessionId?: string
+  ): Promise<ToolCallResult> {
+    this.calls.push({ message, sessionId });
+    this.options.order?.push('random:start');
+    if (this.options.delayMs) {
+      await sleep(this.options.delayMs);
+    }
+    try {
+      if (this.options.error) {
+        throw this.options.error;
+      }
+      return {
+        content: [{ type: 'text', text: this.handleRandom(message, sessionId) }],
+      };
+    } finally {
+      this.options.order?.push('random:end');
+    }
+  }
+
+  private handleRandom(message: string, sessionId?: string): string {
+    const normalized = normalize(message);
+
+    if (RANDOM_COMMANDS.has(normalized)) {
+      if (sessionId) {
+        this.sessions.set(sessionId, { question: QUESTION, createdAt: Date.now() });
+      }
+      return QUESTION_ANSWER;
+    }
+
+    const session = sessionId ? this.session(sessionId) : null;
+    if (!session) {
+      return SANGO_NO_SESSION_PROMPT;
+    }
+
+    if (ANSWER_COMMANDS.has(normalized)) {
+      return this.formatAnswer(this.answerOf(session.question));
+    }
+
+    const result = this.judge(message, session.question);
+    if (!result) {
+      return `答错了，${this.formatAnswer(this.answerOf(session.question))}`;
+    }
+    return result.correct
+      ? `答对了！${this.formatAnswer(result.answer)}`
+      : `答错了，${this.formatAnswer(result.answer)}`;
+  }
+
+  private session(sessionId: string): { question: SangoQuestion; createdAt: number } | null {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return null;
+    }
+    if (Date.now() - session.createdAt > (this.options.ttlMs ?? 30 * 60 * 1000)) {
+      this.sessions.delete(sessionId);
+      return null;
+    }
+    return session;
+  }
+
+  private judge(
+    text: string,
+    question: SangoQuestion
+  ): { correct: boolean; answer: { key: SangoOptionKey; text: string } } | null {
+    const normalized = normalize(text);
+    const key = this.matchOptionKey(normalized, question);
+    if (!key) {
+      return null;
+    }
+    const answer = this.answerOf(question);
+    return { correct: key === answer.key, answer };
+  }
+
+  private matchOptionKey(
+    normalized: string,
+    question: SangoQuestion
+  ): SangoOptionKey | null {
+    if (normalized.length === 1) {
+      const letterIndex = 'abcd'.indexOf(normalized);
+      if (letterIndex >= 0) {
+        return OPTION_KEYS[letterIndex]!;
+      }
+    }
+    for (const key of OPTION_KEYS) {
+      if (normalize(question.options[key]) === normalized) {
+        return key;
+      }
+    }
+    return null;
+  }
+
+  private answerOf(question: SangoQuestion): { key: SangoOptionKey; text: string } {
+    const answerText = question.answer.trim();
+    const key = OPTION_KEYS.find(
+      (optionKey) => normalize(question.options[optionKey]) === normalize(answerText)
+    );
+    if (!key) {
+      throw new Error('QuizSimTransport: question answer not found in options');
+    }
+    return { key, text: answerText };
+  }
+
+  private formatAnswer(answer: { key: SangoOptionKey; text: string }): string {
+    return `正确答案：${answer.text}（${answer.key}）`;
+  }
 }
 
-/** 记录调用顺序的随机一题服务：用于断言两个端点共用同一条串行队列 */
-function recordingSango(
-  service: SangoService,
-  order: string[],
-  delayMs = 0
-): SangoService {
-  return {
-    async handleRandom(message: string, sessionId?: string) {
-      order.push('random:start');
-      if (delayMs) {
-        await sleep(delayMs);
-      }
-      const answer = service.handleRandom(message, sessionId);
-      order.push('random:end');
-      return answer;
-    },
-  } as unknown as SangoService;
+/** 归一化：全角→半角、小写、去空白与标点（与 mcp-server fengyunsanguo 一致） */
+function normalize(text: string): string {
+  return text
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/\p{P}/gu, '');
 }
 
 interface StartOptions {
   agent?: StubAgent;
-  sango?: SangoService;
+  quiz?: QuizSimTransport;
 }
 
 async function startServer(
@@ -137,8 +256,8 @@ async function startServer(
   options: StartOptions = {}
 ): Promise<string> {
   const agent = options.agent ?? new StubAgent();
-  const sangoService = options.sango ?? makeSangoService(t);
-  const app = createServer(asAgent(agent), sangoService, {
+  const quiz = (options.quiz ?? new QuizSimTransport()) as unknown as MCPTransport;
+  const app = createServer(asAgent(agent), quiz, {
     port: 0,
     allowedOrigin: '*',
   });
@@ -231,19 +350,30 @@ test('⑦ /api/chat 携带 scenario / service / sessionId → 400，无效字段
   assert.deepEqual(agent.queries, [], '校验失败不应触达 Agent');
 });
 
-test('domain 白名单：sango / sango-novel 透传给 Agent，其他值 400', async (t) => {
+test('domain 白名单：fengyunsanguo / sango-novel 透传给 Agent（sango 已废弃返回 400）', async (t) => {
   const agent = new StubAgent({ reply: 'ok' });
   const baseUrl = await startServer(t, { agent });
 
-  for (const domain of ['sango', 'sango-novel']) {
+  for (const domain of ['fengyunsanguo', 'sango-novel']) {
     const res = await post(baseUrl, '/api/chat', { message: '你好', domain });
     assert.equal(res.status, 200, domain);
   }
-  assert.deepEqual(agent.domains, ['sango', 'sango-novel'], 'domain 应原样透传给 Agent');
+  assert.deepEqual(
+    agent.domains,
+    ['fengyunsanguo', 'sango-novel'],
+    'domain 应原样透传给 Agent'
+  );
 
-  const bad = await post(baseUrl, '/api/chat', { message: '你好', domain: 'weather' });
+  const legacy = await post(baseUrl, '/api/chat', { message: '你好', domain: 'sango' });
+  assert.equal(legacy.status, 400);
+  assertEnvelope(legacy.body, 400, null, 'domain 字段仅支持 fengyunsanguo、sango-novel');
+
+  const bad = await post(baseUrl, '/api/chat', {
+    message: '你好',
+    domain: 'weather',
+  });
   assert.equal(bad.status, 400);
-  assertEnvelope(bad.body, 400, null, 'domain 字段仅支持 sango、sango-novel');
+  assertEnvelope(bad.body, 400, null, 'domain 字段仅支持 fengyunsanguo、sango-novel');
 });
 
 test('⑦ /api/sango/random 白名单为 message、sessionId，其余键 400', async (t) => {
@@ -299,17 +429,22 @@ test('校验：message 超 300 字符 → 413，恰好 300 字符放行', async 
   assert.equal(exact.status, 200);
 });
 
-test('⑧ /api/tools 返回统一 Agent 可见的全部工具（MCP 工具 + 本地 sango_query）', async (t) => {
-  const agent = new StubAgent({ tools: [...MCP_TOOLS, SANGO_TOOL] });
+test('⑧ /api/tools 返回统一 Agent 可见的全部工具（全部来自 MCP server，总台无本地工具）', async (t) => {
+  const agent = new StubAgent({ tools: [...MCP_TOOLS, FENGYUNSANGUO_TOOL] });
   const baseUrl = await startServer(t, { agent });
 
   const res = await get(baseUrl, '/api/tools');
 
   assert.equal(res.status, 200);
-  assertEnvelope(res.body, 200, { tools: [...MCP_TOOLS, SANGO_TOOL] }, '');
+  assertEnvelope(
+    res.body,
+    200,
+    { tools: [...MCP_TOOLS, FENGYUNSANGUO_TOOL] },
+    ''
+  );
   assert.deepEqual(
     res.body.data.tools.map((tool: any) => tool.name),
-    ['get-alerts', 'get-forecast', 'sango_query']
+    ['get-alerts', 'get-forecast', 'fengyunsanguo_query']
   );
   assert.equal(agent.listToolsCalls, 1);
 });
@@ -326,27 +461,28 @@ test('⑧ /api/tools：Agent.listTools() 抛错 → 503 MCP Server 未连接', a
   assertEnvelope(res.body, 503, null, 'MCP Server 未连接');
 });
 
-test('装配回归：index.ts 合成 [...mcpTools, SANGO_QUERY_TOOL] 并把单个 Agent 交给 createServer', () => {
+test('装配回归：index.ts 工具集全部来自 MCP、L3 走 fengyunsanguo_quiz_route、createServer 只收 transport', () => {
   const source = readFileSync(join(__dirname, '../../../src/index.ts'), 'utf8');
 
   assert.match(source, /const mcpTools = await transport\.listTools\(\);/);
-  assert.match(source, /tools: \[\.\.\.mcpTools, SANGO_QUERY_TOOL\]/);
+  assert.match(source, /tools: mcpTools/);
   assert.match(source, /new Agent\(transport, llmConfig, \{/);
   assert.match(
     source,
-    /createServer\(agent, sangoService, \{ port, allowedOrigin \}\)/
+    /sangoVectorMatcher: \(query\) => transport\.fengyunsanguo_quiz_route\(query\)/
   );
   assert.match(
     source,
-    /风云三国题库检索：仅当用户询问风云三国游戏内招募武将问答题时调用/
+    /createServer\(agent, transport, \{ port, allowedOrigin \}\)/
   );
+  // 总台无本地工具：不再出现 SangoService / 本地 sango_query 装配
   assert.doesNotMatch(
     source,
-    /GENERAL_SYSTEM_PROMPT|SANGO_KNOWLEDGE_SYSTEM_PROMPT|sangoKnowledge/
+    /SangoService|sango_query|SANGO_QUERY_TOOL|sangoService|localTools/
   );
 });
 
-test('ToolExecutionError 契约：Error 子类、携带 toolName、保留 cause（小胡在 agent.ts 抛出）', () => {
+test('ToolExecutionError 契约：Error 子类、携带 toolName、保留 cause（agent / transport 抛出）', () => {
   const cause = new Error('MCP down');
   const error = new ToolExecutionError('get-forecast', { cause });
 
@@ -387,17 +523,18 @@ test('500：非 ToolExecutionError 异常 → 处理请求失败，请稍后重�
   assert.doesNotMatch(JSON.stringify(res.body), /sk-secret-key/);
 });
 
-test('⑨ /api/sango/random：出题 → 判对 → 判错 → 查答案 → 无会话提示，全程不调用 Agent', async (t) => {
+test('⑨ /api/sango/random：出题 → 判对 → 判错 → 查答案 → 无会话提示，全程不调用 Agent，薄转发 quiz_command', async (t) => {
   const agent = new StubAgent();
-  const baseUrl = await startServer(t, { agent });
+  const quiz = new QuizSimTransport();
+  const baseUrl = await startServer(t, { agent, quiz });
   const sessionId = 'sid-a003';
 
-  const quiz = await post(baseUrl, '/api/sango/random', {
+  const ask = await post(baseUrl, '/api/sango/random', {
     message: '随机一题',
     sessionId,
   });
-  assert.equal(quiz.status, 200);
-  assertEnvelope(quiz.body, 200, { answer: QUESTION_ANSWER }, '');
+  assert.equal(ask.status, 200);
+  assertEnvelope(ask.body, 200, { answer: QUESTION_ANSWER }, '');
 
   const correct = await post(baseUrl, '/api/sango/random', {
     message: 'A',
@@ -428,6 +565,14 @@ test('⑨ /api/sango/random：出题 → 判对 → 判错 → 查答案 → 无
   );
 
   assert.deepEqual(agent.queries, [], '随机一题不经 LLM，不应触达统一 Agent');
+  assert.deepEqual(
+    quiz.calls.map((call) => call.message),
+    ['随机一题', 'A', '妙才', '答案', 'A']
+  );
+  assert.deepEqual(
+    quiz.calls.map((call) => call.sessionId),
+    ['sid-a003', 'sid-a003', 'sid-a003', 'sid-a003', undefined]
+  );
 });
 
 test('⑨ sessionId 非字符串 / 空串 / 纯空白视为未传 → 无会话提示', async (t) => {
@@ -458,21 +603,25 @@ test('⑨ sessionId 归一化：出题带空白、作答用 trim 后的同一 id
   assertEnvelope(judge.body, 200, { answer: '答对了！正确答案：元让（A）' }, '');
 });
 
-test('/api/sango/random 不依赖 MCP：本地规则异常落 500，本端点没有 503', async (t) => {
-  const broken = {
-    handleRandom: () => {
-      throw new Error('question bank broken');
-    },
-  } as unknown as SangoService;
-  const baseUrl = await startServer(t, { sango: broken });
+test('quiz 缺配 / 调用失败 → /api/sango/random 503（ToolExecutionError），/api/chat 其余功能正常', async (t) => {
+  const agent = new StubAgent({ reply: '正常回复' });
+  const quiz = new QuizSimTransport({
+    error: new ToolExecutionError('fengyunsanguo_quiz_command', {
+      cause: new Error('quiz 未配置'),
+    }),
+  });
+  const baseUrl = await startServer(t, { agent, quiz });
 
-  const res = await post(baseUrl, '/api/sango/random', {
+  const random = await post(baseUrl, '/api/sango/random', {
     message: '随机一题',
     sessionId: 'sid',
   });
+  assert.equal(random.status, 503);
+  assertEnvelope(random.body, 503, null, '工具服务暂不可用，请稍后重试');
 
-  assert.equal(res.status, 500);
-  assertEnvelope(res.body, 500, null, '处理请求失败，请稍后重试');
+  const chat = await post(baseUrl, '/api/chat', { message: '你好' });
+  assert.equal(chat.status, 200);
+  assertEnvelope(chat.body, 200, { answer: '正常回复' }, '');
 });
 
 test('⑩ 所有接口均为 { code, data, message } 信封：成功 data 有值，失败 data 为 null', async (t) => {
@@ -521,18 +670,14 @@ test('队列串行：/api/chat 并发请求不重叠执行（同一时刻只有�
     [200, 200, 200]
   );
   assert.equal(agent.maxActive, 1, '并发请求必须排队，不能同时进入 Agent');
-  assert.deepEqual([...agent.queries].sort(), [
-    '第一问',
-    '第三问',
-    '第二问',
-  ].sort());
+  assert.deepEqual([...agent.queries].sort(), ['第一问', '第三问', '第二问'].sort());
 });
 
 test('队列串行：/api/chat 与 /api/sango/random 共用一条队列，按到达顺序执行', async (t) => {
   const order: string[] = [];
   const agent = new StubAgent({ delayMs: 40, order });
-  const sango = recordingSango(makeSangoService(t), order);
-  const baseUrl = await startServer(t, { agent, sango });
+  const quiz = new QuizSimTransport({ delayMs: 10, order });
+  const baseUrl = await startServer(t, { agent, quiz });
 
   const chat = post(baseUrl, '/api/chat', { message: '纽约天气' });
   await sleep(15);
@@ -544,12 +689,7 @@ test('队列串行：/api/chat 与 /api/sango/random 共用一条队列，按到
 
   assert.equal(chatRes.status, 200);
   assert.equal(randomRes.status, 200);
-  assert.deepEqual(order, [
-    'chat:start',
-    'chat:end',
-    'random:start',
-    'random:end',
-  ]);
+  assert.deepEqual(order, ['chat:start', 'chat:end', 'random:start', 'random:end']);
 });
 
 test('/health 保持 feat-A002 行为：200 信封', async (t) => {
