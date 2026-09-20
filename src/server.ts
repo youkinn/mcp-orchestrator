@@ -1,13 +1,13 @@
 import cors from 'cors';
 import express, { type Request, type Response } from 'express';
 import type { Agent } from './agent.js';
-import type { SangoService } from './sango.js';
-import { ToolExecutionError } from './types.js';
+import type { MCPTransport } from './transport.js';
+import { ToolExecutionError, type ToolCallResult } from './types.js';
 
 const MAX_MESSAGE_LENGTH = 300;
 const CHAT_ALLOWED_KEYS = ['message', 'domain'];
 const CHAT_ALLOWED_LABEL = 'message、domain';
-const CHAT_ALLOWED_DOMAINS = ['sango', 'sango-novel'];
+const CHAT_ALLOWED_DOMAINS = ['fengyunsanguo', 'sango-novel'];
 const RANDOM_ALLOWED_KEYS = ['message', 'sessionId'];
 const RANDOM_ALLOWED_LABEL = 'message、sessionId';
 
@@ -81,7 +81,7 @@ function sendError(response: Response, code: number, message: string) {
 
 export function createServer(
   agent: Agent,
-  sangoService: SangoService,
+  transport: MCPTransport,
   options: { port: number; allowedOrigin: string }
 ) {
   const app = express();
@@ -99,7 +99,7 @@ export function createServer(
     });
   });
 
-  // 上报模型实际可见的全部工具（MCP 工具 + 本地 sango_query），来源为统一 Agent
+  // 上报模型实际可见的全部工具；工具集全部来自 MCP server（总台无本地工具）
   app.get('/api/tools', async (_request: Request, response: Response) => {
     try {
       response.json({
@@ -163,11 +163,23 @@ export function createServer(
       return;
     }
 
-    // 确定性命令：本地规则出题 / 判题 / 查答案，不经 LLM、不经 MCP
-    await enqueue(response, () =>
-      sangoService.handleRandom(parsed.value.message, parsed.value.sessionId)
-    );
+    // 确定性命令：薄转发 mcp-server fengyunsanguo_quiz_command（出题 / 判题 / 查答案状态机在 quiz 子进程），不经 LLM
+    await enqueue(response, async () => {
+      const result = await transport.fengyunsanguo_quiz_command(
+        parsed.value.message,
+        parsed.value.sessionId
+      );
+      return toolResultText(result);
+    });
   });
 
   return app;
+}
+
+/** 提取工具返回的纯文本（quiz_command 为确定性单文本回复） */
+function toolResultText(result: ToolCallResult): string {
+  return result.content
+    .filter((item) => item.type === 'text')
+    .map((item) => item.text)
+    .join('\n');
 }

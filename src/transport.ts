@@ -1,10 +1,10 @@
-﻿import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
   CallToolResultSchema,
   ListToolsResultSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { MCPToolDefinition, ToolCallResult } from "./types.js";
+import { ToolExecutionError, type MCPToolDefinition, type ToolCallResult } from "./types.js";
 
 /** 注册表条目：一个 MCP server 的启动配置 */
 export interface MCPServerConfig {
@@ -18,6 +18,13 @@ export interface MCPServerConfig {
 
 export const WEATHER_SERVER_NAME = "weather";
 export const SANGO_SERVER_NAME = "sango";
+/** 风云三国 server 注册名（A005：题库域下沉 mcp-server 独立 MCP） */
+export const FENGYUNSANGUO_SERVER_NAME = "fengyunsanguo";
+
+/** fengyunsanguo server 的 MCP 工具名 */
+export const FENGYUNSANGUO_QUERY_TOOL = "fengyunsanguo_query";
+export const FENGYUNSANGUO_QUIZ_COMMAND_TOOL = "fengyunsanguo_quiz_command";
+export const FENGYUNSANGUO_QUIZ_ROUTE_TOOL = "fengyunsanguo_quiz_route";
 
 /** 单个 MCP server 的连接抽象：默认为 SDK Client + stdio 子进程，测试可注入假实现 */
 export interface MCPServerConnection {
@@ -83,9 +90,10 @@ export class StdioMCPServerConnection implements MCPServerConnection {
 }
 
 /**
- * 从环境变量解析注册表配置（weather 必需、sango 可缺配）：
+ * 从环境变量解析注册表配置（weather 必需、sango 与 fengyunsanguo 可缺配）：
  * - MCP_WEATHER_SCRIPT：weather 入口绝对路径（必填；缺配 → 启动层报错退出）。
  * - MCP_SANGO_SCRIPT：sango 入口绝对路径（可选）；缺配 → sango 不可用。
+ * - MCP_FENGYUNSANGUO_SCRIPT：fengyunsanguo 入口绝对路径（可选）；缺配 → fengyunsanguo 不可用。
  * 注册表只认 MCP_*_SCRIPT 环境变量；不再支持命令行参数 / 旧 MCP_SERVER_SCRIPT。
  */
 export function resolveMCPServerConfigs(
@@ -105,6 +113,14 @@ export function resolveMCPServerConfigs(
     configs.push({
       name: SANGO_SERVER_NAME,
       scriptPath: sangoScript,
+      required: false,
+    });
+  }
+  const fengyunsanguoScript = env.MCP_FENGYUNSANGUO_SCRIPT;
+  if (fengyunsanguoScript) {
+    configs.push({
+      name: FENGYUNSANGUO_SERVER_NAME,
+      scriptPath: fengyunsanguoScript,
       required: false,
     });
   }
@@ -183,6 +199,71 @@ export class MCPTransport {
       throw new Error(`Unknown MCP tool: ${name}`);
     }
     return connection.callTool(name, args);
+  }
+
+  /**
+   * L3 题库自动路由识别：薄转发 fengyunsanguo server 的 fengyunsanguo_quiz_route。
+   * quiz 为可选 server，缺配 / 调用失败 → 返回 null（不命中），保持无 domain 自动路由行为不变，其余功能不受影响。
+   */
+  async fengyunsanguo_quiz_route(
+    text: string
+  ): Promise<boolean | null> {
+    try {
+      const result = await this.callTool(FENGYUNSANGUO_QUIZ_ROUTE_TOOL, { text });
+      return this.parseQuizRouteResult(result);
+    } catch (error) {
+      console.warn(
+        "[MCPTransport] fengyunsanguo_quiz_route 识别失败，按未命中处理：",
+        error
+      );
+      return null;
+    }
+  }
+
+  /**
+   * 随机一题状态机整体下沉：薄转发 fengyunsanguo server 的 fengyunsanguo_quiz_command。
+   * quiz 为可选 server，缺配 / 调用失败 → ToolExecutionError（server.ts 据此判 503）。
+   */
+  async fengyunsanguo_quiz_command(
+    message: string,
+    sessionId?: string
+  ): Promise<ToolCallResult> {
+    const args: Record<string, unknown> = { message };
+    if (sessionId) {
+      args.sessionId = sessionId;
+    }
+    try {
+      return await this.callTool(FENGYUNSANGUO_QUIZ_COMMAND_TOOL, args);
+    } catch (error) {
+      throw new ToolExecutionError(FENGYUNSANGUO_QUIZ_COMMAND_TOOL, { cause: error });
+    }
+  }
+
+  /** 解析 quiz_route 返回文本：纯 "true"/"false" 或 JSON 布尔 / {"hit": boolean}；无法解析按未命中（null）处理 */
+  private parseQuizRouteResult(result: ToolCallResult): boolean | null {
+    const text = result.content
+      .filter((item) => item.type === "text")
+      .map((item) => item.text)
+      .join("")
+      .trim();
+    if (!text) {
+      return null;
+    }
+    if (text === "true" || text === "false") {
+      return text === "true";
+    }
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (typeof parsed === "boolean") {
+        return parsed;
+      }
+      if (parsed && typeof parsed === "object" && "hit" in parsed) {
+        return (parsed as { hit: unknown }).hit === true;
+      }
+    } catch {
+      // 非 JSON 返回文本按未命中处理
+    }
+    return null;
   }
 
   private async resolveServerForTool(name: string): Promise<string> {

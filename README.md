@@ -14,7 +14,6 @@ src/
 ├── transport.ts  MCP 协议层（多 server 注册表：连接、列工具、按工具名路由、关闭）
 ├── agent.ts      AI 编排层（LLM 调用、tool-use 循环）
 ├── server.ts     Express HTTP 层（路由、校验、请求队列）
-├── sango.ts      三国知识问答题库服务（加载检索、随机一题会话）
 ├── index.ts      Web 服务入口
 ├── cli.ts        CLI 交互入口
 └── test/         特性测试（按特性号分目录）
@@ -38,11 +37,12 @@ node --test "build/test/feat-A002/*.test.js"
 
 ## 配置
 
-MCP server 清单通过根目录 `.env` 的**注册表环境变量**声明（weather 必需、sango 可选）：
+MCP server 清单通过根目录 `.env` 的**注册表环境变量**声明（weather 必需；sango 演义与 fengyunsanguo 可缺配）：
 
 ```env
 MCP_WEATHER_SCRIPT=D:\workplace\mcp-server\weather\src\index.js
 MCP_SANGO_SCRIPT=D:\workplace\mcp-server\sango\dist\index.js
+MCP_FENGYUNSANGUO_SCRIPT=D:\workplace\mcp-server\fengyunsanguo\dist\index.js
 ```
 
 LLM 配置同文件：
@@ -67,26 +67,28 @@ npm run dev
 接口：
 - `GET /health` — 健康检查
 - `GET /api/tools` — 列出可用 MCP 工具（合并所有已注册 server 的工具）
-- `POST /api/chat` — 发送聊天消息（`{ "message": "...", "domain": "sango-novel" }`）
+- `POST /api/chat` — 发送聊天消息，`domain` 可选：`weather` / `fengyunsanguo` / `sango-novel`（缺省自动路由）
 
 **CLI 交互模式：**
 
 ```bash
 npm start
-```### 场景分发（feat-A002 风云三国知识问答）
+```
 
-`POST /api/chat` 请求体支持 `scenario` / `service` / `sessionId`（均为可选项）：
+### 域分发（domain 路由）
 
-| scenario | service | 说明 |
-|----------|---------|------|
-| `general`（缺省） | — | 普通问答，不带工具 |
-| `weather` | — | 天气 MCP 工具（现状） |
-| `sango` | `knowledge` | 三国知识问答：LLM 理解问法，答案从题库精确取 |
-| `sango` | `random` | 随机一题：本地规则出题/判题/查答案，不调 LLM |
+`POST /api/chat` 请求体支持 `message` + `domain`（可选）；`domain` 命中即锁定该域（L1 标签判定），缺省时按 L2 关键词 / L3 向量 / LLM 兜底自动路由（见 `docs/sango-mcp-routing-design.md`）。
 
-- `sango` + `random`：`sessionId` 标识会话（前端生成 UUID），会话 30 分钟过期
-- 题库默认 `data/sango-questions.json`，可用环境变量 `SANGO_QUESTION_FILE` 覆盖### 新增一个 MCP server（通用流程）
+| domain | 说明 |
+|--------|------|
+| `weather` | 天气 MCP 工具（get-forecast / get-alerts） |
+| `fengyunsanguo` | 风云三国知识问答：LLM 理解问法，答案经 MCP 工具 `fengyunsanguo_query` 从题库精确取 |
+| `sango-novel` | 三国演义原著检索（`sango_novel_search`，feat-A004） |
 
+- 风云三国随机一题走 `POST /api/sango/random`：薄转发 MCP `fengyunsanguo_quiz_command`，出题 / 判题 / 查答案状态机在 fengyunsanguo 子进程；`sessionId` 语义不变，会话 30 分钟过期
+- 题库在 `mcp-server/fengyunsanguo/data/fengyunsanguo-questions.json`；quiz 子进程缺配 / 不可用 → 随机一题与 `domain=fengyunsanguo` 知识问答返回 503，其余功能正常
+
+### 新增一个 MCP server（通用流程）
 以后要接第 3 个 MCP（如「水浒传」），**不需要改 orchestrator 任何代码**：
 
 1. 在 `mcp-server/` 下新建独立项目目录（如 `shuihu/`），实现 MCP stdio server，注册自己的工具（新增 MCP 一律 TypeScript 打底）。
@@ -109,5 +111,5 @@ npm start
 | `PORT` | Web 服务端口 | `3000` |
 | `WEB_ORIGIN` | CORS 允许来源 | `http://localhost:8001` |
 | `MCP_WEATHER_SCRIPT` | weather server 入口脚本绝对路径 | 必填 |
-| `MCP_SANGO_SCRIPT` | sango server 入口脚本绝对路径 | 缺配 → sango 不可用 |
-| `SANGO_QUESTION_FILE` | 风云三国题库文件路径 | `data/sango-questions.json` |
+| `MCP_SANGO_SCRIPT` | 三国演义（sango）server 入口脚本绝对路径 | 缺配 → sango 演义不可用 |
+| `MCP_FENGYUNSANGUO_SCRIPT` | 风云三国（fengyunsanguo）server 入口脚本绝对路径 | 缺配 → fengyunsanguo 不可用 |

@@ -46,8 +46,8 @@ class RecordingAgent extends Agent {
   }
 }
 
-const SANG_QUIZ_TOOL: MCPToolDefinition = {
-  name: "sango_query",
+const FENGYUNSANGUO_QUIZ_TOOL: MCPToolDefinition = {
+  name: "fengyunsanguo_query",
   description: "风云三国知识问答：查题库",
   inputSchema: {
     type: "object",
@@ -84,7 +84,7 @@ function textResponse(text: string): ModelResponse {
 }
 
 test("general 模式：options.tools=[] 时不执行任何工具，也不查 transport.listTools", async () => {
-  const transport = new MockTransport([SANG_QUIZ_TOOL]);
+  const transport = new MockTransport([FENGYUNSANGUO_QUIZ_TOOL]);
   const seenTools: MCPToolDefinition[][] = [];
 
   const modelCaller = async (
@@ -113,10 +113,10 @@ test("general 模式：options.tools=[] 时不执行任何工具，也不查 tra
 for (const provider of ["deepseek", "anthropic"] as const) {
   if (provider === "anthropic") continue; // 暂不注册 anthropic 用例
   test(`本地工具命中（${provider}）：走 localTools 而非 transport.callTool，回填符合 ${provider} 消息格式`, async () => {
-    const transport = new MockTransport([SANG_QUIZ_TOOL]);
+    const transport = new MockTransport([FENGYUNSANGUO_QUIZ_TOOL]);
     let localCalls = 0;
     const localTools = {
-      sango_query: async (args: Record<string, unknown>) => {
+      fengyunsanguo_query: async (args: Record<string, unknown>) => {
         localCalls += 1;
         return {
           content: [{ type: "text", text: `题干：${String(args.text)}` }],
@@ -131,7 +131,7 @@ for (const provider of ["deepseek", "anthropic"] as const) {
     ): Promise<ModelResponse> => {
       modelCallCount += 1;
       if (modelCallCount === 1) {
-        return toolUseResponse("sango_query", {
+        return toolUseResponse("fengyunsanguo_query", {
           text: "赤壁之战发生在哪一年？",
         });
       }
@@ -169,7 +169,7 @@ test("未命中本地工具时回退 transport.callTool（天气链路回归）"
   const transport = new MockTransport([WEATHER_TOOL]);
 
   const localTools = {
-    sango_query: async () => ({
+    fengyunsanguo_query: async () => ({
       content: [{ type: "text", text: "不应被调用" }],
     }),
   };

@@ -30,7 +30,7 @@ import {
 export const UNIFIED_SYSTEM_PROMPT = [
   // 身份与总原则
   "你是统一对话助手，用简体中文回答用户问题。",
-  "你有三项专用能力：美国天气播报（get-forecast / get-alerts）、风云三国题库问答（sango_query）、《三国演义》原著检索（sango_novel_search）。",
+  "你有三项专用能力：美国天气播报（get-forecast / get-alerts）、风云三国题库问答（fengyunsanguo_query）、《三国演义》原著检索（sango_novel_search）。",
   "总原则：先判断用户意图是否命中某项专用能力 → 命中则调用对应工具、并严格按该能力的格式作答 → 未命中则按「分域兜底」处理。一次回答只属于一个域，不混用两个域的格式与话术。",
   "",
   // 能力清单
@@ -44,10 +44,10 @@ export const UNIFIED_SYSTEM_PROMPT = [
   "5. 不输出未来几天预报、预警区域细节或用户没问的建议。",
   "",
   "【能力二 · 风云三国题库问答】",
-  "适用域：仅限风云三国游戏内的招募武将问答题；其他三国历史或常识问答不属于本能力，不要调用 sango_query。",
+  "适用域：仅限风云三国游戏内的招募武将问答题；其他三国历史或常识问答不属于本能力，不要调用 fengyunsanguo_query。",
   "什么时候调：用户的问题指向上述题库题目时（含与题干问法不同、含义相同的问法）。",
   "调了之后怎么答（以下 5 条必须严格遵守）：",
-  "1. 收到用户提问后必须先调用 sango_query 工具（参数 text 传用户原始问题），取回候选题目。",
+  "1. 收到用户提问后必须先调用 fengyunsanguo_query 工具（参数 text 传用户原始问题），取回候选题目。",
   "2. 先理解用户问题的含义，再判断候选中哪条含义相同；问法不同但含义相同即算对应。",
   "3. 判定出对应的题目后，只输出该题答案原文，不要输出题干、选项字母、解释或任何多余文字。",
   "4. 候选中没有含义对应的题目时（包括只是字面相似、含义不同的），只回复「题库未收录该题，请换个问法」。",
@@ -66,7 +66,7 @@ export const UNIFIED_SYSTEM_PROMPT = [
   // 优先级判断次序
   "【判断次序（自上而下，命中即停）】",
   "三个专用域互斥，按语义命中即停：",
-  "1. 意图是否命中风云三国游戏内招募武将问答题 → 命中：调 sango_query，按能力二的 5 条作答。",
+  "1. 意图是否命中风云三国游戏内招募武将问答题 → 命中：调 fengyunsanguo_query，按能力二的 5 条作答。",
   "1.1 意图是否命中《三国演义》原著情节 / 人物 / 事件等需要原文依据的问句 → 命中：调 sango_novel_search（参数 source=sanguo-yanyi、query=用户白话问句、limit 默认 5），按能力三的 6 条作答。",
   "2. 意图是否命中美国境内城市的天气 / 地铁通勤出行 → 命中：调 get-forecast（必要时 get-alerts），按能力一的 5 条作答。",
   "3. 以上都未命中 → 不调用任何工具，转入分域兜底。",
@@ -74,7 +74,7 @@ export const UNIFIED_SYSTEM_PROMPT = [
   // 分域兜底
   "【分域兜底（未命中专用能力时按所属域处理，不存在笼统的自由回答）】",
   "- 原著检索域：调过 sango_novel_search 但检索无命中，或引用校验不过 → 不做归纳生成，输出「原文片段 + 出处」并补一句结论归纳（如「按原文，斩华雄者系关羽」）；原文无相关内容时按能力三第 4 条回答「演义中未涉及」。",
-  "- 三国题库域：调过 sango_query 但候选中没有含义对应的题 → 只回复「题库未收录该题，请换个问法」，不用题库之外的知识补答。",
+  "- 三国题库域：调过 fengyunsanguo_query 但候选中没有含义对应的题 → 只回复「题库未收录该题，请换个问法」，不用题库之外的知识补答。",
   "- 非美国天气域：用户问的是美国以外地区（如北京）的天气 → 不调用天气工具，明确告知仅支持美国境内天气查询、无法提供该地区数据；严禁编造温度、降水或预警数值。",
   "- 其余域：包括问候（如「你好」）、闲聊以及与天气、题库无关的通用问题 → 不调用任何工具，凭自身知识自由作答，简洁清楚；不套用天气播报格式，不套用题库话术，不确定时直接说明。",
   "",
@@ -85,7 +85,7 @@ export const UNIFIED_SYSTEM_PROMPT = [
 
 /** 域提示：命中域后追加在统一提示词之后（域内工具已预调并注入结果，模型不再自行调工具） */
 const ROUTE_HINTS: Record<string, string> = {
-  sango: ["当前用户已明确选择了“风云三国题库”场景（题库域硬锁）。系统已预先调用 sango_query 检索题库，候选题目附在问题下方【已检索到的题库候选】中；请直接依据候选作答，不要再调用 sango_query：候选中含义相同的那道题只输出该题答案原文，候选为「未召回到任何候选题目」时只回复「题库未收录该题，请换个问法」。"].join('\n'),
+  fengyunsanguo: ["当前用户已明确选择了“风云三国题库”场景（题库域硬锁）。系统已预先调用 fengyunsanguo_query 检索题库，候选题目附在问题下方【已检索到的题库候选】中；请直接依据候选作答，不要再调用 fengyunsanguo_query：候选中含义相同的那道题只输出该题答案原文，候选为「未召回到任何候选题目」时只回复「题库未收录该题，请换个问法」。"].join('\n'),
   "sango-novel":
     ['当前用户已明确选择了“三国演义原著解读”场景。系统已预先调用 sango_novel_search（source=sanguo-yanyi）检索《三国演义》原文并附在问题下方【已检索到的《三国演义》原文片段】中；请直接依据这些片段作答，不要再调用 sango_novel_search。',
       '1. 给出一句结论，结论必须直接回答用户问题的主体。例如用户问“谁温酒斩华雄”，结论应写「关羽温酒斩华雄」；不能只写「酒尚温时斩华雄」。人名用原文中的称呼，关羽、云长、关公均可。',
@@ -100,19 +100,19 @@ const CITATION_FALLBACK_CONCLUSION_PROMPT =
   "根据给定的《三国演义》原文片段，用一句话归纳结论，以「按原文，」开头；结论必须先回答用户问题的主体（例如用户问“谁”，就要写出对应人物），再写事件，禁止只复述事件。如果用户只是问名字，只回答名字即可。只依据片段内容作答，不得补充片段之外的信息，不得评价、纠正、对比原文。引用的原文片段长度以10字内为佳，最长不得超过20汉字。";
 
 /** 路由目标（docs/sango-mcp-routing-design.md §二）：决定系统提示词、可见工具与是否走域内快路径 */
-export type RouteTarget = "weather" | "sango" | "sango-novel" | "auto";
+export type RouteTarget = "weather" | "fengyunsanguo" | "sango-novel" | "auto";
 
 /** 最终路由决策：auto 表示继续走统一 Agent；irrelevant 表示无关问题，直接短路 */
 export type RouteDecision = RouteTarget | "irrelevant";
 
-/** L3 向量匹配注入点：只做风云三国高置信正向识别，命中返回 sango */
-export type SangoVectorMatcher = (
+/** L3 向量匹配注入点：只做风云三国高置信正向识别，命中返回 fengyunsanguo */
+export type FengyunsanguoVectorMatcher = (
   query: string
 ) =>
   | boolean
-  | "sango"
+  | "fengyunsanguo"
   | null
-  | Promise<boolean | "sango" | null>;
+  | Promise<boolean | "fengyunsanguo" | null>;
 
 /** L4 轻量路由注入点：前三层未命中时，由调用方提供四分类结果 */
 export type RouteClassifier = (
@@ -135,18 +135,18 @@ export const ROUTE_CLASSIFIER_PROMPT = [
 export const IRRELEVANT_ROUTE_RESPONSE =
   "我是统一对话助手，目前可以帮你：美国天气播报、风云三国题库问答、《三国演义》原著检索。请直接问相关问题。";
 
-/** 本地题库工具名（index.ts 装配同名 localTool）：sango 域快路径预调它，不经模型决策 */
-export const SANGO_QUERY_TOOL = "sango_query";
+/** 本地题库工具名（index.ts 装配同名 localTool）：fengyunsanguo 域快路径预调它，不经模型决策 */
+export const FENGYUNSANGUO_QUERY_TOOL = "fengyunsanguo_query";
 
 /** L1 前端标签 → 域：domain 取值与 server.ts 白名单同源，命中即跳过后续所有路由判断 */
 const DOMAIN_ROUTES: Record<string, RouteTarget> = {
   weather: "weather",
-  sango: "sango",
+  fengyunsanguo: "fengyunsanguo",
   "sango-novel": "sango-novel",
 };
 
 // L2 本地关键词硬匹配（文档 §二 第二层）：命中任意专属关键词即路由到对应域
-const SANGO_KEYWORDS = ["风云三国", "MOD", "骑砍", "招募", "答题", "好感度"];
+const FENGYUNSANGUO_KEYWORDS = ["风云三国", "MOD", "骑砍", "招募", "答题", "好感度"];
 const NOVEL_KEYWORDS = [
   "官职",
   "生卒年",
@@ -200,8 +200,8 @@ export interface AgentOptions {
   /** feat-A004 引用硬校验注入点（测试用）；不注入使用默认实现（本地别名表扫描 + LLM 结论归纳） */
   aliasTable?: Map<string, string>;
   fallbackConcluder?: (fragments: RecallFragment[]) => Promise<string>;
-  /** L3 向量匹配注入点；命中 sango 后走题库快路径 */
-  sangoVectorMatcher?: SangoVectorMatcher;
+  /** L3 向量匹配注入点；命中 fengyunsanguo 后走题库快路径 */
+  fengyunsanguoVectorMatcher?: FengyunsanguoVectorMatcher;
   /** L4 轻量路由注入点；不注入则保持统一 Agent 语义自主决策 */
   routeClassifier?: RouteClassifier;
 }
@@ -346,13 +346,13 @@ export class Agent {
       : await this.callTransportTool(SANGO_NOVEL_SEARCH_TOOL, args);
   }
 
-  /** sango 域快路径：直接调本地题库工具（不经模型决策）；测试可用 localTools 注入 */
-  private async searchSangoQuestions(query: string): Promise<ToolCallResult> {
+  /** fengyunsanguo 域快路径：直接调题库工具（不经模型决策）；测试可用 localTools 注入 */
+  private async searchFengyunsanguoQuestions(query: string): Promise<ToolCallResult> {
     const args = { text: query };
-    const localTool = this.options.localTools?.[SANGO_QUERY_TOOL];
+    const localTool = this.options.localTools?.[FENGYUNSANGUO_QUERY_TOOL];
     return localTool
       ? await localTool(args)
-      : await this.callTransportTool(SANGO_QUERY_TOOL, args);
+      : await this.callTransportTool(FENGYUNSANGUO_QUERY_TOOL, args);
   }
 
   private invokeModel(
@@ -505,7 +505,7 @@ export class Agent {
       return "weather";
     }
     if (digit === "2") {
-      return "sango";
+      return "fengyunsanguo";
     }
     if (digit === "3") {
       return "sango-novel";
@@ -527,8 +527,8 @@ export class Agent {
     const lowered = query.toLowerCase();
     const hit = (keywords: string[]) =>
       keywords.some((keyword) => lowered.includes(keyword.toLowerCase()));
-    if (hit(SANGO_KEYWORDS)) {
-      return "sango";
+    if (hit(FENGYUNSANGUO_KEYWORDS)) {
+      return "fengyunsanguo";
     }
     if (hit(NOVEL_KEYWORDS)) {
       return "sango-novel";
@@ -563,8 +563,8 @@ export class Agent {
           novelQuotes: view.quotes,
           novelTargets: view.fragments,
         };
-      } else if (domain === DOMAIN_ROUTES["sango"]) {
-        const result = await this.searchSangoQuestions(query);
+      } else if (domain === DOMAIN_ROUTES["fengyunsanguo"]) {
+        const result = await this.searchFengyunsanguoQuestions(query);
         return { result: this.collectTexts(result).join("\n") };
       } else if (domain === DOMAIN_ROUTES["weather"]) {
         // Handle weather domain
@@ -576,7 +576,7 @@ export class Agent {
   /**
    * 处理用户提问并回答
    * 先做四层路由判定（L1 标签 → L2 关键词 → L3 向量 → L4 轻量分类），
-   * 命中 sango / sango-novel 走域内快路径；L4 判为无关问题直接返回引导话术；
+   * 命中 fengyunsanguo / sango-novel 走域内快路径；L4 判为无关问题直接返回引导话术；
    * 未注入 L3 / L4 时 auto 保持统一 Agent 语义自主决策。
    */
   async processQuery(query: string, domain?: string): Promise<string> {
@@ -598,10 +598,10 @@ export class Agent {
       novelSearched = result.novelFragments !== undefined;
     }
 
-    // L3 向量匹配注入点：只做风云三国高置信正向识别，命中 sango 后走题库快路径
-    const sangoHit = await this.options.sangoVectorMatcher?.(query);
-    if (sangoHit === true || sangoHit === "sango") {
-      route = DOMAIN_ROUTES.sango
+    // L3 向量匹配注入点：只做风云三国高置信正向识别，命中 fengyunsanguo 后走题库快路径
+    const fengyunsanguoHit = await this.options.fengyunsanguoVectorMatcher?.(query);
+    if (fengyunsanguoHit === true || fengyunsanguoHit === "fengyunsanguo") {
+      route = DOMAIN_ROUTES.fengyunsanguo
       const { result } = await this.resolveUserContent(query, route);
       resolvedContent = result;
     }
