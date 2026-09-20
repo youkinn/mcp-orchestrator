@@ -1,8 +1,20 @@
+import { randomUUID } from 'node:crypto';
 import cors from 'cors';
-import express, { type Request, type Response } from 'express';
+import express, {
+  type Request,
+  type RequestHandler,
+  type Response,
+} from 'express';
 import type { Agent, ChatData } from './agent.js';
 import type { MCPTransport } from './transport.js';
 import { ToolExecutionError, type ToolCallResult } from './types.js';
+import { createLogsApi } from './api/v1/logs.js';
+import {
+  getLogStore,
+  truncate,
+  type LogStore,
+} from './storage/logs.js';
+import { runWithTraceId } from './trace.js';
 
 const MAX_MESSAGE_LENGTH = 300;
 const CHAT_ALLOWED_KEYS = ['message', 'domain'];
@@ -79,17 +91,86 @@ function sendError(response: Response, code: number, message: string) {
   response.status(code).json({ code, data: null, message });
 }
 
+/** 埋点旁路：日志写失败只告警，绝不影响 /api/chat 主流程与响应 */
+function trySafe(run: () => void): void {
+  try {
+    run();
+  } catch (error) {
+    console.error('Log write failed (bypassed):', error);
+  }
+}
+
+/** /api/chat 全链路埋点中间件（t1 骨架）：读 X-Trace-Id（缺失兜底生成并回写响应头）、
+ * X-Client-Sent-At；ensureSkeleton 在业务校验 / 入队之前执行（400 / 413 也落库）；
+ * runWithTraceId 包裹后续处理供 agent / transport 明细埋点取用 */
+function chatTracing(logStore: LogStore): RequestHandler {
+  return (request, response, next) => {
+    const rawTraceId = request.header('X-Trace-Id');
+    const traceId =
+      typeof rawTraceId === 'string' && rawTraceId.trim() !== ''
+        ? rawTraceId.trim()
+        : randomUUID();
+    // 兜底生成的 traceId 必须随响应头返回，前端补报以服务端为准（X-Trace-Id）
+    response.setHeader('X-Trace-Id', traceId);
+
+    const rawSentAt = request.header('X-Client-Sent-At');
+    const clientSentAt =
+      typeof rawSentAt === 'string' && /^\d+$/.test(rawSentAt.trim())
+        ? Number(rawSentAt.trim())
+        : null;
+
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    trySafe(() =>
+      logStore.ensureSkeleton(
+        'chat',
+        traceId,
+        typeof body.message === 'string' ? body.message : null,
+        typeof body.domain === 'string' ? body.domain : null,
+        Date.now(),
+        clientSentAt
+      )
+    );
+
+    runWithTraceId(traceId, () => {
+      response.locals.chatTraceId = traceId;
+      next();
+    });
+  };
+}
+
+/** 队列 / 编排异常统一映射：503 只由 ToolExecutionError 触发，其余一律 500 */
+function processingErrorInfo(error: unknown): { code: number; message: string } {
+  const toolUnavailable = error instanceof ToolExecutionError;
+  return {
+    code: toolUnavailable ? 503 : 500,
+    message: toolUnavailable
+      ? '工具服务暂不可用，请稍后重试'
+      : '处理请求失败，请稍后重试',
+  };
+}
+
 export function createServer(
   agent: Agent,
   transport: MCPTransport,
-  options: { port: number; allowedOrigin: string }
+  options: { port: number; allowedOrigin: string; logStore?: LogStore }
 ) {
   const app = express();
+  // feat-A007：日志存储（进程级共享实例；测试可注入隔离 store）
+  const logStore = options.logStore ?? getLogStore();
   // 两个 POST 端点共用同一条串行队列，避免 LLM 调用与题库会话读写并发
   let requestQueue = Promise.resolve();
 
-  app.use(cors({ origin: options.allowedOrigin }));
+  app.use(
+    cors({
+      origin: options.allowedOrigin,
+      // feat-A007：跨域部署时前端需读取响应头 X-Trace-Id（兜底场景以服务端为准）
+      exposedHeaders: ['X-Trace-Id'],
+    })
+  );
   app.use(express.json({ limit: '32kb' }));
+
+  // feat-A007：v1 日志查询接口独立处理器；/api/v1/logs* 不参与本特性埋点（防递归）
+  app.use('/api/v1/logs', createLogsApi(logStore));
 
   app.get('/health', (_request: Request, response: Response) => {
     response.json({
@@ -113,47 +194,84 @@ export function createServer(
     }
   });
 
-  // 校验通过后入队执行；503 只由 ToolExecutionError 触发，其余异常一律 500
-  async function enqueue(
-    response: Response,
+  // 入队执行：队列串行、先到先处理；异常（含 ToolExecutionError）向上抛给调用方映射 500 / 503
+  function enqueue(
     handle: () => ChatData | Promise<ChatData>
-  ) {
-    try {
-      const result = requestQueue.then(() => handle());
-      requestQueue = result.then(
-        () => undefined,
-        () => undefined
-      );
-      response.json({ code: 200, data: await result, message: '' });
-    } catch (error) {
-      console.error('Failed to process request:', error);
-      const toolUnavailable = error instanceof ToolExecutionError;
-      sendError(
-        response,
-        toolUnavailable ? 503 : 500,
-        toolUnavailable
-          ? '工具服务暂不可用，请稍后重试'
-          : '处理请求失败，请稍后重试'
-      );
-    }
+  ): Promise<ChatData> {
+    const result = requestQueue.then(() => handle());
+    requestQueue = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
   }
 
-  app.post('/api/chat', async (request: Request, response: Response) => {
-    const parsed = parseBody(
-      (request.body ?? {}) as Record<string, unknown>,
-      CHAT_ALLOWED_KEYS,
-      CHAT_ALLOWED_LABEL
-    );
-    if (!parsed.ok) {
-      sendError(response, parsed.code, parsed.message);
-      return;
-    }
+  app.post(
+    '/api/chat',
+    chatTracing(logStore),
+    async (request: Request, response: Response) => {
+      const traceId = response.locals.chatTraceId as string;
+      const parsed = parseBody(
+        (request.body ?? {}) as Record<string, unknown>,
+        CHAT_ALLOWED_KEYS,
+        CHAT_ALLOWED_LABEL
+      );
+      if (!parsed.ok) {
+        // 校验失败（400 / 413）同样落主表一条：handle_started_at 为 NULL、t5 回填校验失败时刻
+        trySafe(() =>
+          logStore.markResponded(
+            traceId,
+            Date.now(),
+            'failed',
+            parsed.code,
+            parsed.message,
+            null,
+            null
+          )
+        );
+        sendError(response, parsed.code, parsed.message);
+        return;
+      }
 
-    await enqueue(
-      response,
-      () => agent.processQueryData(parsed.value.message, parsed.value.domain)
-    );
-  });
+      try {
+        const data = await enqueue(() => {
+          // 队列出队开始处理：回填 t2（未入队的校验失败请求保持 NULL）
+          trySafe(() => logStore.markHandled(traceId, Date.now()));
+          return agent.processQueryData(parsed.value.message, parsed.value.domain);
+        });
+
+        // 响应完成：回填 t5 与 status / response_code / answer / citations（内容字段 8000 截断）
+        trySafe(() =>
+          logStore.markResponded(
+            traceId,
+            Date.now(),
+            'success',
+            200,
+            '',
+            truncate(data.answer) ?? null,
+            truncate(JSON.stringify(data.citations)) ?? null
+          )
+        );
+        response.json({ code: 200, data, message: '' });
+      } catch (error) {
+        // 异常中断兜底：骨架必然已存在（进入本 handler 前 ensureSkeleton），按失败回填
+        console.error('Failed to process request:', error);
+        const info = processingErrorInfo(error);
+        trySafe(() =>
+          logStore.markResponded(
+            traceId,
+            Date.now(),
+            'failed',
+            info.code,
+            info.message,
+            null,
+            null
+          )
+        );
+        sendError(response, info.code, info.message);
+      }
+    }
+  );
 
   app.post('/api/sango/random', async (request: Request, response: Response) => {
     const parsed = parseBody(
@@ -168,13 +286,20 @@ export function createServer(
 
     // 确定性命令：薄转发 mcp-server fengyunsanguo_quiz_command（出题 / 判题 / 查答案状态机在 quiz 子进程），
     // 不经 LLM；citations 恒 []（随机一题无原文引用，行为与现状零变化）
-    await enqueue(response, async () => {
-      const result = await transport.fengyunsanguo_quiz_command(
-        parsed.value.message,
-        parsed.value.sessionId
-      );
-      return { answer: toolResultText(result), citations: [] };
-    });
+    try {
+      const data = await enqueue(async () => {
+        const result = await transport.fengyunsanguo_quiz_command(
+          parsed.value.message,
+          parsed.value.sessionId
+        );
+        return { answer: toolResultText(result), citations: [] };
+      });
+      response.json({ code: 200, data, message: '' });
+    } catch (error) {
+      console.error('Failed to process request:', error);
+      const info = processingErrorInfo(error);
+      sendError(response, info.code, info.message);
+    }
   });
 
   return app;

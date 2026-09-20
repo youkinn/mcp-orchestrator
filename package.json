@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "mcp-orchestrator",
   "version": "1.0.0",
   "description": "MCP orchestration layer - connects LLM to MCP servers",
@@ -14,12 +14,14 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.124.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "better-sqlite3": "^13.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "openai": "^7.13.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^22.20.2",

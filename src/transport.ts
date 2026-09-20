@@ -5,6 +5,32 @@ import {
   ListToolsResultSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { ToolExecutionError, type MCPToolDefinition, type ToolCallResult } from "./types.js";
+import { getTraceId } from "./trace.js";
+import { appendToolCall, truncate } from "./storage/logs.js";
+
+// feat-A007 工具明细埋点辅助（旁路静默）：序列化失败兜底 String，统一 8000 截断
+function summarizeJson(value: unknown, max = 8000): string {
+  let text: string;
+  try {
+    text = JSON.stringify(value);
+  } catch {
+    text = String(value);
+  }
+  return (truncate(text ?? "", max) ?? "").trim();
+}
+
+function toErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** isError 返回的错误描述：取返回内容中的文本拼接；无文本返回空串（调用方兜底文案） */
+function extractToolError(result: ToolCallResult): string {
+  return result.content
+    .filter((item) => item.type === "text" && typeof item.text === "string")
+    .map((item) => item.text ?? "")
+    .join(" ")
+    .trim();
+}
 
 /** 注册表条目：一个 MCP server 的启动配置 */
 export interface MCPServerConfig {
@@ -198,7 +224,53 @@ export class MCPTransport {
     if (!connection) {
       throw new Error(`Unknown MCP tool: ${name}`);
     }
-    return connection.callTool(name, args);
+    // feat-A007 工具明细：发出 = MCP 收到（只记一次）；仅请求上下文（getTraceId 非空）时记录
+    const traceId = getTraceId();
+    const activeTraceId =
+      typeof traceId === "string" && traceId !== "" ? traceId : null;
+    const callSentAt = Date.now();
+    const argsSummary = activeTraceId ? summarizeJson(args) : "";
+    try {
+      const result = await connection.callTool(name, args);
+      if (activeTraceId) {
+        try {
+          const toolFailed = (result as { isError?: boolean }).isError === true;
+          appendToolCall(activeTraceId, {
+            mcpServer: serverName,
+            toolName: name,
+            argsSummary,
+            callSentAt,
+            callReturnedAt: Date.now(),
+            resultSummary: summarizeJson(result),
+            status: toolFailed ? "failed" : "success",
+            errorMessage: toolFailed
+              ? extractToolError(result) || "MCP 工具返回错误（isError=true）"
+              : "",
+          });
+        } catch {
+          // 旁路：埋点失败静默，绝不影响工具调用
+        }
+      }
+      return result;
+    } catch (error) {
+      if (activeTraceId) {
+        try {
+          appendToolCall(activeTraceId, {
+            mcpServer: serverName,
+            toolName: name,
+            argsSummary,
+            callSentAt,
+            callReturnedAt: Date.now(),
+            resultSummary: null,
+            status: "failed",
+            errorMessage: toErrorMessage(error),
+          });
+        } catch {
+          // 旁路：埋点失败静默，绝不影响工具调用
+        }
+      }
+      throw error;
+    }
   }
 
   /**
