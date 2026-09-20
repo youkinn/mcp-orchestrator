@@ -111,7 +111,7 @@ test("domain=sango-novel 时 system 追加三国演义域提示（软性，不�
   assert.ok(capturedSystem.includes("sango_novel_search"), "域提示应指向原著检索工具");
 });
 
-test("① 指针合法：模型只给结论 + 指针，服务端渲染引用与出处（无额外模型调用）", async () => {
+test("① 指针合法：模型只给结论 + 指针，服务端渲染引文 + 角标，citations 下沉片段（无额外模型调用）", async () => {
   let modelCallCount = 0;
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
@@ -136,17 +136,17 @@ test("① 指针合法：模型只给结论 + 指针，服务端渲染引用与�
     modelCaller,
   });
 
-  const answer = await agent.processQuery("谁斩了华雄？");
-  assert.equal(
-    answer,
-    `斩华雄者系关羽，原文见「${RECALL_QUOTE}」（出处：第${RECALL_CHAPTER}回 ${RECALL_TITLE}）。`
-  );
-  assert.doesNotMatch(answer, /\[Q1\]/, "指针应已被服务端渲染替换");
-  assert.doesNotMatch(answer, /段\d/, "出处只到回目，不展示段号");
+  const data = await agent.processQueryData("谁斩了华雄？");
+  assert.equal(data.answer, `斩华雄者系关羽，原文见「${RECALL_QUOTE}」¹。`);
+  assert.deepEqual(data.citations, [
+    { text: RECALL_BODY, chapter: RECALL_CHAPTER, title: RECALL_TITLE },
+  ]);
+  assert.doesNotMatch(data.answer, /\[Q1\]/, "指针应已被服务端渲染替换");
+  assert.doesNotMatch(data.answer, /段\d|（出处/, "不再内联出处，任何展示位无段号");
   assert.equal(modelCallCount, 2, "校验通过不应有额外模型调用");
 });
 
-test("② 断言人物不在召回原文（曹操）：丢弃模型输出，输出兜底「原文片段 + 出处 + 结论归纳」", async () => {
+test("② 断言人物不在召回原文（曹操）：丢弃模型输出，输出兜底结论句 + 恰一条兜底片段", async () => {
   let modelCallCount = 0;
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
@@ -171,13 +171,13 @@ test("② 断言人物不在召回原文（曹操）：丢弃模型输出，输�
     modelCaller,
   });
 
-  const answer = await agent.processQuery("谁斩了华雄？");
-  assert.match(answer, /【原文片段】/);
-  assert.match(answer, /众皆大惊曰：“云长提刀出阵，斩华雄于帐前！”/);
-  assert.match(answer, /（出处：第5回 发矫诏诸镇应曹公　破关兵三英战吕布）/);
-  assert.doesNotMatch(answer, /段\d/, "出处只到回目，不展示段号");
-  assert.match(answer, /按原文，斩华雄者系关羽/);
-  assert.doesNotMatch(answer, /曹操斩了华雄/);
+  const data = await agent.processQueryData("谁斩了华雄？");
+  assert.equal(data.answer, "按原文，斩华雄者系关羽¹");
+  assert.deepEqual(data.citations, [
+    { text: RECALL_BODY, chapter: RECALL_CHAPTER, title: RECALL_TITLE },
+  ]);
+  assert.doesNotMatch(data.answer, /曹操斩了华雄/);
+  assert.doesNotMatch(data.answer, /（出处|【原文片段】/, "兜底不再内联原文与出处");
   assert.equal(modelCallCount, 2, "注入提取/结论后不增加模型调用");
 });
 
@@ -206,9 +206,15 @@ test("②.1 指针非法（不在本次注入集合内）：丢弃模型输出�
     modelCaller,
   });
 
-  const answer = await agent.processQuery("谁斩了华雄？");
-  assert.match(answer, /【原文片段】/, "越界指针即走兜底");
-  assert.doesNotMatch(answer, /\[Q9\]/, "非法指针不得进入最终答案");
+  const data = await agent.processQueryData("谁斩了华雄？");
+  assert.equal(data.answer, "按原文，斩华雄者系关羽¹", "越界指针即走兜底");
+  assert.doesNotMatch(data.answer, /\[Q9\]/, "非法指针不得进入最终答案");
+  assert.equal(data.citations.length, 1, "兜底恰一条");
+  assert.deepEqual(data.citations[0], {
+    text: RECALL_BODY,
+    chapter: RECALL_CHAPTER,
+    title: RECALL_TITLE,
+  });
   assert.equal(modelCallCount, 2, "兜底走注入的结论归纳，不额外调模型");
 });
 
@@ -237,8 +243,14 @@ test("②.2 缺指针（结论无引用）：丢弃模型输出，走兜底", as
     modelCaller,
   });
 
-  const answer = await agent.processQuery("谁斩了华雄？");
-  assert.match(answer, /【原文片段】/, "无指针即无出处，走兜底补出处");
+  const data = await agent.processQueryData("谁斩了华雄？");
+  assert.equal(data.answer, "按原文，斩华雄者系关羽¹", "无指针即无出处，走兜底补出处");
+  assert.equal(data.citations.length, 1, "兜底恰一条");
+  assert.deepEqual(data.citations[0], {
+    text: RECALL_BODY,
+    chapter: RECALL_CHAPTER,
+    title: RECALL_TITLE,
+  });
   assert.equal(modelCallCount, 2);
 });
 
@@ -269,12 +281,16 @@ test("②.3 长引语安全网：模型违规抄写超 30 字引语被丢弃，�
     modelCaller,
   });
 
-  const answer = await agent.processQuery("谁斩了华雄？");
-  assert.doesNotMatch(answer, new RegExp(longQuote), "违规抄写应被丢弃");
-  assert.ok(
-    answer.includes(`「${RECALL_QUOTE}」（出处：第5回 ${RECALL_TITLE}）`),
+  const data = await agent.processQueryData("谁斩了华雄？");
+  assert.doesNotMatch(data.answer, new RegExp(longQuote), "违规抄写应被丢弃");
+  assert.equal(
+    data.answer,
+    `斩华雄者系关羽，曰「${RECALL_QUOTE}」¹。`,
     "原文改由指针 + 字段渲染，逐字可信"
   );
+  assert.deepEqual(data.citations, [
+    { text: RECALL_BODY, chapter: RECALL_CHAPTER, title: RECALL_TITLE },
+  ]);
   assert.equal(modelCallCount, 2, "安全网是确定性回收，不额外调模型");
 });
 
@@ -330,12 +346,19 @@ test("②.4 注入编号连续（bug-00009）：窗口裁掉证据段引语时�
     modelCaller,
   });
 
-  const answer = await agent.processQuery("华雄是怎么死的");
+  const data = await agent.processQueryData("华雄是怎么死的");
   assert.ok(
-    answer.includes(`「酒且斟下，某去便来。」（出处：第5回 ${RECALL_TITLE}）`),
+    data.answer.includes(`「酒且斟下，某去便来。」¹`),
     "Q2 应指向被并回窗口的证据段引语，答案原样保留"
   );
-  assert.doesNotMatch(answer, /【原文片段】/, "指针合法不应走兜底");
+  assert.equal(data.citations.length, 1, "只收被引用片段：仅 Q2 所在片段");
+  assert.equal(data.citations[0].chapter, 5);
+  assert.equal(data.citations[0].title, RECALL_TITLE);
+  assert.ok(
+    data.citations[0].text.includes("关公曰：“酒且斟下，某去便来。”"),
+    "citation text 为片段整段原文（工具出参 text）"
+  );
+  assert.doesNotMatch(data.answer, /【原文片段】/, "指针合法不应走兜底");
   assert.equal(modelCallCount, 2, "校验通过不触发兜底结论归纳");
 });
 
@@ -362,8 +385,9 @@ test("③ 检索无命中：回答「演义中未涉及」，不做归纳生成"
     modelCaller,
   });
 
-  const answer = await agent.processQuery("诸葛亮借东风后去了哪？");
-  assert.equal(answer, "演义中未涉及");
+  const data = await agent.processQueryData("诸葛亮借东风后去了哪？");
+  assert.equal(data.answer, "演义中未涉及");
+  assert.deepEqual(data.citations, [], "无引用恒空数组，不省略不缺失");
   assert.equal(modelCallCount, 2, "无命中不应触发提取/NER/结论模型调用");
 });
 
@@ -381,8 +405,9 @@ test("④ 未调原著工具的其他域：不触发引用校验，无额外模�
     modelCaller,
   });
 
-  const answer = await agent.processQuery("纽约天气怎么样？");
-  assert.equal(answer, "纽约今日适合出行。");
+  const data = await agent.processQueryData("纽约天气怎么样？");
+  assert.equal(data.answer, "纽约今日适合出行。");
+  assert.deepEqual(data.citations, [], "未调原著工具的其他域 citations 恒 []");
   assert.equal(modelCallCount, 2, "天气域不应触发引用校验的额外模型调用");
 });
 
@@ -420,11 +445,12 @@ test("⑤ 默认链路（本地别名表扫描 + 兜底结论）：校验不过�
     modelCaller,
   });
 
-  const answer = await agent.processQuery("谁斩了华雄？");
-  assert.match(answer, /【原文片段】/);
-  assert.match(answer, /众皆大惊曰：“云长提刀出阵，斩华雄于帐前！”/);
-  assert.match(answer, /（出处：第5回 发矫诏诸镇应曹公　破关兵三英战吕布）/);
-  assert.match(answer, /按原文，斩华雄者系关羽/);
+  const data = await agent.processQueryData("谁斩了华雄？");
+  assert.equal(data.answer, "按原文，斩华雄者系关羽¹");
+  assert.deepEqual(data.citations, [
+    { text: RECALL_BODY, chapter: RECALL_CHAPTER, title: RECALL_TITLE },
+  ]);
+  assert.doesNotMatch(data.answer, /（出处|【原文片段】/, "兜底不再内联原文与出处");
   assert.equal(callIndex, 3, "主问答 + 兜底结论共 3 次模型调用（无提取/NER）");
 });
 test("⑥ 快路径注入策略：前 5 段整段保底注入（不裁剪），且注入不含回目 / 段号 / 分数", async () => {
@@ -552,14 +578,21 @@ test("⑦ 注入上限放宽到 10 + 叙述段指针（bug-00009 张飞题）：
     fallbackConcluder: async () => "张飞被范疆、张达所杀",
     modelCaller,
   });
-  const answer = await agent.processQuery("张飞怎么死的");
+  const data = await agent.processQueryData("张飞怎么死的");
   assert.ok(
-    answer.includes(`张飞被范疆、张达刺死。「范、张二贼`),
-    "叙述句指针 [片段5] 应渲染证据段原文窗口"
+    data.answer.startsWith("张飞被范疆、张达刺死。「范、张二贼，探知消息"),
+    "叙述句指针 [片段5] 应渲染证据段原文"
   );
-  assert.match(answer, /密入帐中/, "渲染原文含杀张飞过程");
-  assert.match(answer, /（出处：第81回 急兄仇张飞遇害　雪弟恨先主兴兵）/);
-  assert.doesNotMatch(answer, /\[片段5\]/, "指针已被服务端渲染替换");
-  assert.doesNotMatch(answer, /【原文片段】/, "指针合法不走兜底");
+  assert.ok(data.answer.endsWith("」¹"), "叙述段指针带角标 ¹");
+  assert.match(data.answer, /密入帐中/, "渲染原文含杀张飞过程");
+  assert.equal(data.citations.length, 1, "只收被引用片段：仅 [片段5] 所在片段");
+  assert.equal(data.citations[0].chapter, 81);
+  assert.equal(data.citations[0].title, "急兄仇张飞遇害　雪弟恨先主兴兵");
+  assert.ok(
+    data.citations[0].text.includes("飞大叫一声而亡。时年五十五。"),
+    "citation text 为片段整段原文"
+  );
+  assert.doesNotMatch(data.answer, /\[片段5\]/, "指针已被服务端渲染替换");
+  assert.doesNotMatch(data.answer, /【原文片段】/, "指针合法不走兜底");
   assert.equal(modelCallCount, 2, "校验通过不触发兜底结论归纳");
 });

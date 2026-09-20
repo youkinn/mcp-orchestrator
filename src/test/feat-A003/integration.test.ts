@@ -475,7 +475,11 @@ test('1/6 美国天气语义：只传 message，真实 Agent 调 get-forecast，
   });
 
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body, { code: 200, data: { answer }, message: '' });
+  assert.deepEqual(res.body, {
+    code: 200,
+    data: { answer, citations: [] },
+    message: '',
+  });
   assert.deepEqual(
     transport.callToolCalls[0],
     { name: 'fengyunsanguo_quiz_route', args: { text: '纽约今天适合坐地铁通勤吗' } }
@@ -504,7 +508,7 @@ test('1 多轮 tool-use：get-forecast 后 get-alerts 再出文本，调用顺�
   });
 
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body.data, { answer });
+  assert.deepEqual(res.body.data, { answer, citations: [] });
   assert.deepEqual(
     callsNamed(transport.callToolCalls, 'get-forecast').map((call) => call.name),
     ['get-forecast']
@@ -526,7 +530,7 @@ test('2/6 无 domain 题库问法：L3 经 fengyunsanguo_quiz_route 未命中 �
   });
 
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body.data, { answer: '元让' });
+  assert.deepEqual(res.body.data, { answer: '元让', citations: [] });
   assert.deepEqual(transport.callToolCalls[0], {
     name: 'fengyunsanguo_quiz_route',
     args: { text: '夏侯的字是什么' },
@@ -555,7 +559,7 @@ test('3/6 题库未收录：fengyunsanguo_query 无候选，回答固定话术�
   });
 
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body.data, { answer: fixed });
+  assert.deepEqual(res.body.data, { answer: fixed, citations: [] });
   assert.deepEqual(callsNamed(transport.callToolCalls, 'fengyunsanguo_query').length, 1);
   assert.ok(
     JSON.stringify(lastMessage(model.calls[1])).includes('未召回到任何候选题目')
@@ -573,7 +577,7 @@ test('L3 识别失败（可选 server 异常）→ 不命中，自动路由照�
   });
 
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body.data, { answer: '元让' });
+  assert.deepEqual(res.body.data, { answer: '元让', citations: [] });
   assert.ok(
     callsNamed(transport.callToolCalls, 'fengyunsanguo_query').length === 1,
     'L3 失败后模型仍可自主调 fengyunsanguo_query'
@@ -591,7 +595,7 @@ test('4/6 非美国天气：不调用任何工具，明确告知仅支持美国�
   });
 
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body.data, { answer });
+  assert.deepEqual(res.body.data, { answer, citations: [] });
   assert.deepEqual(
     transport.callToolCalls.map((call) => call.name),
     ['fengyunsanguo_quiz_route']
@@ -608,7 +612,7 @@ test('5/6 闲聊：不调用任何工具（仅 L3 识别），自由作答，不
   const res = await postJson(baseUrl, '/api/chat', { message: '你好' });
 
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body.data, { answer });
+  assert.deepEqual(res.body.data, { answer, citations: [] });
   assert.deepEqual(
     transport.callToolCalls.map((call) => call.name),
     ['fengyunsanguo_quiz_route']
@@ -734,7 +738,10 @@ test('9 POST /api/sango/random：出题、判对、判错、查答案、无会�
     message: '答案',
   });
   assert.equal(noSession.status, 200);
-  assert.deepEqual(noSession.body.data, { answer: SANGO_NO_SESSION_PROMPT });
+  assert.deepEqual(noSession.body.data, {
+    answer: SANGO_NO_SESSION_PROMPT,
+    citations: [],
+  });
 
   assert.equal(model.calls.length, 0);
   assert.deepEqual(
@@ -787,7 +794,7 @@ test('10 所有端点均为 { code, data, message } 信封：成功 data 有值�
   const chat = await postJson(baseUrl, '/api/chat', { message: '你好' });
   assertEnvelope(chat.body, 200);
   assert.equal(chat.body.message, '');
-  assert.deepEqual(chat.body.data, { answer: '你好，我在。' });
+  assert.deepEqual(chat.body.data, { answer: '你好，我在。', citations: [] });
 
   const random = await postJson(baseUrl, '/api/sango/random', {
     message: '答案',

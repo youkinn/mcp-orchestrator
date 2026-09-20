@@ -13,18 +13,20 @@ import {
   SANGO_NOVEL_SEARCH_TOOL,
   buildFallback,
   buildInjectionView,
-  formatQuoteSource,
   loadAliasTable,
   pickBestFallbackFragment,
-  renderAnswerWithQuotes,
+  renderAnswerWithCitations,
   scanRecallPersonIds,
   stripOverlongModelQuotes,
   toRecallFragments,
   validateQuotePointers,
   verifyCitation,
+  type ChatData,
+  type InjectionView,
   type RecallFragment,
-  type RenderedQuote,
 } from "./citation.js";
+
+export type { ChatData } from "./citation.js";
 
 // 统一路由提示词（feat-A003）：单 Agent 自主决定调不调工具、调哪个
 export const UNIFIED_SYSTEM_PROMPT = [
@@ -425,7 +427,7 @@ export class Agent {
       ? pickBestFallbackFragment(fragments, query)
       : null;
     const fragmentText = top
-      ? `${buildInjectionView([top], query).text}\n（出处：${formatQuoteSource(top)}）`
+      ? buildInjectionView([top], query).text
       : "（无原文片段）";
     const content = `用户问题：${query}\n\n${fragmentText}`;
     const response = await this.invokeModel(
@@ -443,19 +445,19 @@ export class Agent {
   }
 
   /**
-   * feat-A004：引用硬校验（本地别名表扫描，0 次 LLM）+ 指针校验 + 服务端渲染引用与出处。
+   * feat-A004/A006：引用硬校验（本地别名表扫描，0 次 LLM）+ 指针校验 + 服务端渲染引文与 citations。
    * 模型只输出「结论 + 指针」（`[Qn]`）：指针合法（∈ 本次注入的 qid）且断言人物 ⊆ 召回人物 →
-   * 由字段渲染 `「原文」（出处：第N回 回目）`；指针非法 / 抄写超长引语 / 断言不成立 → 兜底。
+   * 由字段渲染「引文」+ 全局上标角标并组装 citations（按引用出现顺序、片段粒度合并）；
+   * 指针非法 / 抄写超长引语 / 断言不成立 → 兜底（结论句带角标 ¹ + 恰一条兜底片段）。
    */
   private async applyNovelCitationGuard(
     answer: string,
     fragments: RecallFragment[],
     query: string,
-    injectedQuotes: Map<string, RenderedQuote>,
-    injectedTargets?: Map<string, RenderedQuote>
-  ): Promise<string> {
-    if (fragments.length === 0) {
-      return NOVEL_NO_HIT_ANSWER;
+    view: InjectionView | null
+  ): Promise<ChatData> {
+    if (fragments.length === 0 || !view) {
+      return { answer: NOVEL_NO_HIT_ANSWER, citations: [] };
     }
     const aliasTable = this.getAliasTable();
     const recallText = fragments.map((fragment) => fragment.text).join("\n");
@@ -468,7 +470,7 @@ export class Agent {
       /\[片段\d+\]/.test(answer) ||
       /按原文，/.test(answer);
     if (!isNovelAnswer) {
-      return answer;
+      return { answer, citations: [] };
     }
     // H4 长引语安全网：模型输出里的超长「…」是违规抄写，直接丢弃；原文改由指针 + 字段渲染提供。
     // 断言扫描对象是丢弃违规抄写后的答案正文人名（抄写内容不参与断言）
@@ -476,13 +478,13 @@ export class Agent {
     const assertedIds = scanRecallPersonIds(cleaned, aliasTable);
     const pointer = validateQuotePointers(
       cleaned,
-      injectedQuotes,
-      injectedTargets
+      view.quotes,
+      view.fragments
     );
     const asserted = [...assertedIds].map((id) => ({ name: id, id }));
     const check = verifyCitation(asserted, recallText, recallPersonIds);
     if (pointer.ok && check.ok) {
-      return renderAnswerWithQuotes(cleaned, injectedQuotes, injectedTargets);
+      return renderAnswerWithCitations(cleaned, view);
     }
     const conclusion = await this.concludeFallback(fragments, query);
     return buildFallback(fragments, conclusion, query);
@@ -539,7 +541,7 @@ export class Agent {
     return "auto";
   }
 
-  private async resolveUserContent(query: string, domain?: string): Promise<{ result: string, novelFragments?: RecallFragment[], novelQuotes?: Map<string, RenderedQuote>, novelTargets?: Map<string, RenderedQuote> }> {
+  private async resolveUserContent(query: string, domain?: string): Promise<{ result: string, novelFragments?: RecallFragment[], novelView?: InjectionView }> {
     if (domain && DOMAIN_ROUTES[domain]) {
       const novelFragments: RecallFragment[] = [];
       if (domain === DOMAIN_ROUTES["sango-novel"]) {
@@ -560,8 +562,7 @@ export class Agent {
         return {
           result: injected,
           novelFragments,
-          novelQuotes: view.quotes,
-          novelTargets: view.fragments,
+          novelView: view,
         };
       } else if (domain === DOMAIN_ROUTES["fengyunsanguo"]) {
         const result = await this.searchFengyunsanguoQuestions(query);
@@ -574,15 +575,12 @@ export class Agent {
   }
 
   /**
-   * 处理用户提问并回答
-   * 先做四层路由判定（L1 标签 → L2 关键词 → L3 向量 → L4 轻量分类），
-   * 命中 fengyunsanguo / sango-novel 走域内快路径；L4 判为无关问题直接返回引导话术；
-   * 未注入 L3 / L4 时 auto 保持统一 Agent 语义自主决策。
+   * 处理用户提问并回答（feat-A006 结构化）：同样走四层路由判定与域内快路径，
+   * 返回 /api/chat 响应 data 统一形状 { answer, citations }（无引用恒 []）。
    */
-  async processQuery(query: string, domain?: string): Promise<string> {
+  async processQueryData(query: string, domain?: string): Promise<ChatData> {
     let novelFragments: RecallFragment[] = [];
-    let novelQuotes = new Map<string, RenderedQuote>();
-    let novelTargets = new Map<string, RenderedQuote>();
+    let novelView: InjectionView | null = null;
     let novelSearched = false;
     const userContent = query.trim();
     let resolvedContent = '';
@@ -593,8 +591,7 @@ export class Agent {
       const result = await this.resolveUserContent(query, domain || route);
       resolvedContent = result.result;
       novelFragments = result.novelFragments || [];
-      novelQuotes = result.novelQuotes || novelQuotes;
-      novelTargets = result.novelTargets || novelTargets;
+      novelView = result.novelView || null;
       novelSearched = result.novelFragments !== undefined;
     }
 
@@ -641,8 +638,7 @@ export class Agent {
           novelSearched = true;
           novelFragments.push(...this.collectRecallFragments(result, toolArgs));
           const view = buildInjectionView(novelFragments, query);
-          novelQuotes = view.quotes;
-          novelTargets = view.fragments;
+          novelView = view;
           toolContent = view.text;
         }
         const assistantMessage: any = {
@@ -686,17 +682,20 @@ export class Agent {
       .join("\n")
       .trim();
 
-    // 调过原著检索即进校验：无命中（片段为空）由 guard 统一回「演义中未涉及」
+    // 调过原著检索即进校验：无命中（片段为空）由 guard 统一回「演义中未涉及」+ citations []
     if (novelSearched) {
-      answer = await this.applyNovelCitationGuard(
+      return await this.applyNovelCitationGuard(
         answer,
         novelFragments,
         query,
-        novelQuotes,
-        novelTargets
+        novelView
       );
     }
+    return { answer, citations: [] };
+  }
 
-    return answer;
+  /** 兼容旧调用：只返回结论正文（citations 由 processQueryData 承载） */
+  async processQuery(query: string, domain?: string): Promise<string> {
+    return (await this.processQueryData(query, domain)).answer;
   }
 }

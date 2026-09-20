@@ -127,7 +127,22 @@ export interface RenderedQuote {
   text: string;
   chapter?: number;
   title?: string;
-  source: string;
+}
+
+/** feat-A006 引用出处卡片：按引用出现顺序的扁平数组；无引用时恒 [] */
+export interface Citation {
+  /** 命中片段原文（工具出参 text，可含引语；无回目 / 段号 / 类型 / 分数） */
+  text: string;
+  /** 回号 */
+  chapter?: number;
+  /** 回目 */
+  title?: string;
+}
+
+/** /api/chat 与 /api/sango/random 响应 data 统一形状（feat-A006） */
+export interface ChatData {
+  answer: string;
+  citations: Citation[];
 }
 
 /** 注入视图：注入给模型的纯原文（带 `[片段N]` / `⟨Qn⟩` 标记）+ 全局 qid → 引语元数据 */
@@ -136,6 +151,8 @@ export interface InjectionView {
   quotes: Map<string, RenderedQuote>;
   /** 全局片段编号 → 该片段原文窗口（叙述句答案的引用目标：`[片段N]` 指针渲染用，bug-00009） */
   fragments: Map<string, RenderedQuote>;
+  /** 全局引语序号 → 所属片段编号（feat-A006：同片段多引语合并为一条 citation） */
+  quoteFragments: Map<string, string>;
 }
 
 
@@ -330,6 +347,7 @@ export function buildInjectionView(
 ): InjectionView {
   const quotes = new Map<string, RenderedQuote>();
   const targets = new Map<string, RenderedQuote>();
+  const quoteFragments = new Map<string, string>();
   const parts: string[] = [];
   let next = 1;
   const injected = fragments.slice(0, INJECT_FRAGMENT_LIMIT);
@@ -347,11 +365,11 @@ export function buildInjectionView(
     }
   }
   picked.forEach((fragment, index) => {
-    targets.set(`片段${index + 1}`, {
+    const fragmentKey = `片段${index + 1}`;
+    targets.set(fragmentKey, {
       text: fragment.text,
       chapter: fragment.chapter,
       title: fragment.title,
-      source: fragment.source,
     });
     const { marked, assigned, next: after } = markQuotesInWindow(
       fragment.text,
@@ -364,12 +382,12 @@ export function buildInjectionView(
         text: quote.text,
         chapter: fragment.chapter,
         title: fragment.title,
-        source: fragment.source,
       });
+      quoteFragments.set(qid, fragmentKey);
     }
-    parts.push(`[片段${index + 1}] ${marked}`);
+    parts.push(`[${fragmentKey}] ${marked}`);
   });
-  return { text: parts.join("\n\n"), quotes, fragments: targets };
+  return { text: parts.join("\n\n"), quotes, fragments: targets, quoteFragments };
 }
 
 /** 模型输出里的引用指针（`[Qn]` 引语 / `[片段N]` 叙述段） */
@@ -407,35 +425,62 @@ export function stripOverlongModelQuotes(answer: string): string {
   );
 }
 
-/** 出处渲染：只到回目、不展示段号（spec §6.6）；无回号时退回来源标识 */
-export function formatQuoteSource(quote: {
-  chapter?: number;
-  title?: string;
-  source: string;
-}): string {
-  if (typeof quote.chapter === "number") {
-    return quote.title
-      ? `第${quote.chapter}回 ${quote.title}`
-      : `第${quote.chapter}回`;
-  }
-  return quote.source;
+/** 上标角标字符（feat-A006）：¹²³⁴⁵⁶⁷⁸⁹⁰，下标按出现顺序从 1 起 */
+const SUPERSCRIPT_DIGITS = "⁰¹²³⁴⁵⁶⁷⁸⁹";
+
+/** 全局上标角标：1 → ¹，10 → ¹⁰（>9 用多字符组合），与 citations 下标一一对应 */
+export function toSuperscript(index: number): string {
+  return String(index)
+    .split("")
+    .map((digit) => SUPERSCRIPT_DIGITS[Number(digit)])
+    .join("");
 }
 
-/** 服务端渲染引用与出处（spec §6.4 步骤 3）：`[Qn]` → 引语、`[片段N]` → 叙述段窗口，
- * 均渲染为 `「原文」（出处：第N回 回目）`；未注册的指针原样保留。 */
-export function renderAnswerWithQuotes(
+/** 解析答案里的指针：引语 `[Qn]`（连同所属片段编号）或叙述段 `[片段N]`；未注册返回 null */
+function resolvePointerRef(
+  ref: string,
+  view: InjectionView
+): { quote: RenderedQuote; fragmentKey: string } | null {
+  const quote = ref.startsWith("Q")
+    ? view.quotes.get(ref)
+    : view.fragments.get(ref);
+  if (!quote) {
+    return null;
+  }
+  const fragmentKey = ref.startsWith("Q")
+    ? view.quoteFragments.get(ref)
+    : ref;
+  return fragmentKey ? { quote, fragmentKey } : null;
+}
+
+/** 服务端渲染引用与出处（feat-A006）：`[Qn]` / `[片段N]` 指针 → 「引文」+ 全局上标角标，
+ * 不再内联出处；citations 按引用出现顺序、片段粒度合并（同片段多引语合并为一条，
+ * 角标数量 = 片段数量），只收被引用片段；未注册的指针原样保留。 */
+export function renderAnswerWithCitations(
   answer: string,
-  injected: Map<string, RenderedQuote>,
-  injectedFragments?: Map<string, RenderedQuote>
-): string {
-  return answer.replace(/\[(Q\d+|片段\d+)\]/g, (whole, ref: string) => {
-    const quote = ref.startsWith("Q")
-      ? injected.get(ref)
-      : injectedFragments?.get(ref);
-    return quote
-      ? `「${quote.text}」（出处：${formatQuoteSource(quote)}）`
-      : whole;
+  view: InjectionView
+): ChatData {
+  const citations: Citation[] = [];
+  const citedIndexes = new Map<string, number>();
+  const rendered = answer.replace(/\[(Q\d+|片段\d+)\]/g, (whole, ref: string) => {
+    const resolved = resolvePointerRef(ref, view);
+    if (!resolved) {
+      return whole;
+    }
+    let index = citedIndexes.get(resolved.fragmentKey);
+    if (index === undefined) {
+      index = citations.length + 1;
+      citedIndexes.set(resolved.fragmentKey, index);
+      const fragment = view.fragments.get(resolved.fragmentKey);
+      citations.push({
+        text: fragment?.text ?? resolved.quote.text,
+        chapter: fragment?.chapter ?? resolved.quote.chapter,
+        title: fragment?.title ?? resolved.quote.title,
+      });
+    }
+    return `「${resolved.quote.text}」${toSuperscript(index)}`;
   });
+  return { answer: rendered, citations };
 }
 
 /** query 锚点稀有度：命中最稀有 key 的 [key 长度, -段内出现次数, -首次位置]；无命中为 null。
@@ -516,26 +561,31 @@ export function pickBestFallbackFragment(
 }
 
 /**
- * 兜底输出（spec §6.4 步骤 4）：不做归纳生成，只输出最符合的一段 + 出处 + 一句结论。
- * 原文取整段纯原文（不裁剪；chunk 上限 400 字，天然防刷屏），出处由 chapter / title 字段渲染、只到回目。
- * 选段走 pickBestFallbackFragment（结论人物 + query 锚点稀有度），不再盲取 fragments[0]。
+ * 兜底输出（feat-A006 结构化）：不做归纳生成，answer 放结论句（带角标 ¹），
+ * citations 恰一条兜底片段（整段、不裁剪；chunk 上限 400 字，天然防刷屏，禁止多段拼刷）。
+ * 选段走 pickBestFallbackFragment（结论人物 + query 锚点稀有度），不再盲取 fragments[0]；
+ * 无原文可引用不得编造（citations 恒 []）。
  */
 export function buildFallback(
   fragments: RecallFragment[],
   conclusion: string,
   query = ""
-): string {
+): ChatData {
   const conclusionLine = conclusion.startsWith("按原文")
     ? conclusion
     : `按原文，${conclusion}`;
   if (fragments.length === 0) {
-    return conclusionLine;
+    return { answer: conclusionLine, citations: [] };
   }
   const top = pickBestFallbackFragment(fragments, query, conclusion);
-  return [
-    "【原文片段】",
-    `${top.text}\n（出处：${formatQuoteSource(top)}）`,
-    "",
-    conclusionLine,
-  ].join("\n");
+  return {
+    answer: `${conclusionLine}${toSuperscript(1)}`,
+    citations: [
+      {
+        text: top.text,
+        chapter: top.chapter,
+        title: top.title,
+      },
+    ],
+  };
 }
