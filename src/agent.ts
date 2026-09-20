@@ -8,6 +8,8 @@ import {
   type ToolCallResult,
 } from "./types.js";
 import type { MCPTransport } from "./transport.js";
+import { getTraceId } from "./trace.js";
+import { appendLlmCall, truncate } from "./storage/logs.js";
 import {
   NOVEL_NO_HIT_ANSWER,
   SANGO_NOVEL_SEARCH_TOOL,
@@ -27,6 +29,43 @@ import {
 } from "./citation.js";
 
 export type { ChatData } from "./citation.js";
+
+// feat-A007 埋点辅助（旁路静默）：序列化失败兜底 String，统一 8000 截断
+type LlmStage = "routing" | "generation";
+
+function summarizeJson(value: unknown, max = 8000): string {
+  let text: string;
+  try {
+    text = JSON.stringify(value);
+  } catch {
+    text = String(value);
+  }
+  return (truncate(text ?? "", max) ?? "").trim();
+}
+
+/** LLM 声明要调的工具（name + arguments，JSON 序列化）；无则为空串 '' */
+function summarizeToolCalls(toolCalls: unknown): string {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
+    return "";
+  }
+  const normalized = toolCalls.map((item: any) => {
+    const rawArgs = item?.function?.arguments;
+    let parsed: unknown = rawArgs;
+    if (typeof rawArgs === "string") {
+      try {
+        parsed = JSON.parse(rawArgs);
+      } catch {
+        parsed = rawArgs;
+      }
+    }
+    return { name: item?.function?.name ?? null, arguments: parsed ?? null };
+  });
+  return summarizeJson(normalized);
+}
+
+function toErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 // 统一路由提示词（feat-A003）：单 Agent 自主决定调不调工具、调哪个
 export const UNIFIED_SYSTEM_PROMPT = [
@@ -251,21 +290,52 @@ export class Agent {
 
   protected async callModel(
     messages: any[],
-    tools: MCPToolDefinition[]
+    tools: MCPToolDefinition[],
+    stage?: LlmStage
   ): Promise<ModelResponse> {
     if (!this.openai) {
       throw new Error("OpenAI-compatible client not initialized");
     }
 
+    // feat-A007 埋点：仅请求上下文（getTraceId 非空）且显式指定 stage 时记录，其余路径零开销
+    const traceId = getTraceId();
+    const logContext =
+      stage != null && typeof traceId === "string" && traceId !== ""
+        ? { traceId, stage }
+        : null;
+    const requestAt = Date.now();
+    const requestSummary = logContext ? summarizeJson(messages) : "";
+
     console.error('[callModel]', 'messages:', messages);
     console.time('callModel');
-    const response = await this.openai.chat.completions.create({
-      model: this.config.model,
-      messages,
-      tools: this.getOpenAITools(tools),
-      max_tokens: 1000,
-      temperature: 0.7,
-    });
+    let response: Awaited<ReturnType<typeof this.openai.chat.completions.create>>;
+    try {
+      response = await this.openai.chat.completions.create({
+        model: this.config.model,
+        messages,
+        tools: this.getOpenAITools(tools),
+        max_tokens: 1000,
+        temperature: 0.7,
+      });
+    } catch (error) {
+      if (logContext) {
+        try {
+          appendLlmCall(logContext.traceId, {
+            stage: logContext.stage,
+            model: this.config.model,
+            requestAt,
+            responseAt: null,
+            requestSummary,
+            responseSummary: null,
+            status: "failed",
+            errorMessage: toErrorMessage(error),
+          });
+        } catch {
+          // 旁路：埋点失败静默，绝不影响 LLM 编排
+        }
+      }
+      throw error;
+    }
     console.timeEnd('callModel');
 
     const message = response.choices[0]?.message;
@@ -289,6 +359,27 @@ export class Agent {
           name: toolName,
           input: toolArgs,
         });
+      }
+    }
+
+    if (logContext) {
+      try {
+        appendLlmCall(logContext.traceId, {
+          stage: logContext.stage,
+          model: this.config.model,
+          requestAt,
+          responseAt: Date.now(),
+          requestSummary,
+          responseSummary: summarizeJson(normalizedContent),
+          toolCalls: summarizeToolCalls(message?.tool_calls),
+          promptTokens: response.usage?.prompt_tokens ?? null,
+          completionTokens: response.usage?.completion_tokens ?? null,
+          finishReason: response.choices?.[0]?.finish_reason ?? null,
+          status: "success",
+          errorMessage: "",
+        });
+      } catch {
+        // 旁路：埋点失败静默，绝不影响 LLM 编排
       }
     }
 
@@ -333,12 +424,13 @@ export class Agent {
 
   private invokeModel(
     messages: any[],
-    tools: MCPToolDefinition[]
+    tools: MCPToolDefinition[],
+    stage?: LlmStage
   ): Promise<ModelResponse> {
     if (this.options.modelCaller) {
       return this.options.modelCaller(messages, tools);
     }
-    return this.callModel(messages, tools);
+    return this.callModel(messages, tools, stage);
   }
 
   /** 工具返回的纯文本片段（空文本不计入） */
@@ -409,7 +501,8 @@ export class Agent {
         { role: "system", content: CITATION_FALLBACK_CONCLUSION_PROMPT },
         { role: "user", content },
       ],
-      []
+      [],
+      "generation"
     );
     return response.content
       .filter((item) => item.type === "text")
@@ -562,7 +655,7 @@ export class Agent {
       messages.push({ role: "system", content: resolvedContent, });
     }
     let availableTools = this.options.tools ?? (await this.transport.listTools());
-    let currentResponse = await this.invokeModel(messages, availableTools); // 调LLM
+    let currentResponse = await this.invokeModel(messages, availableTools, "routing"); // 调LLM
 
     const MAX_TOOL_ROUNDS = 8
     let toolRounds = 0
@@ -623,7 +716,7 @@ export class Agent {
       }
       toolRounds++;
 
-      currentResponse = await this.invokeModel(messages, availableTools);
+      currentResponse = await this.invokeModel(messages, availableTools, "generation");
     }
 
     let answer = currentResponse.content
