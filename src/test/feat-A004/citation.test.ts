@@ -153,7 +153,7 @@ test("⑬ 注入视图只给纯原文 + 服务端编号：片段带 [片段N]、
   assert.equal(view.quotes.get("Q2")!.chapter, 73, "指针表保留出处字段供服务端渲染");
 });
 
-test("⑬.1 注入视图窗口裁掉引语时，其指针一并失效（不留下查不到的指针）", () => {
+test("⑬.1 整段注入：长段引语完整可见并可引用（不再按检索词窗口裁剪）", () => {
   const filler = "先叙无关内容。".repeat(40);
   const fragment = {
     text: `${filler}云长怒曰：“吾虎女安肯嫁犬子乎！”`,
@@ -162,11 +162,12 @@ test("⑬.1 注入视图窗口裁掉引语时，其指针一并失效（不留�
     quotes: [{ qid: "Q1", text: "吾虎女安肯嫁犬子乎！", offset: filler.length + 6 }],
   };
   const view = buildInjectionView([fragment], "云长怒曰");
+  assert.ok(view.text.includes(filler), "整段注入：前 5 段不再做窗口裁剪");
   assert.match(view.text, /⟨Q1⟩/, "命中词在引语旁，指针应可见");
   assert.equal(view.quotes.size, 1);
 });
 
-test("⑬.2 注入编号连续无空洞：窗口裁掉片段引语时并入首条引语保底，可见编号紧邻（bug-00009）", () => {
+test("⑬.2 注入编号连续无空洞：整段注入下跨片段编号紧邻（bug-00009 回归）", () => {
   const filler = "先叙无关内容。".repeat(30);
   const fragments = [
     // 片段1：引语完整可见（Q1）
@@ -177,7 +178,7 @@ test("⑬.2 注入编号连续无空洞：窗口裁掉片段引语时并入首�
       title: "发矫诏诸镇应曹公　破关兵三英战吕布",
       quotes: [{ qid: "Q1", text: "主公头上赤帻射目，可脱帻与某戴之。", offset: 5 }],
     },
-    // 片段2：引语在检索词窗口之前被裁掉 → 并入首条引语保底（Q2）
+    // 片段2：整段注入 → 引语完整可见（Q2）
     {
       text: `关公曰：“酒且斟下，某去便来。”出帐提刀，飞身上马。${filler}马到中军，云长提华雄之头，掷于地上。其酒尚温。`,
       source: "sanguo-yanyi",
@@ -198,13 +199,13 @@ test("⑬.2 注入编号连续无空洞：窗口裁掉片段引语时并入首�
   assert.deepEqual(
     [...view.quotes.keys()],
     ["Q1", "Q2", "Q3"],
-    "窗口裁掉引语后不得留下 Q1 后直接 Q3 的编号空洞"
+    "整段注入后可见编号连续，不得留下 Q1 后直接 Q3 的空洞"
   );
   assert.equal(view.quotes.get("Q2")!.text, "酒且斟下，某去便来。", "证据段引语被并回窗口保底");
   assert.match(view.text, /⟨Q2⟩“酒且斟下，某去便来。”/, "并入的引语带可见编号");
 });
 
-test("⑬.3 注入上限 10（bug-00009 张飞题）：证据段排 #5 仍注入，整段叙述（无引语）不走指针也可被归纳", () => {
+test("⑬.3 注入策略（2026-09-20 定稿）：前 5 段整段保底，证据段排 #5 仍注入，整段叙述（无引语）不走指针也可被归纳", () => {
   const filler = "无关内容。".repeat(30);
   const fragments = [
     { text: `宋宪告布曰：“买马被张飞劫走。”${filler}`, source: "sanguo-yanyi", chapter: 16, title: "吕奉先射戟辕门　曹孟德败师淯水", quotes: [] },
@@ -224,6 +225,60 @@ test("⑬.3 注入上限 10（bug-00009 张飞题）：证据段排 #5 仍注入
   assert.ok(view.text.includes("[片段5]"), "注入上限放宽到 10：第 5 段应注入");
   assert.ok(view.text.includes("范、张二贼，密入帐中"), "证据段叙述整体可见，模型可据此归纳");
   assert.equal(view.quotes.size, 0, "该题无引语可指针，兜底路径负责叙述窗口输出");
+});
+
+test("⑬.4 注入策略：tailFallback=true 时前 5 段整段保底 + 第 6+ 段预算内整段纳入", () => {
+  const make = (i: number) => ({
+    text: `第${i}段。`.repeat(10),
+    source: "sanguo-yanyi",
+    chapter: i,
+    title: `回目${i}`,
+    quotes: [],
+  });
+  const fragments = Array.from({ length: 8 }, (_, i) => make(i + 1));
+  const view = buildInjectionView(fragments, "问句", true);
+  assert.ok(view.text.includes(`[片段5]`), "前 5 段保底注入");
+  assert.ok(view.text.includes(`[片段6]`), "预算充足时第 6 段整段纳入兜底");
+  assert.ok(view.text.includes("第6段。".repeat(10)), "尾部段整段注入，不裁剪");
+  assert.equal(view.fragments.size, 8, "8 段均在预算内 → 全部注入");
+});
+
+test("⑬.5 注入策略：预算不足时丢整段，绝不裁半段", () => {
+  const make = (i: number, len: number) => ({
+    text: "甲".repeat(len),
+    source: "sanguo-yanyi",
+    chapter: i,
+    title: `回目${i}`,
+    quotes: [],
+  });
+  // 前 5 段每段 100 字；第 6 段极长（3000 字）远超总预算 2000
+  const fragments = [
+    ...Array.from({ length: 5 }, (_, i) => make(i + 1, 100)),
+    make(6, 3000),
+    make(7, 100),
+  ];
+  const view = buildInjectionView(fragments, "问句", true);
+  assert.ok(view.text.includes(`[片段5]`), "前 5 段保底仍注入");
+  assert.ok(!view.text.includes(`[片段6]`), "第 6 段超预算 → 整体丢弃");
+  assert.ok(!view.text.includes("甲".repeat(3000)), "超预算段不得以半段形式注入");
+  assert.ok(!view.text.includes(`[片段7]`), "预算被超则停止，不再看后续段");
+  assert.equal(view.fragments.size, 5);
+});
+
+test("⑬.6 开关关闭（tailFallback=false）：固定只注入前 5 段整段，不注入第 6+ 段", () => {
+  const make = (i: number) => ({
+    text: `第${i}段。`.repeat(10),
+    source: "sanguo-yanyi",
+    chapter: i,
+    title: `回目${i}`,
+    quotes: [],
+  });
+  const fragments = Array.from({ length: 8 }, (_, i) => make(i + 1));
+  const view = buildInjectionView(fragments, "问句", false);
+  assert.ok(view.text.includes(`[片段5]`), "关闭兜底时前 5 段仍整段注入");
+  assert.ok(!view.text.includes(`[片段6]`), "关闭兜底时第 6 段不注入");
+  assert.ok(!view.text.includes("第6段。".repeat(10)), "第 6 段内容不在注入视图内");
+  assert.equal(view.fragments.size, 5);
 });
 
 test("⑭ buildFallback 只输出最符合的一段：多段召回不长篇大论", () => {

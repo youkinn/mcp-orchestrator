@@ -427,7 +427,7 @@ test("⑤ 默认链路（本地别名表扫描 + 兜底结论）：校验不过�
   assert.match(answer, /按原文，斩华雄者系关羽/);
   assert.equal(callIndex, 3, "主问答 + 兜底结论共 3 次模型调用（无提取/NER）");
 });
-test("⑥ 快路径注入收窄：按上限 10 段注入、每段窗口截断，且注入不含回目 / 段号 / 分数", async () => {
+test("⑥ 快路径注入策略：前 5 段整段保底注入（不裁剪），且注入不含回目 / 段号 / 分数", async () => {
   let capturedUser = "";
   const filler = "先叙无关内容。".repeat(40);
   const key = "孙权遣人向关羽求亲，关羽怒曰“吾虎女安肯嫁犬子乎！”";
@@ -502,11 +502,12 @@ test("⑥ 快路径注入收窄：按上限 10 段注入、每段窗口截断，
   });
   await agent.processQuery("孙权遣人向关羽求亲，关羽是怎么回复使者的", "sango-novel");
   assert.ok(capturedUser.includes("求亲"), "注入应含最符合段的关键句");
+  assert.ok(capturedUser.includes(key), "关键段整段注入（不再窗口截断）");
   assert.ok(
-    !capturedUser.includes("章武元年无关内容。".repeat(40)),
-    "无锚点段按 120 字截断，不整段注入"
+    capturedUser.includes("章武元年无关内容。".repeat(40)),
+    "前 5 段整段保底：无关长段也完整注入"
   );
-  assert.ok(!capturedUser.includes("桃园结义无关内容。".repeat(40)), "每段应被窗口截断，不整段注入");
+  assert.ok(capturedUser.includes("桃园结义无关内容。".repeat(40)), "前 5 段整段注入，不做窗口裁剪");
   assert.ok(!capturedUser.includes("第73回"), "注入不带回目：模型无从抄写出处");
   assert.ok(!capturedUser.includes("· 段"), "注入不带段号");
   assert.match(capturedUser, /\[片段1\]/, "片段带服务端编号，模型据此定位");
