@@ -9,7 +9,6 @@ src/
 ├── types.ts       共享类型定义
 ├── transport.ts   MCP 协议层（connect / listTools / callTool / close）
 ├── agent.ts       LLM 编排（callModel / processQuery）
-├── sango.ts       本地工具（三国题库检索）
 ├── server.ts      Express HTTP 层（路由、校验、队列）
 ├── index.ts       Web 服务入口
 ├── cli.ts         CLI 入口
@@ -21,7 +20,7 @@ src/
 
 ## 分工
 
-- 小胡：`agent.ts`、`sango.ts`（LLM 调用、tool-use 循环、prompt 处理、本地工具）。
+- 小胡：`agent.ts`（LLM 调用、tool-use 循环、prompt 处理）。
 - 老陈：`transport.ts`、`server.ts`、`index.ts`、`cli.ts`、`types.ts`（MCP 连接、HTTP 层、生命周期）。
 
 ## 规范
