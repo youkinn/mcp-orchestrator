@@ -1,6 +1,6 @@
 import cors from 'cors';
 import express, { type Request, type Response } from 'express';
-import type { Agent } from './agent.js';
+import type { Agent, ChatData } from './agent.js';
 import type { MCPTransport } from './transport.js';
 import { ToolExecutionError, type ToolCallResult } from './types.js';
 
@@ -116,7 +116,7 @@ export function createServer(
   // 校验通过后入队执行；503 只由 ToolExecutionError 触发，其余异常一律 500
   async function enqueue(
     response: Response,
-    handle: () => string | Promise<string>
+    handle: () => ChatData | Promise<ChatData>
   ) {
     try {
       const result = requestQueue.then(() => handle());
@@ -124,7 +124,7 @@ export function createServer(
         () => undefined,
         () => undefined
       );
-      response.json({ code: 200, data: { answer: await result }, message: '' });
+      response.json({ code: 200, data: await result, message: '' });
     } catch (error) {
       console.error('Failed to process request:', error);
       const toolUnavailable = error instanceof ToolExecutionError;
@@ -149,7 +149,10 @@ export function createServer(
       return;
     }
 
-    await enqueue(response, () => agent.processQuery(parsed.value.message, parsed.value.domain));
+    await enqueue(
+      response,
+      () => agent.processQueryData(parsed.value.message, parsed.value.domain)
+    );
   });
 
   app.post('/api/sango/random', async (request: Request, response: Response) => {
@@ -163,13 +166,14 @@ export function createServer(
       return;
     }
 
-    // 确定性命令：薄转发 mcp-server fengyunsanguo_quiz_command（出题 / 判题 / 查答案状态机在 quiz 子进程），不经 LLM
+    // 确定性命令：薄转发 mcp-server fengyunsanguo_quiz_command（出题 / 判题 / 查答案状态机在 quiz 子进程），
+    // 不经 LLM；citations 恒 []（随机一题无原文引用，行为与现状零变化）
     await enqueue(response, async () => {
       const result = await transport.fengyunsanguo_quiz_command(
         parsed.value.message,
         parsed.value.sessionId
       );
-      return toolResultText(result);
+      return { answer: toolResultText(result), citations: [] };
     });
   });
 

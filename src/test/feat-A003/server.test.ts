@@ -100,6 +100,14 @@ class StubAgent {
     }
   }
 
+  /** feat-A006：HTTP data 统一形状（非原著域 citations 恒 []，与 processQuery 同源） */
+  async processQueryData(
+    query: string,
+    domain?: string
+  ): Promise<{ answer: string; citations: [] }> {
+    return { answer: await this.processQuery(query, domain), citations: [] };
+  }
+
   async listTools(): Promise<MCPToolDefinition[]> {
     this.listToolsCalls += 1;
     if (this.options.listToolsError) {
@@ -315,7 +323,7 @@ test('⑥ /api/chat 只传 message：统一 Agent 收到 trim 后的问题，返
   });
 
   assert.equal(res.status, 200);
-  assertEnvelope(res.body, 200, { answer: '纽约晴，24℃，适合出行' }, '');
+  assertEnvelope(res.body, 200, { answer: '纽约晴，24℃，适合出行', citations: [] }, '');
   assert.deepEqual(agent.queries, ['纽约今天适合坐地铁出门吗？']);
 });
 
@@ -535,25 +543,25 @@ test('⑨ /api/sango/random：出题 → 判对 → 判错 → 查答案 → 无
     sessionId,
   });
   assert.equal(ask.status, 200);
-  assertEnvelope(ask.body, 200, { answer: QUESTION_ANSWER }, '');
+  assertEnvelope(ask.body, 200, { answer: QUESTION_ANSWER, citations: [] }, '');
 
   const correct = await post(baseUrl, '/api/sango/random', {
     message: 'A',
     sessionId,
   });
-  assertEnvelope(correct.body, 200, { answer: '答对了！正确答案：元让（A）' }, '');
+  assertEnvelope(correct.body, 200, { answer: '答对了！正确答案：元让（A）', citations: [] }, '');
 
   const wrong = await post(baseUrl, '/api/sango/random', {
     message: '妙才',
     sessionId,
   });
-  assertEnvelope(wrong.body, 200, { answer: '答错了，正确答案：元让（A）' }, '');
+  assertEnvelope(wrong.body, 200, { answer: '答错了，正确答案：元让（A）', citations: [] }, '');
 
   const reveal = await post(baseUrl, '/api/sango/random', {
     message: '答案',
     sessionId,
   });
-  assertEnvelope(reveal.body, 200, { answer: '正确答案：元让（A）' }, '');
+  assertEnvelope(reveal.body, 200, { answer: '正确答案：元让（A）', citations: [] }, '');
 
   const withoutSession = await post(baseUrl, '/api/sango/random', {
     message: 'A',
@@ -561,7 +569,7 @@ test('⑨ /api/sango/random：出题 → 判对 → 判错 → 查答案 → 无
   assertEnvelope(
     withoutSession.body,
     200,
-    { answer: SANGO_NO_SESSION_PROMPT },
+    { answer: SANGO_NO_SESSION_PROMPT, citations: [] },
     ''
   );
 
@@ -585,7 +593,12 @@ test('⑨ sessionId 非字符串 / 空串 / 纯空白视为未传 → 无会话�
       sessionId,
     });
     assert.equal(res.status, 200, String(sessionId));
-    assertEnvelope(res.body, 200, { answer: SANGO_NO_SESSION_PROMPT }, '');
+    assertEnvelope(
+      res.body,
+      200,
+      { answer: SANGO_NO_SESSION_PROMPT, citations: [] },
+      ''
+    );
   }
 });
 
@@ -601,7 +614,7 @@ test('⑨ sessionId 归一化：出题带空白、作答用 trim 后的同一 id
     sessionId: 'sid-trim',
   });
 
-  assertEnvelope(judge.body, 200, { answer: '答对了！正确答案：元让（A）' }, '');
+  assertEnvelope(judge.body, 200, { answer: '答对了！正确答案：元让（A）', citations: [] }, '');
 });
 
 test('quiz 缺配 / 调用失败 → /api/sango/random 503（ToolExecutionError），/api/chat 其余功能正常', async (t) => {
@@ -622,7 +635,7 @@ test('quiz 缺配 / 调用失败 → /api/sango/random 503（ToolExecutionError�
 
   const chat = await post(baseUrl, '/api/chat', { message: '你好' });
   assert.equal(chat.status, 200);
-  assertEnvelope(chat.body, 200, { answer: '正常回复' }, '');
+  assertEnvelope(chat.body, 200, { answer: '正常回复', citations: [] }, '');
 });
 
 test('⑩ 所有接口均为 { code, data, message } 信封：成功 data 有值，失败 data 为 null', async (t) => {

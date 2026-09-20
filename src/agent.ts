@@ -13,18 +13,20 @@ import {
   SANGO_NOVEL_SEARCH_TOOL,
   buildFallback,
   buildInjectionView,
-  formatQuoteSource,
   loadAliasTable,
   pickBestFallbackFragment,
-  renderAnswerWithQuotes,
+  renderAnswerWithCitations,
   scanRecallPersonIds,
   stripOverlongModelQuotes,
   toRecallFragments,
   validateQuotePointers,
   verifyCitation,
+  type ChatData,
+  type InjectionView,
   type RecallFragment,
-  type RenderedQuote,
 } from "./citation.js";
+
+export type { ChatData } from "./citation.js";
 
 // 统一路由提示词（feat-A003）：单 Agent 自主决定调不调工具、调哪个
 export const UNIFIED_SYSTEM_PROMPT = [
@@ -102,9 +104,6 @@ const CITATION_FALLBACK_CONCLUSION_PROMPT =
 /** 路由目标（docs/sango-mcp-routing-design.md §二）：决定系统提示词、可见工具与是否走域内快路径 */
 export type RouteTarget = "weather" | "fengyunsanguo" | "sango-novel" | "auto";
 
-/** 最终路由决策：auto 表示继续走统一 Agent；irrelevant 表示无关问题，直接短路 */
-export type RouteDecision = RouteTarget | "irrelevant";
-
 /** L3 向量匹配注入点：只做风云三国高置信正向识别，命中返回 fengyunsanguo */
 export type FengyunsanguoVectorMatcher = (
   query: string
@@ -113,27 +112,6 @@ export type FengyunsanguoVectorMatcher = (
   | "fengyunsanguo"
   | null
   | Promise<boolean | "fengyunsanguo" | null>;
-
-/** L4 轻量路由注入点：前三层未命中时，由调用方提供四分类结果 */
-export type RouteClassifier = (
-  query: string
-) => RouteDecision | Promise<RouteDecision>;
-
-/** L4 轻量路由提示词（docs/sango-mcp-routing-design.md §二 第四层）：只输出数字编号 */
-export const ROUTE_CLASSIFIER_PROMPT = [
-  "你是路由助手，请判断用户问题属于哪个类别，只返回数字编号：",
-  "1: 天气查询",
-  "2: 风云三国游戏问答",
-  "3: 三国演义原著问答",
-  "4: 以上都不是 / 无关问题",
-  "",
-  "用户问题：{{用户问题}}",
-  "输出：",
-].join("\n");
-
-/** L4 判为无关问题时直接返回的引导话术，不调用任何 MCP 或 LLM 生成答案 */
-export const IRRELEVANT_ROUTE_RESPONSE =
-  "我是统一对话助手，目前可以帮你：美国天气播报、风云三国题库问答、《三国演义》原著检索。请直接问相关问题。";
 
 /** 本地题库工具名（index.ts 装配同名 localTool）：fengyunsanguo 域快路径预调它，不经模型决策 */
 export const FENGYUNSANGUO_QUERY_TOOL = "fengyunsanguo_query";
@@ -202,8 +180,6 @@ export interface AgentOptions {
   fallbackConcluder?: (fragments: RecallFragment[]) => Promise<string>;
   /** L3 向量匹配注入点；命中 fengyunsanguo 后走题库快路径 */
   fengyunsanguoVectorMatcher?: FengyunsanguoVectorMatcher;
-  /** L4 轻量路由注入点；不注入则保持统一 Agent 语义自主决策 */
-  routeClassifier?: RouteClassifier;
 }
 
 export class Agent {
@@ -425,7 +401,7 @@ export class Agent {
       ? pickBestFallbackFragment(fragments, query)
       : null;
     const fragmentText = top
-      ? `${buildInjectionView([top], query).text}\n（出处：${formatQuoteSource(top)}）`
+      ? buildInjectionView([top], query).text
       : "（无原文片段）";
     const content = `用户问题：${query}\n\n${fragmentText}`;
     const response = await this.invokeModel(
@@ -443,19 +419,19 @@ export class Agent {
   }
 
   /**
-   * feat-A004：引用硬校验（本地别名表扫描，0 次 LLM）+ 指针校验 + 服务端渲染引用与出处。
+   * feat-A004/A006：引用硬校验（本地别名表扫描，0 次 LLM）+ 指针校验 + 服务端渲染引文与 citations。
    * 模型只输出「结论 + 指针」（`[Qn]`）：指针合法（∈ 本次注入的 qid）且断言人物 ⊆ 召回人物 →
-   * 由字段渲染 `「原文」（出处：第N回 回目）`；指针非法 / 抄写超长引语 / 断言不成立 → 兜底。
+   * 由字段渲染「引文」+ 全局上标角标并组装 citations（按引用出现顺序、片段粒度合并）；
+   * 指针非法 / 抄写超长引语 / 断言不成立 → 兜底（结论句带角标 ¹ + 恰一条兜底片段）。
    */
   private async applyNovelCitationGuard(
     answer: string,
     fragments: RecallFragment[],
     query: string,
-    injectedQuotes: Map<string, RenderedQuote>,
-    injectedTargets?: Map<string, RenderedQuote>
-  ): Promise<string> {
-    if (fragments.length === 0) {
-      return NOVEL_NO_HIT_ANSWER;
+    view: InjectionView | null
+  ): Promise<ChatData> {
+    if (fragments.length === 0 || !view) {
+      return { answer: NOVEL_NO_HIT_ANSWER, citations: [] };
     }
     const aliasTable = this.getAliasTable();
     const recallText = fragments.map((fragment) => fragment.text).join("\n");
@@ -468,7 +444,7 @@ export class Agent {
       /\[片段\d+\]/.test(answer) ||
       /按原文，/.test(answer);
     if (!isNovelAnswer) {
-      return answer;
+      return { answer, citations: [] };
     }
     // H4 长引语安全网：模型输出里的超长「…」是违规抄写，直接丢弃；原文改由指针 + 字段渲染提供。
     // 断言扫描对象是丢弃违规抄写后的答案正文人名（抄写内容不参与断言）
@@ -476,49 +452,21 @@ export class Agent {
     const assertedIds = scanRecallPersonIds(cleaned, aliasTable);
     const pointer = validateQuotePointers(
       cleaned,
-      injectedQuotes,
-      injectedTargets
+      view.quotes,
+      view.fragments
     );
     const asserted = [...assertedIds].map((id) => ({ name: id, id }));
     const check = verifyCitation(asserted, recallText, recallPersonIds);
     if (pointer.ok && check.ok) {
-      return renderAnswerWithQuotes(cleaned, injectedQuotes, injectedTargets);
+      return renderAnswerWithCitations(cleaned, view);
     }
     const conclusion = await this.concludeFallback(fragments, query);
     return buildFallback(fragments, conclusion, query);
   }
 
-  /** L4 默认实现：四分类轻量模型，只解析数字编号；解析失败回退 auto */
-  private async classifyRouteViaModel(query: string): Promise<RouteDecision> {
-    const prompt = ROUTE_CLASSIFIER_PROMPT.replace("{{用户问题}}", query);
-    const response = await this.invokeModel(
-      [{ role: "user", content: prompt }],
-      []
-    );
-    const text = response.content
-      .filter((item) => item.type === "text")
-      .map((item) => item.text ?? "")
-      .join("\n")
-      .trim();
-    const digit = text.match(/[1-4]/)?.[0];
-    if (digit === "1") {
-      return "weather";
-    }
-    if (digit === "2") {
-      return "fengyunsanguo";
-    }
-    if (digit === "3") {
-      return "sango-novel";
-    }
-    if (digit === "4") {
-      return "irrelevant";
-    }
-    return "auto";
-  }
-
   /**
    * 路由判定（零 LLM）：L1 前端标签 → L2 本地关键词硬匹配。
-   * 返回 "auto" 表示前两层未命中，交统一 Agent 按语义自主决策（即 L3 向量 / L4 大模型兜底的现有承载）。
+   * 返回 "auto" 表示前两层未命中，交统一 Agent 按语义自主决策（L3 题库高置信识别由调用方注入）。
    */
   resolveRoute(query: string, domain?: string): RouteTarget {
     if (domain && DOMAIN_ROUTES[domain]) {
@@ -539,7 +487,7 @@ export class Agent {
     return "auto";
   }
 
-  private async resolveUserContent(query: string, domain?: string): Promise<{ result: string, novelFragments?: RecallFragment[], novelQuotes?: Map<string, RenderedQuote>, novelTargets?: Map<string, RenderedQuote> }> {
+  private async resolveUserContent(query: string, domain?: string): Promise<{ result: string, novelFragments?: RecallFragment[], novelView?: InjectionView }> {
     if (domain && DOMAIN_ROUTES[domain]) {
       const novelFragments: RecallFragment[] = [];
       if (domain === DOMAIN_ROUTES["sango-novel"]) {
@@ -560,8 +508,7 @@ export class Agent {
         return {
           result: injected,
           novelFragments,
-          novelQuotes: view.quotes,
-          novelTargets: view.fragments,
+          novelView: view,
         };
       } else if (domain === DOMAIN_ROUTES["fengyunsanguo"]) {
         const result = await this.searchFengyunsanguoQuestions(query);
@@ -574,36 +521,36 @@ export class Agent {
   }
 
   /**
-   * 处理用户提问并回答
-   * 先做四层路由判定（L1 标签 → L2 关键词 → L3 向量 → L4 轻量分类），
-   * 命中 fengyunsanguo / sango-novel 走域内快路径；L4 判为无关问题直接返回引导话术；
-   * 未注入 L3 / L4 时 auto 保持统一 Agent 语义自主决策。
+   * 处理用户提问并回答（feat-A006 结构化）：同样走三层路由判定与域内快路径
+   * （L1 标签 → L2 关键词 → L3 题库高置信识别，L3 仅 auto 时生效），
+   * 返回 /api/chat 响应 data 统一形状 { answer, citations }（无引用恒 []）。
    */
-  async processQuery(query: string, domain?: string): Promise<string> {
+  async processQueryData(query: string, domain?: string): Promise<ChatData> {
     let novelFragments: RecallFragment[] = [];
-    let novelQuotes = new Map<string, RenderedQuote>();
-    let novelTargets = new Map<string, RenderedQuote>();
+    let novelView: InjectionView | null = null;
     let novelSearched = false;
     const userContent = query.trim();
     let resolvedContent = '';
 
-    // L1 / L2 已命中专用域，直接走域内快路径（不经 L3 / L4）
+    // L1 / L2 已命中专用域，直接走域内快路径（不经 L3）
     let route = this.resolveRoute(query, domain);
     if (Object.values(DOMAIN_ROUTES).includes(route)) {
       const result = await this.resolveUserContent(query, domain || route);
       resolvedContent = result.result;
       novelFragments = result.novelFragments || [];
-      novelQuotes = result.novelQuotes || novelQuotes;
-      novelTargets = result.novelTargets || novelTargets;
+      novelView = result.novelView || null;
       novelSearched = result.novelFragments !== undefined;
     }
 
-    // L3 向量匹配注入点：只做风云三国高置信正向识别，命中 fengyunsanguo 后走题库快路径
-    const fengyunsanguoHit = await this.options.fengyunsanguoVectorMatcher?.(query);
-    if (fengyunsanguoHit === true || fengyunsanguoHit === "fengyunsanguo") {
-      route = DOMAIN_ROUTES.fengyunsanguo
-      const { result } = await this.resolveUserContent(query, route);
-      resolvedContent = result;
+    // L3 向量匹配注入点：只做风云三国高置信正向识别，命中 fengyunsanguo 后走题库快路径；
+    // 仅 auto（L1/L2 未锁定域）时生效——domain 硬锁（weather/fengyunsanguo/sango-novel）不得被 L3 覆盖
+    if (route === "auto") {
+      const fengyunsanguoHit = await this.options.fengyunsanguoVectorMatcher?.(query);
+      if (fengyunsanguoHit === true || fengyunsanguoHit === "fengyunsanguo") {
+        route = DOMAIN_ROUTES.fengyunsanguo;
+        const { result } = await this.resolveUserContent(query, route);
+        resolvedContent = result;
+      }
     }
 
     const systemContent = resolvedContent ? ROUTE_HINTS[route] : this.systemPrompt;
@@ -641,8 +588,7 @@ export class Agent {
           novelSearched = true;
           novelFragments.push(...this.collectRecallFragments(result, toolArgs));
           const view = buildInjectionView(novelFragments, query);
-          novelQuotes = view.quotes;
-          novelTargets = view.fragments;
+          novelView = view;
           toolContent = view.text;
         }
         const assistantMessage: any = {
@@ -686,17 +632,20 @@ export class Agent {
       .join("\n")
       .trim();
 
-    // 调过原著检索即进校验：无命中（片段为空）由 guard 统一回「演义中未涉及」
+    // 调过原著检索即进校验：无命中（片段为空）由 guard 统一回「演义中未涉及」+ citations []
     if (novelSearched) {
-      answer = await this.applyNovelCitationGuard(
+      return await this.applyNovelCitationGuard(
         answer,
         novelFragments,
         query,
-        novelQuotes,
-        novelTargets
+        novelView
       );
     }
+    return { answer, citations: [] };
+  }
 
-    return answer;
+  /** 兼容旧调用：只返回结论正文（citations 由 processQueryData 承载） */
+  async processQuery(query: string, domain?: string): Promise<string> {
+    return (await this.processQueryData(query, domain)).answer;
   }
 }
