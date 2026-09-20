@@ -579,12 +579,9 @@ test("⑦ 注入上限放宽到 10 + 叙述段指针（bug-00009 张飞题）：
     modelCaller,
   });
   const data = await agent.processQueryData("张飞怎么死的");
-  assert.ok(
-    data.answer.startsWith("张飞被范疆、张达刺死。「范、张二贼，探知消息"),
-    "叙述句指针 [片段5] 应渲染证据段原文"
-  );
-  assert.ok(data.answer.endsWith("」¹"), "叙述段指针带角标 ¹");
-  assert.match(data.answer, /密入帐中/, "渲染原文含杀张飞过程");
+  assert.ok(data.answer.startsWith("张飞被范疆、张达刺死。"), "叙述句指针渲染后保留结论");
+  assert.ok(data.answer.endsWith("¹"), "叙述段指针只渲染角标 ¹，不内联原文");
+  assert.doesNotMatch(data.answer, /密入帐中/, "answer 不内联片段原文（原文进 citations 卡片）");
   assert.equal(data.citations.length, 1, "只收被引用片段：仅 [片段5] 所在片段");
   assert.equal(data.citations[0].chapter, 81);
   assert.equal(data.citations[0].title, "急兄仇张飞遇害　雪弟恨先主兴兵");

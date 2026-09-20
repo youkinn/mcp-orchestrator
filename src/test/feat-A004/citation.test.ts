@@ -449,7 +449,7 @@ test("⑯.1 上标角标：¹²³⁴⁵⁶⁷⁸⁹⁰ 字符集，>9 用多字�
   assert.equal(toSuperscript(100), "¹⁰⁰");
 });
 
-test("⑯.2 叙述段指针：`[片段N]` → 该片段原文 + 角标，citations 收录该片段（bug-00009 张飞题）", () => {
+test("⑯.2 叙述段指针：`[片段N]` → 仅角标（不内联原文），citations 收录该片段（bug-00009 张飞题）", () => {
   const view: InjectionView = {
     text: "",
     quotes: new Map(),
@@ -468,8 +468,9 @@ test("⑯.2 叙述段指针：`[片段N]` → 该片段原文 + 角标，citatio
   const out = renderAnswerWithCitations("张飞被范疆、张达刺死。[片段5]", view);
   assert.equal(
     out.answer,
-    "张飞被范疆、张达刺死。「范、张二贼，密入帐中，以短刀刺入飞腹。飞大叫一声而亡。」¹"
+    "张飞被范疆、张达刺死。¹"
   );
+  assert.doesNotMatch(out.answer, /密入帐中/, "叙述段指针不内联片段原文");
   assert.deepEqual(out.citations, [
     {
       text: "范、张二贼，密入帐中，以短刀刺入飞腹。飞大叫一声而亡。",
@@ -611,7 +612,7 @@ test("⑯.5 只收被引用片段：注入 3 段只引 2 段 → citations 恰 2
     quoteFragments: new Map([["Q1", "片段1"]]),
   };
   const out = renderAnswerWithCitations("引用[Q1]，再引[片段3]。", view);
-  assert.equal(out.answer, "引用「引语甲」¹，再引「片段丙原文」²。");
+  assert.equal(out.answer, "引用「引语甲」¹，再引²。");
   assert.equal(out.citations.length, 2, "未被引用的片段2 不得收录");
   assert.deepEqual(
     out.citations.map((item) => item.text),

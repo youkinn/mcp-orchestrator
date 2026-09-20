@@ -453,7 +453,8 @@ function resolvePointerRef(
   return fragmentKey ? { quote, fragmentKey } : null;
 }
 
-/** 服务端渲染引用与出处（feat-A006）：`[Qn]` / `[片段N]` 指针 → 「引文」+ 全局上标角标，
+/** 服务端渲染引用与出处（feat-A006）：`[Qn]` 引语指针 → 「引文」+ 全局上标角标，
+ * `[片段N]` 叙述段指针 → 仅全局上标角标（不内联原文，answer 只放结论，原文进 citations 卡片）；
  * 不再内联出处；citations 按引用出现顺序、片段粒度合并（同片段多引语合并为一条，
  * 角标数量 = 片段数量），只收被引用片段；未注册的指针原样保留。 */
 export function renderAnswerWithCitations(
@@ -478,7 +479,10 @@ export function renderAnswerWithCitations(
         title: fragment?.title ?? resolved.quote.title,
       });
     }
-    return `「${resolved.quote.text}」${toSuperscript(index)}`;
+    if (ref.startsWith("Q")) {
+      return `「${resolved.quote.text}」${toSuperscript(index)}`;
+    }
+    return toSuperscript(index);
   });
   return { answer: rendered, citations };
 }
