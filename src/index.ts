@@ -56,7 +56,11 @@ async function main() {
     systemPrompt: UNIFIED_SYSTEM_PROMPT,
     tools: mcpTools,
     // L3：无 domain 且 L2 未命中时，先调 fengyunsanguo server 做题库高置信识别（可选 server，缺配/失败不命中）
-    sangoVectorMatcher: (query) => transport.fengyunsanguo_quiz_route(query),
+    fengyunsanguoVectorMatcher: async (query) => {
+      const hit = await transport.fengyunsanguo_quiz_route(query);
+      // transport 联合类型沿用旧域值 "sango"，命中即映射为当前题库域 fengyunsanguo
+      return hit === "sango" ? "fengyunsanguo" : hit;
+    },
   });
 
   const app = createServer(agent, transport, { port, allowedOrigin });

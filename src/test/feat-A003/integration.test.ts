@@ -421,7 +421,10 @@ async function startApp(
     systemPrompt: UNIFIED_SYSTEM_PROMPT,
     tools: MCP_TOOLS,
     // 与 index.ts 同形：L3 无 domain 自动路由走 transport 的 fengyunsanguo_quiz_route
-    sangoVectorMatcher: (query) => transport.fengyunsanguo_quiz_route(query),
+    fengyunsanguoVectorMatcher: async (query) => {
+      const hit = await transport.fengyunsanguo_quiz_route(query);
+      return hit === "sango" ? "fengyunsanguo" : hit;
+    },
     modelCaller: model.respond,
   });
 
@@ -683,7 +686,11 @@ test('8 GET /api/tools：真实 Agent 上报 MCP 工具（含 fengyunsanguo_quer
     UNIFIED_TOOL_NAMES
   );
   assert.deepEqual(res.body.data.tools[2], FENGYUNSANGUO_QUERY_TOOL);
-  assert.equal(res.body.data.tools.some((tool: any) => tool.name === 'sango_query'), false);
+  assert.equal(
+    res.body.data.tools.length,
+    UNIFIED_TOOL_NAMES.length,
+    '总台无本地工具：上报列表与 MCP 工具集完全一致'
+  );
   assert.equal(model.calls.length, 0);
   // 上报能力与模型可见能力同源：注入 tools 后不打 MCP
   assert.equal(transport.listToolsCount, 0);

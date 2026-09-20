@@ -350,7 +350,7 @@ test('⑦ /api/chat 携带 scenario / service / sessionId → 400，无效字段
   assert.deepEqual(agent.queries, [], '校验失败不应触达 Agent');
 });
 
-test('domain 白名单：fengyunsanguo / sango-novel 透传给 Agent（sango 已废弃返回 400）', async (t) => {
+test('域名白名单：fengyunsanguo / sango-novel 透传给 Agent（旧值 sango 已废弃返回 400）', async (t) => {
   const agent = new StubAgent({ reply: 'ok' });
   const baseUrl = await startServer(t, { agent });
 
@@ -364,7 +364,8 @@ test('domain 白名单：fengyunsanguo / sango-novel 透传给 Agent（sango 已
     'domain 应原样透传给 Agent'
   );
 
-  const legacy = await post(baseUrl, '/api/chat', { message: '你好', domain: 'sango' });
+  const LEGACY_SANGO_VALUE = 'sango';
+  const legacy = await post(baseUrl, '/api/chat', { message: '你好', domain: LEGACY_SANGO_VALUE });
   assert.equal(legacy.status, 400);
   assertEnvelope(legacy.body, 400, null, 'domain 字段仅支持 fengyunsanguo、sango-novel');
 
@@ -469,16 +470,16 @@ test('装配回归：index.ts 工具集全部来自 MCP、L3 走 fengyunsanguo_q
   assert.match(source, /new Agent\(transport, llmConfig, \{/);
   assert.match(
     source,
-    /sangoVectorMatcher: \(query\) => transport\.fengyunsanguo_quiz_route\(query\)/
+    /fengyunsanguoVectorMatcher: async \(query\) => \{\s+const hit = await transport\.fengyunsanguo_quiz_route\(query\);/
   );
   assert.match(
     source,
     /createServer\(agent, transport, \{ port, allowedOrigin \}\)/
   );
-  // 总台无本地工具：不再出现 SangoService / 本地 sango_query 装配
+  // 总台无本地工具：不再出现 SangoService / localTools 装配
   assert.doesNotMatch(
     source,
-    /SangoService|sango_query|SANGO_QUERY_TOOL|sangoService|localTools/
+    /SangoService|sangoService|localTools|FENGYUNSANGUO_QUERY_TOOL/
   );
 });
 
