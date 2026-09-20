@@ -598,7 +598,8 @@ test('4/6 非美国天气：不调用任何工具，明确告知仅支持美国�
   assert.deepEqual(res.body.data, { answer, citations: [] });
   assert.deepEqual(
     transport.callToolCalls.map((call) => call.name),
-    ['fengyunsanguo_quiz_route']
+    [],
+    'L2 关键词已锁定 weather，L3 题库识别不再调用（路由分层：L3 仅 auto 生效）'
   );
   assert.equal(model.calls.length, 1);
 });

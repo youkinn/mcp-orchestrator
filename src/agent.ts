@@ -104,9 +104,6 @@ const CITATION_FALLBACK_CONCLUSION_PROMPT =
 /** 路由目标（docs/sango-mcp-routing-design.md §二）：决定系统提示词、可见工具与是否走域内快路径 */
 export type RouteTarget = "weather" | "fengyunsanguo" | "sango-novel" | "auto";
 
-/** 最终路由决策：auto 表示继续走统一 Agent；irrelevant 表示无关问题，直接短路 */
-export type RouteDecision = RouteTarget | "irrelevant";
-
 /** L3 向量匹配注入点：只做风云三国高置信正向识别，命中返回 fengyunsanguo */
 export type FengyunsanguoVectorMatcher = (
   query: string
@@ -115,27 +112,6 @@ export type FengyunsanguoVectorMatcher = (
   | "fengyunsanguo"
   | null
   | Promise<boolean | "fengyunsanguo" | null>;
-
-/** L4 轻量路由注入点：前三层未命中时，由调用方提供四分类结果 */
-export type RouteClassifier = (
-  query: string
-) => RouteDecision | Promise<RouteDecision>;
-
-/** L4 轻量路由提示词（docs/sango-mcp-routing-design.md §二 第四层）：只输出数字编号 */
-export const ROUTE_CLASSIFIER_PROMPT = [
-  "你是路由助手，请判断用户问题属于哪个类别，只返回数字编号：",
-  "1: 天气查询",
-  "2: 风云三国游戏问答",
-  "3: 三国演义原著问答",
-  "4: 以上都不是 / 无关问题",
-  "",
-  "用户问题：{{用户问题}}",
-  "输出：",
-].join("\n");
-
-/** L4 判为无关问题时直接返回的引导话术，不调用任何 MCP 或 LLM 生成答案 */
-export const IRRELEVANT_ROUTE_RESPONSE =
-  "我是统一对话助手，目前可以帮你：美国天气播报、风云三国题库问答、《三国演义》原著检索。请直接问相关问题。";
 
 /** 本地题库工具名（index.ts 装配同名 localTool）：fengyunsanguo 域快路径预调它，不经模型决策 */
 export const FENGYUNSANGUO_QUERY_TOOL = "fengyunsanguo_query";
@@ -204,8 +180,6 @@ export interface AgentOptions {
   fallbackConcluder?: (fragments: RecallFragment[]) => Promise<string>;
   /** L3 向量匹配注入点；命中 fengyunsanguo 后走题库快路径 */
   fengyunsanguoVectorMatcher?: FengyunsanguoVectorMatcher;
-  /** L4 轻量路由注入点；不注入则保持统一 Agent 语义自主决策 */
-  routeClassifier?: RouteClassifier;
 }
 
 export class Agent {
@@ -490,37 +464,9 @@ export class Agent {
     return buildFallback(fragments, conclusion, query);
   }
 
-  /** L4 默认实现：四分类轻量模型，只解析数字编号；解析失败回退 auto */
-  private async classifyRouteViaModel(query: string): Promise<RouteDecision> {
-    const prompt = ROUTE_CLASSIFIER_PROMPT.replace("{{用户问题}}", query);
-    const response = await this.invokeModel(
-      [{ role: "user", content: prompt }],
-      []
-    );
-    const text = response.content
-      .filter((item) => item.type === "text")
-      .map((item) => item.text ?? "")
-      .join("\n")
-      .trim();
-    const digit = text.match(/[1-4]/)?.[0];
-    if (digit === "1") {
-      return "weather";
-    }
-    if (digit === "2") {
-      return "fengyunsanguo";
-    }
-    if (digit === "3") {
-      return "sango-novel";
-    }
-    if (digit === "4") {
-      return "irrelevant";
-    }
-    return "auto";
-  }
-
   /**
    * 路由判定（零 LLM）：L1 前端标签 → L2 本地关键词硬匹配。
-   * 返回 "auto" 表示前两层未命中，交统一 Agent 按语义自主决策（即 L3 向量 / L4 大模型兜底的现有承载）。
+   * 返回 "auto" 表示前两层未命中，交统一 Agent 按语义自主决策（L3 题库高置信识别由调用方注入）。
    */
   resolveRoute(query: string, domain?: string): RouteTarget {
     if (domain && DOMAIN_ROUTES[domain]) {
@@ -575,7 +521,8 @@ export class Agent {
   }
 
   /**
-   * 处理用户提问并回答（feat-A006 结构化）：同样走四层路由判定与域内快路径，
+   * 处理用户提问并回答（feat-A006 结构化）：同样走三层路由判定与域内快路径
+   * （L1 标签 → L2 关键词 → L3 题库高置信识别，L3 仅 auto 时生效），
    * 返回 /api/chat 响应 data 统一形状 { answer, citations }（无引用恒 []）。
    */
   async processQueryData(query: string, domain?: string): Promise<ChatData> {
@@ -585,7 +532,7 @@ export class Agent {
     const userContent = query.trim();
     let resolvedContent = '';
 
-    // L1 / L2 已命中专用域，直接走域内快路径（不经 L3 / L4）
+    // L1 / L2 已命中专用域，直接走域内快路径（不经 L3）
     let route = this.resolveRoute(query, domain);
     if (Object.values(DOMAIN_ROUTES).includes(route)) {
       const result = await this.resolveUserContent(query, domain || route);
@@ -595,12 +542,15 @@ export class Agent {
       novelSearched = result.novelFragments !== undefined;
     }
 
-    // L3 向量匹配注入点：只做风云三国高置信正向识别，命中 fengyunsanguo 后走题库快路径
-    const fengyunsanguoHit = await this.options.fengyunsanguoVectorMatcher?.(query);
-    if (fengyunsanguoHit === true || fengyunsanguoHit === "fengyunsanguo") {
-      route = DOMAIN_ROUTES.fengyunsanguo
-      const { result } = await this.resolveUserContent(query, route);
-      resolvedContent = result;
+    // L3 向量匹配注入点：只做风云三国高置信正向识别，命中 fengyunsanguo 后走题库快路径；
+    // 仅 auto（L1/L2 未锁定域）时生效——domain 硬锁（weather/fengyunsanguo/sango-novel）不得被 L3 覆盖
+    if (route === "auto") {
+      const fengyunsanguoHit = await this.options.fengyunsanguoVectorMatcher?.(query);
+      if (fengyunsanguoHit === true || fengyunsanguoHit === "fengyunsanguo") {
+        route = DOMAIN_ROUTES.fengyunsanguo;
+        const { result } = await this.resolveUserContent(query, route);
+        resolvedContent = result;
+      }
     }
 
     const systemContent = resolvedContent ? ROUTE_HINTS[route] : this.systemPrompt;
