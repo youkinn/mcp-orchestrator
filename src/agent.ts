@@ -146,7 +146,7 @@ const DOMAIN_ROUTES: Record<string, RouteTarget> = {
 };
 
 // L2 本地关键词硬匹配（文档 §二 第二层）：命中任意专属关键词即路由到对应域
-const SANGO_KEYWORDS = ["风云三国", "MOD", "骑砍", "招募", "答题", "好感度"];
+const FENGYUNSANGUO_KEYWORDS = ["风云三国", "MOD", "骑砍", "招募", "答题", "好感度"];
 const NOVEL_KEYWORDS = [
   "官职",
   "生卒年",
@@ -527,7 +527,7 @@ export class Agent {
     const lowered = query.toLowerCase();
     const hit = (keywords: string[]) =>
       keywords.some((keyword) => lowered.includes(keyword.toLowerCase()));
-    if (hit(SANGO_KEYWORDS)) {
+    if (hit(FENGYUNSANGUO_KEYWORDS)) {
       return "fengyunsanguo";
     }
     if (hit(NOVEL_KEYWORDS)) {
