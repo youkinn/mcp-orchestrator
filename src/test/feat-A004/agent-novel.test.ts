@@ -88,7 +88,7 @@ const RECALL_TEXT = JSON.stringify([
     segFrom: 4,
     segTo: 4,
     quoteBalanced: true,
-    quotes: [{ qid: "Q1", text: RECALL_QUOTE, offset: 7, speaker: "众" }],
+    quotes: [{ offset: 7, len: RECALL_QUOTE.length }],
   },
 ]);
 
@@ -303,7 +303,7 @@ test("②.4 注入编号连续（bug-00009）：窗口裁掉证据段引语时�
       chapter: 5,
       title: RECALL_TITLE,
       type: "narration",
-      quotes: [{ qid: "Q1", text: "主公头上赤帻射目，可脱帻与某戴之。" }],
+      quotes: [{ offset: 5, len: 17 }],
     },
     {
       id: "sanguo-yanyi:0005:c0015",
@@ -311,7 +311,7 @@ test("②.4 注入编号连续（bug-00009）：窗口裁掉证据段引语时�
       chapter: 5,
       title: RECALL_TITLE,
       type: "narration",
-      quotes: [{ qid: "Q1", text: "酒且斟下，某去便来。" }],
+      quotes: [{ offset: 5, len: 10 }],
     },
     {
       id: "sanguo-yanyi:0005:c0014",
@@ -319,7 +319,7 @@ test("②.4 注入编号连续（bug-00009）：窗口裁掉证据段引语时�
       chapter: 5,
       title: RECALL_TITLE,
       type: "narration",
-      quotes: [{ qid: "Q1", text: "吾有上将潘凤，可斩华雄。" }],
+      quotes: [{ offset: 7, len: 12 }],
     },
   ];
   let modelCallCount = 0;

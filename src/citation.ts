@@ -80,14 +80,13 @@ export interface PersonMention {
   id?: string;
 }
 
-/** spec §5 语料 schema v2：一条引语（qid 只在 chunk 内唯一，注入期由服务端重编号为全局序号） */
+/** spec §5 语料 schema（bug-00010 出参瘦身）：一条引语只给定位，不再重复携带文本 /
+ * qid / speaker——引语原文由编排侧按切片还原，出参体积随之减半。 */
 export interface RecallQuote {
-  qid: string;
-  /** 引语纯原文内容（不含成对引号） */
-  text: string;
-  /** 引语内容在 chunk.text 中的起始下标（成对引号位于 offset-1 与 offset+text.length） */
+  /** 开引号在该条目 text 中的 1 基下标 */
   offset: number;
-  speaker?: string;
+  /** 引语本体字数（不含两侧引号） */
+  len: number;
 }
 
 /** spec §5 检索工具出参条目（C4 定稿：裸数组，字段逐字为 id/text/chapter/title/type/segFrom/segTo/quoteBalanced/quotes） */
@@ -111,7 +110,7 @@ export interface RecallFragment {
   source: string;
   chapter?: number;
   title?: string;
-  /** 该片段携带的引语（qid 为 chunk 内序号，渲染前由 buildInjectionView 重编号） */
+  /** 该片段携带的引语（只有定位；渲染前由 buildInjectionView 还原文本并重编号） */
   quotes?: RecallQuote[];
 }
 
@@ -290,8 +289,8 @@ export function toRecallFragments(
             ? entry.title.trim()
             : undefined,
         quotes: Array.isArray(entry.quotes)
-          ? entry.quotes.filter(
-              (quote) => quote && typeof quote.text === "string" && quote.text
+          ? entry.quotes.filter((quote) =>
+              isValidQuoteRange(quote, entry.text.length)
             )
           : undefined,
       });
@@ -300,35 +299,58 @@ export function toRecallFragments(
   return fragments;
 }
 
-/** 在窗口文本内标出引语：`⟨Qn⟩` 插在开引号前，qid 从 start 起按可见引语连续编号。
- * 只认完整可见的 `“……“XXX”……”` 引语——被窗口切半的引语模型本就看不清，不允许引用。
- * 先裁窗口再编号 ⇒ 可见编号天然连续，不会出现「Q1 后直接 Q3」的空洞引模型误用。 */
+/** 引语定位合法性：offset / len 为整数、len 为正、开引号在正文内、且整条引语（含两侧
+ * 引号）不越出正文。非法只跳过该条引语，绝不让整组 quotes 静默变空（bug-00009 同类回归：
+ * quotes 全空 ⇒ 注入视图无 ⟨Qn⟩ ⇒ 指针校验失败 ⇒ 全量走兜底、引用丢失）。 */
+function isValidQuoteRange(quote: RecallQuote, textLength: number): boolean {
+  return (
+    !!quote &&
+    Number.isInteger(quote.offset) &&
+    Number.isInteger(quote.len) &&
+    quote.len > 0 &&
+    quote.offset >= 1 &&
+    quote.offset - 1 + quote.len + 2 <= textLength
+  );
+}
+
+/** 按 offset / len 还原引语本体（不含两侧引号）：offset 是开引号的 1 基下标，
+ * 故本体起点为 0 基的 offset（开引号下标 offset-1 再 +1）。 */
+function sliceQuoteText(text: string, quote: RecallQuote): string {
+  return text.slice(quote.offset, quote.offset + quote.len);
+}
+
+/** 在正文内标出引语：`⟨Qn⟩` 插在开引号前，qid 从 start 起按出参 quotes 顺序连续编号。
+ *
+ * **前置条件：text 必须与 quote.offset 同基准。** offset 是整段 fragment.text 的 1 基下标，
+ * 故当前调用方恒传整段 fragment.text；本函数不做窗口裁剪、不做偏移换算。若将来恢复窗口裁剪
+ * 而把裁剪后的窗口文本传进来，落在窗口内的 offset 仍会通过校验却语义错位，静默标错 ⟨Qn⟩
+ * （bug-00009 同类：标记与文本不对位 ⇒ 指针指向错误引语）。要支持窗口必须先把 offset 换算到
+ * 窗口基准，或直接传整段文本。
+ *
+ * 定位直接取 offset（1 基 → 0 基减一），不再 indexOf 搜索——同一 chunk 内引语文本重复时
+ * 也能各就各位（全量语料 7 处）。越界引语（含两侧引号超出 text 范围 / 数据非法）跳过，
+ * 不标错位置；跳过只影响该条，编号仍连续无空洞。 */
 function markQuotesInWindow(
   text: string,
   fragment: RecallFragment,
   start: number
 ): { marked: string; assigned: Array<{ qid: string; quote: RecallQuote }>; next: number } {
-  const located: Array<{ at: number; quote: RecallQuote }> = [];
+  const located: Array<{ at: number; qid: string; quote: RecallQuote }> = [];
   for (const quote of fragment.quotes ?? []) {
-    if (!quote || !quote.text) {
+    if (!isValidQuoteRange(quote, text.length)) {
       continue;
     }
-    const at = text.indexOf(`“${quote.text}”`);
-    if (at >= 0) {
-      located.push({ at, quote });
-    }
+    located.push({
+      at: quote.offset - 1,
+      qid: `Q${start + located.length}`,
+      quote,
+    });
   }
-  located.sort((a, b) => a.at - b.at);
-  const assigned = located.map((item, index) => ({
-    qid: `Q${start + index}`,
-    quote: item.quote,
-  }));
+  const assigned = located.map(({ qid, quote }) => ({ qid, quote }));
   let marked = text;
-  for (let index = assigned.length - 1; index >= 0; index--) {
-    marked =
-      marked.slice(0, located[index].at) +
-      `⟨${assigned[index].qid}⟩` +
-      marked.slice(located[index].at);
+  // 从后往前插入，前面的下标才不被撑位移（编号顺序不受插入顺序影响）
+  for (const { at, qid } of [...located].sort((a, b) => b.at - a.at)) {
+    marked = marked.slice(0, at) + `⟨${qid}⟩` + marked.slice(at);
   }
   return { marked, assigned, next: start + assigned.length };
 }
@@ -379,7 +401,7 @@ export function buildInjectionView(
     next = after;
     for (const { qid, quote } of assigned) {
       quotes.set(qid, {
-        text: quote.text,
+        text: sliceQuoteText(fragment.text, quote),
         chapter: fragment.chapter,
         title: fragment.title,
       });

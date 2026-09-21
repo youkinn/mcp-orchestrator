@@ -144,8 +144,8 @@ test("⑬ 注入视图只给纯原文 + 服务端编号：片段带 [片段N]、
     chapter: 73,
     title: "玄德进位汉中王　云长攻拔襄阳郡",
     quotes: [
-      { qid: "Q1", text: "特来求结两家之好，请君侯思之。", offset: 4 },
-      { qid: "Q2", text: "吾虎女安肯嫁犬子乎！", offset: 29 },
+      { offset: 4, len: 15 },
+      { offset: 29, len: 10 },
     ],
   };
   const view = buildInjectionView([fragment]);
@@ -156,6 +156,11 @@ test("⑬ 注入视图只给纯原文 + 服务端编号：片段带 [片段N]、
   assert.doesNotMatch(view.text, /·\s*段\d/, "注入不带段号");
   assert.doesNotMatch(view.text, /分数|score/i, "注入不带分数");
   assert.equal(view.quotes.size, 2, "指针表应含两条可见引语");
+  assert.equal(
+    view.quotes.get("Q1")!.text,
+    "特来求结两家之好，请君侯思之。",
+    "引语文本由 offset/len 切片还原"
+  );
   assert.equal(view.fragments.size, 1, "叙述段指针表应含该片段窗口");
   assert.equal(view.quotes.get("Q2")!.chapter, 73, "指针表保留出处字段供服务端渲染");
   assert.equal(view.quoteFragments.get("Q1"), "片段1", "Q1 归属片段1");
@@ -168,7 +173,7 @@ test("⑬.1 整段注入：长段引语完整可见并可引用（不再按检�
     text: `${filler}云长怒曰：“吾虎女安肯嫁犬子乎！”`,
     source: "sanguo-yanyi",
     chapter: 73,
-    quotes: [{ qid: "Q1", text: "吾虎女安肯嫁犬子乎！", offset: filler.length + 6 }],
+    quotes: [{ offset: filler.length + 6, len: 10 }],
   };
   const view = buildInjectionView([fragment], "云长怒曰");
   assert.ok(view.text.includes(filler), "整段注入：前 5 段不再做窗口裁剪");
@@ -185,7 +190,7 @@ test("⑬.2 注入编号连续无空洞：整段注入下跨片段编号紧邻�
       source: "sanguo-yanyi",
       chapter: 5,
       title: "发矫诏诸镇应曹公　破关兵三英战吕布",
-      quotes: [{ qid: "Q1", text: "主公头上赤帻射目，可脱帻与某戴之。", offset: 5 }],
+      quotes: [{ offset: 5, len: 17 }],
     },
     // 片段2：整段注入 → 引语完整可见（Q2）
     {
@@ -193,7 +198,7 @@ test("⑬.2 注入编号连续无空洞：整段注入下跨片段编号紧邻�
       source: "sanguo-yanyi",
       chapter: 5,
       title: "发矫诏诸镇应曹公　破关兵三英战吕布",
-      quotes: [{ qid: "Q1", text: "酒且斟下，某去便来。", offset: 5 }],
+      quotes: [{ offset: 5, len: 10 }],
     },
     // 片段3：引语完整可见（Q3），验证跨片段编号连续
     {
@@ -201,7 +206,7 @@ test("⑬.2 注入编号连续无空洞：整段注入下跨片段编号紧邻�
       source: "sanguo-yanyi",
       chapter: 5,
       title: "发矫诏诸镇应曹公　破关兵三英战吕布",
-      quotes: [{ qid: "Q1", text: "吾有上将潘凤，可斩华雄。", offset: 7 }],
+      quotes: [{ offset: 7, len: 12 }],
     },
   ];
   const view = buildInjectionView(fragments, "华雄是怎么死的");
@@ -659,8 +664,8 @@ test("⑱ 出参解析：裸数组条目逐条走字段，正文只留纯原文�
       segTo: 5,
       quoteBalanced: true,
       quotes: [
-        { qid: "Q1", text: "特来求结两家之好，请君侯思之。", offset: 4, speaker: "瑾" },
-        { qid: "Q2", text: "吾虎女安肯嫁犬子乎！", offset: 29, speaker: "云长" },
+        { offset: 4, len: 15 },
+        { offset: 29, len: 10 },
       ],
     },
     {
@@ -700,4 +705,110 @@ test("⑱.1 出参解析：非裸数组（旧拼接文本 / 包裹对象 / 非�
     "包裹对象不存在，只有裸数组"
   );
   assert.deepEqual(toRecallFragments(["{ 不是 JSON"], "sanguo-yanyi"), []);
+});
+
+test("⑲ 出参瘦身（bug-00010）：quotes[] 只给 {offset,len}，引语文本按切片还原且与原文逐字一致", () => {
+  const text =
+    "瑾曰：“特来求结两家之好，请君侯思之。”云长勃然大怒曰：“吾虎女安肯嫁犬子乎！”";
+  const entries = JSON.stringify([
+    {
+      id: "sanguo-yanyi:0073:c0007",
+      text,
+      chapter: 73,
+      title: "玄德进位汉中王　云长攻拔襄阳郡",
+      type: "narration",
+      quotes: [
+        { offset: 4, len: 15 },
+        { offset: 29, len: 10 },
+      ],
+    },
+  ]);
+  const [entry] = toRecallFragments([entries], "sanguo-yanyi");
+  assert.equal(entry.quotes?.length, 2, "合法定位全部保留，不得静默丢 quotes");
+  const view = buildInjectionView([entry]);
+  assert.deepEqual([...view.quotes.keys()], ["Q1", "Q2"]);
+  entry.quotes!.forEach((quote, index) => {
+    const restored = view.quotes.get(`Q${index + 1}`)!.text;
+    assert.equal(
+      text.slice(quote.offset - 1, quote.offset - 1 + quote.len + 2),
+      `“${restored}”`,
+      `Q${index + 1}：切片（含两侧引号）与原文逐字一致`
+    );
+  });
+  assert.equal(view.quotes.get("Q1")!.text, "特来求结两家之好，请君侯思之。");
+  assert.equal(view.quotes.get("Q2")!.text, "吾虎女安肯嫁犬子乎！");
+});
+
+test("⑲.1 同 chunk 内引语文本重复：按 offset 各就各位（修正 indexOf 一律指向首处的既有缺陷）", () => {
+  const text = "布曰：“某愿往。”布又曰：“某愿往。”";
+  const view = buildInjectionView([
+    {
+      text,
+      source: "sanguo-yanyi",
+      chapter: 3,
+      title: "议温明董卓叱丁原　馈金珠李肃说吕布",
+      quotes: [
+        { offset: 4, len: 4 },
+        { offset: 14, len: 4 },
+      ],
+    },
+  ]);
+  assert.equal(
+    view.text,
+    "[片段1] 布曰：⟨Q1⟩“某愿往。”布又曰：⟨Q2⟩“某愿往。”",
+    "两条同名引语各标各的位置，不挤在同一处"
+  );
+  assert.equal(view.quotes.get("Q1")!.text, "某愿往。");
+  assert.equal(view.quotes.get("Q2")!.text, "某愿往。");
+  assert.deepEqual(
+    [view.quoteFragments.get("Q1"), view.quoteFragments.get("Q2")],
+    ["片段1", "片段1"],
+    "同片段两条引语各占一个指针"
+  );
+});
+
+test("⑲.2 非法 / 越界 offset、len：只跳过该条，不崩、不插错标记，编号仍连续（不得静默丢整组）", () => {
+  const text =
+    "瑾曰：“特来求结两家之好，请君侯思之。”云长勃然大怒曰：“吾虎女安肯嫁犬子乎！”";
+  const entries = JSON.stringify([
+    {
+      id: "sanguo-yanyi:0073:c0007",
+      text,
+      chapter: 73,
+      title: "玄德进位汉中王　云长攻拔襄阳郡",
+      quotes: [
+        { offset: 4, len: 15 },
+        { offset: 0, len: 15 },
+        { offset: 4, len: 0 },
+        { offset: 4, len: 99 },
+        { offset: 4.5, len: 3 },
+        { offset: 4, len: "15" },
+        { offset: 29, len: 10 },
+      ],
+    },
+  ]);
+  const [entry] = toRecallFragments([entries], "sanguo-yanyi");
+  assert.equal(entry.quotes?.length, 2, "只跳过非法定位，合法引语照常保留");
+  const view = buildInjectionView([entry]);
+  assert.deepEqual([...view.quotes.keys()], ["Q1", "Q2"], "编号从 1 起连续、无空洞");
+  assert.equal(
+    view.text,
+    "[片段1] 瑾曰：⟨Q1⟩“特来求结两家之好，请君侯思之。”云长勃然大怒曰：⟨Q2⟩“吾虎女安肯嫁犬子乎！”",
+    "非法定位不插标记，合法引语的标记落在开引号前"
+  );
+  const direct = buildInjectionView([
+    {
+      text: "甲曰：“乙。”",
+      source: "sanguo-yanyi",
+      quotes: [
+        { offset: 99, len: 2 },
+        { offset: 4, len: 2 },
+      ],
+    },
+  ]);
+  assert.equal(
+    direct.text,
+    "[片段1] 甲曰：⟨Q1⟩“乙。”",
+    "越界定位跳过，合法定位照常编号"
+  );
 });
