@@ -4,6 +4,7 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { Agent, UNIFIED_SYSTEM_PROMPT } from '../../agent.js';
 import { createServer } from '../../server.js';
+import { createLogStore } from '../../storage/logs.js';
 import { MCPTransport } from '../../transport.js';
 import type {
   LLMConfig,
@@ -408,6 +409,14 @@ async function startApp(
   t: TestContext,
   options: HarnessOptions = {}
 ): Promise<Harness> {
+  const logStore = createLogStore({ dbPath: ':memory:' });
+  t.after(() => {
+    try {
+      logStore.close();
+    } catch {
+      // 故障注入用 store 的 close 也可能抛错，测试收尾不因此失败
+    }
+  });
   const sim = new FengyunsanguoSim(options.questions ?? QUESTIONS);
   const transport = new MockTransport(sim, {
     failTools: options.failTools,
@@ -425,7 +434,7 @@ async function startApp(
     modelCaller: model.respond,
   });
 
-  const app = createServer(agent, transport, { port: 0, allowedOrigin: '*' });
+  const app = createServer(agent, transport, { port: 0, allowedOrigin: '*', logStore });
   const server = app.listen(0);
   await once(server, 'listening');
   const address = server.address() as AddressInfo;

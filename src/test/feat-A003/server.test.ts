@@ -6,6 +6,7 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import type { Agent } from '../../agent.js';
 import { createServer } from '../../server.js';
+import { createLogStore } from '../../storage/logs.js';
 import type { MCPTransport } from '../../transport.js';
 import {
   ToolExecutionError,
@@ -263,11 +264,20 @@ async function startServer(
   t: TestContext,
   options: StartOptions = {}
 ): Promise<string> {
+  const logStore = createLogStore({ dbPath: ':memory:' });
+  t.after(() => {
+    try {
+      logStore.close();
+    } catch {
+      // 故障注入用 store 的 close 也可能抛错，测试收尾不因此失败
+    }
+  });
   const agent = options.agent ?? new StubAgent();
   const quiz = (options.quiz ?? new QuizSimTransport()) as unknown as MCPTransport;
   const app = createServer(asAgent(agent), quiz, {
     port: 0,
     allowedOrigin: '*',
+    logStore,
   });
 
   const server = app.listen(0);
