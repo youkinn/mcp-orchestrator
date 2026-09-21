@@ -61,7 +61,9 @@ export function createSangoApi(transport: MCPTransport): Router {
           sendError(response, 404, message);
           return;
         }
-        sendError(response, 500, message || INTERNAL_ERROR_MESSAGE);
+        // 500 message 固定（接口文档 §2.3 冻结口径），器坊原始文本只进日志排查、不进响应
+        console.error(`${SANGO_NOVEL_CHAPTER_TOOL} 返回未识别工具错误：`, message);
+        sendError(response, 500, INTERNAL_ERROR_MESSAGE);
         return;
       }
 
@@ -79,3 +81,4 @@ export function createSangoApi(transport: MCPTransport): Router {
 
   return router;
 }
+

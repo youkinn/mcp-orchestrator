@@ -133,6 +133,17 @@ test('⑤ 其余处理失败：器坊返回内容解析失败 → 500 message �
   assertEnvelope(res.body, 500, null, INTERNAL_500);
 });
 
+test('⑤b 未识别工具错误：器坊 isError 且 message 非「不存在」→ 500 且 message 固定（不透传器坊原文）', async (t) => {
+  const baseUrl = await startServer(
+    t,
+    new ChapterTransport({ kind: 'isError', text: '语料索引未就绪' }) as unknown as MCPTransport
+  );
+
+  const res = await get(baseUrl, '/api/v1/sango/chapters/73');
+  assert.equal(res.status, 500);
+  assertEnvelope(res.body, 500, null, INTERNAL_500);
+});
+
 test('⑥ 边界回号：1 与 120 均合法（不 400）', async (t) => {
   const baseUrl = await startServer(t, new ChapterTransport({ kind: 'ok' }) as unknown as MCPTransport);
 
