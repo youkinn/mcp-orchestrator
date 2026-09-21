@@ -358,31 +358,31 @@ test('⑦ /api/chat 携带 scenario / service / sessionId → 400，无效字段
   assert.deepEqual(agent.queries, [], '校验失败不应触达 Agent');
 });
 
-test('域名白名单：fengyunsanguo / sango-novel 透传给 Agent（旧值 sango 已废弃返回 400）', async (t) => {
+test('域名白名单：fengyunsanguo / sango-novel / weather 透传给 Agent（旧值 sango 已废弃返回 400）', async (t) => {
   const agent = new StubAgent({ reply: 'ok' });
   const baseUrl = await startServer(t, { agent });
 
-  for (const domain of ['fengyunsanguo', 'sango-novel']) {
+  for (const domain of ['fengyunsanguo', 'sango-novel', 'weather']) {
     const res = await post(baseUrl, '/api/chat', { message: '你好', domain });
     assert.equal(res.status, 200, domain);
   }
   assert.deepEqual(
     agent.domains,
-    ['fengyunsanguo', 'sango-novel'],
+    ['fengyunsanguo', 'sango-novel', 'weather'],
     'domain 应原样透传给 Agent'
   );
 
   const LEGACY_SANGO_VALUE = 'sango';
   const legacy = await post(baseUrl, '/api/chat', { message: '你好', domain: LEGACY_SANGO_VALUE });
   assert.equal(legacy.status, 400);
-  assertEnvelope(legacy.body, 400, null, 'domain 字段仅支持 fengyunsanguo、sango-novel');
+  assertEnvelope(legacy.body, 400, null, 'domain 字段仅支持 fengyunsanguo、sango-novel、weather');
 
   const bad = await post(baseUrl, '/api/chat', {
     message: '你好',
-    domain: 'weather',
+    domain: 'banana',
   });
   assert.equal(bad.status, 400);
-  assertEnvelope(bad.body, 400, null, 'domain 字段仅支持 fengyunsanguo、sango-novel');
+  assertEnvelope(bad.body, 400, null, 'domain 字段仅支持 fengyunsanguo、sango-novel、weather');
 });
 
 test('⑦ /api/sango/random 白名单为 message、sessionId，其余键 400', async (t) => {
