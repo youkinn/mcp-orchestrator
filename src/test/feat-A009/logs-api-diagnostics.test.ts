@@ -63,9 +63,9 @@ const SAMPLE_DIAGNOSTICS = {
   env: { vectorScheme: 'bge-m3', degradedBm25Only: false, corpusChunks: 2344, aliasCount: 87, vectorDim: 1024 },
   funnel: { corpusChunks: 2344, lexicalHits: 42, vectorTop50: 50, labelHits: 3, mergedCandidates: 45, topN: 10, injected: 5, cited: 3 },
   candidates: [
-    { rank: 1, chunkId: 'sango-yanyi:0073:c0007', chapter: 73, title: '玄德进位汉中王', bm25: 12.34, cosine: 0.812, labelHit: true, finalScore: 0.92, sources: ['lexical', 'vector'], injected: true, cited: true },
+    { rank: 1, chunkId: 'sango-yanyi:0073:c0007', chapter: 73, title: '玄德进位汉中王', bm25: 12.34, bm25Norm: 0.92, cosine: 0.812, labelHit: true, finalScore: 0.92, sources: ['lexical', 'vector'], injected: true, cited: true },
   ],
-  nextRank: { rank: 11, chunkId: 'sanguo-yanyi:0074:c0012', chapter: 74, title: '庞令明抬榇决死战', bm25: 3.1, cosine: 0.451, labelHit: false, finalScore: 0.51, sources: ['vector'], injected: false, cited: false, gapToTopN: 0.19 },
+  nextRank: { rank: 11, chunkId: 'sanguo-yanyi:0074:c0012', chapter: 74, title: '庞令明抬榇决死战', bm25: 3.1, bm25Norm: 0.25, cosine: 0.451, labelHit: false, finalScore: 0.51, sources: ['vector'], injected: false, cited: false, gapToTopN: 0.19 },
   deathIntent: { detected: false, pinned: false, chunkIds: [] },
 };
 
@@ -100,6 +100,15 @@ test('① 有诊断行：明细 toolCalls[].diagnostics 为解析后完整对象
   assert.equal(tool.toolName, 'sango_novel_search');
   assert.deepEqual(tool.diagnostics, SAMPLE_DIAGNOSTICS, '返回解析后的对象，非字符串');
   assert.equal(tool.resultSummary, '[{"id":"sanguo-yanyi:0073:c0007"}]', 'resultSummary 仍为原样字符串');
+  // bug-00013：候选含 bm25Norm，finalScore 可由接口字段逐条复算
+  const cands = (tool.diagnostics as { candidates?: Array<Record<string, number | boolean | null>> }).candidates ?? [];
+  assert.ok(cands.length > 0, '明细含候选');
+  for (const c of cands) {
+    assert.ok('bm25Norm' in c, 'rank' + c.rank + ' 含 bm25Norm 字段');
+    const recomputed =
+      Math.round((0.3 * ((c.bm25Norm as number | null) ?? 0) + 0.6 * (((c.cosine as number | null) ?? -1) + 1) / 2 + 0.1 * (c.labelHit ? 1 : 0)) * 1000) / 1000;
+    assert.equal(recomputed, c.finalScore, 'rank' + c.rank + ' 复算恒等式成立（bug-00013）');
+  }
 });
 
 test('② 无诊断行：明细 toolCalls[].diagnostics=null（非检索工具 / 旁路丢失，验收 13）', async (t) => {
