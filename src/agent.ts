@@ -15,6 +15,7 @@ import {
   SANGO_NOVEL_SEARCH_TOOL,
   buildFallback,
   buildInjectionView,
+  extractCitePointers,
   loadAliasTable,
   pickBestFallbackFragment,
   renderAnswerWithCitations,
@@ -27,6 +28,14 @@ import {
   type InjectionView,
   type RecallFragment,
 } from "./citation.js";
+import {
+  computePickedIndices,
+  extractEntryChunkIds,
+  extractRetrievalMeta,
+  fillDiagnostics,
+  persistRetrievalDiagnostics,
+  type RetrievalPersister,
+} from "./recallDiagnostics.js";
 
 export type { ChatData } from "./citation.js";
 
@@ -202,6 +211,23 @@ export type LocalToolHandler = (
   args: Record<string, unknown>
 ) => ToolCallResult | Promise<ToolCallResult>;
 
+/** feat-A009：检索工具调用路径（fastpath=域内快路径确定性注入；tooluse=LLM 自主 tool-use） */
+type RetrievalKind = "fastpath" | "tooluse";
+
+/** feat-A009：一次带诊断的检索调用登记（seq=tool_call_logs 行号；diagnostics 保留给收尾回填） */
+interface RetrievalCallRecord {
+  seq: number | null;
+  diagnostics: Record<string, unknown> | null;
+  kind: RetrievalKind;
+}
+
+/** feat-A009：本次请求的小说召回编排追踪——片段 ↔ chunkId 对齐 + 检索调用登记（收尾回填用） */
+interface NovelTracking {
+  fragments: RecallFragment[];
+  chunkMeta: Array<{ chunkId: string | null; kind: RetrievalKind }>;
+  calls: RetrievalCallRecord[];
+}
+
 export type ModelCaller = (
   messages: any[],
   tools: MCPToolDefinition[]
@@ -219,6 +245,8 @@ export interface AgentOptions {
   fallbackConcluder?: (fragments: RecallFragment[]) => Promise<string>;
   /** L3 向量匹配注入点；命中 fengyunsanguo 后走题库快路径 */
   fengyunsanguoVectorMatcher?: FengyunsanguoVectorMatcher;
+  /** feat-A009 诊断落库注入点（测试用）；不注入使用默认实现（appendRetrievalLog，旁路静默） */
+  retrievalDiagnosticsPersister?: RetrievalPersister;
 }
 
 export class Agent {
@@ -445,21 +473,40 @@ export class Agent {
       .map((item) => item.text!.trim());
   }
 
-  /** feat-A004：sango_novel_search 返回文本 → 召回原文片段（无文本视为无命中） */
-  private collectRecallFragments(
+  /** feat-A004/A009：sango_novel_search 返回文本 → 召回原文片段 + 逐条 chunkId。
+   * 片段与 chunkId 同一遍历 / 跳过规则（extractEntryChunkIds 对齐 toRecallFragments），
+   * 供收尾把「片段 → 候选」映射回诊断（服务端内部已知，不做文本比对）。 */
+  private collectRecallFragmentsWithChunkIds(
     result: ToolCallResult,
     args: Record<string, unknown>
-  ): RecallFragment[] {
+  ): { fragments: RecallFragment[]; chunkIds: Array<string | null> } {
     const texts = this.collectTexts(result);
-    if (texts.length === 0) {
-      return [];
-    }
     const source =
       typeof args.source === "string" && args.source.trim()
         ? args.source
         : "《三国演义》";
     // 工具按相关度降序返回结构化条目（spec §5）；出处 / 段号 / 分数走字段，正文只留纯原文
-    return toRecallFragments(texts, source);
+    return {
+      fragments: toRecallFragments(texts, source),
+      chunkIds: extractEntryChunkIds(result),
+    };
+  }
+
+  /** feat-A009：登记一次带诊断的检索调用（无诊断不登记；诊断对象保留给收尾回填后落库） */
+  private recordRetrievalCall(
+    tracking: NovelTracking,
+    result: ToolCallResult,
+    kind: RetrievalKind
+  ): void {
+    const meta = extractRetrievalMeta(result);
+    if (!meta.diagnostics) {
+      return;
+    }
+    tracking.calls.push({
+      seq: meta.seq,
+      diagnostics: meta.diagnostics,
+      kind,
+    });
   }
 
   private getAliasTable(): Map<string, string> {
@@ -516,15 +563,21 @@ export class Agent {
    * 模型只输出「结论 + 指针」（`[Qn]`）：指针合法（∈ 本次注入的 qid）且断言人物 ⊆ 召回人物 →
    * 由字段渲染「引文」+ 全局上标角标并组装 citations（按引用出现顺序、片段粒度合并）；
    * 指针非法 / 抄写超长引语 / 断言不成立 → 兜底（结论句带角标 ¹ + 恰一条兜底片段）。
+   * feat-A009：同步计算被引用片段 → 候选 chunkId 集合（服务端内部映射，不做文本比对），
+   * 供收尾回填 candidates[].cited / funnel.cited。
    */
   private async applyNovelCitationGuard(
     answer: string,
     fragments: RecallFragment[],
     query: string,
-    view: InjectionView | null
-  ): Promise<ChatData> {
+    view: InjectionView | null,
+    chunkMeta: NovelTracking["chunkMeta"] | null = null
+  ): Promise<{ data: ChatData; citedChunkIds: Set<string> }> {
     if (fragments.length === 0 || !view) {
-      return { answer: NOVEL_NO_HIT_ANSWER, citations: [] };
+      return {
+        data: { answer: NOVEL_NO_HIT_ANSWER, citations: [] },
+        citedChunkIds: new Set(),
+      };
     }
     const aliasTable = this.getAliasTable();
     const recallText = fragments.map((fragment) => fragment.text).join("\n");
@@ -537,7 +590,7 @@ export class Agent {
       /\[片段\d+\]/.test(answer) ||
       /按原文，/.test(answer);
     if (!isNovelAnswer) {
-      return { answer, citations: [] };
+      return { data: { answer, citations: [] }, citedChunkIds: new Set() };
     }
     // H4 长引语安全网：模型输出里的超长「…」是违规抄写，直接丢弃；原文改由指针 + 字段渲染提供。
     // 断言扫描对象是丢弃违规抄写后的答案正文人名（抄写内容不参与断言）
@@ -551,10 +604,75 @@ export class Agent {
     const asserted = [...assertedIds].map((id) => ({ name: id, id }));
     const check = verifyCitation(asserted, recallText, recallPersonIds);
     if (pointer.ok && check.ok) {
-      return renderAnswerWithCitations(cleaned, view);
+      return {
+        data: renderAnswerWithCitations(cleaned, view),
+        citedChunkIds: this.computeCitedChunkIds(
+          cleaned,
+          view,
+          fragments,
+          chunkMeta
+        ),
+      };
     }
     const conclusion = await this.concludeFallback(fragments, query);
-    return buildFallback(fragments, conclusion, query);
+    return {
+      data: buildFallback(fragments, conclusion, query),
+      citedChunkIds: this.computeFallbackCitedChunkIds(
+        fragments,
+        query,
+        conclusion,
+        chunkMeta
+      ),
+    };
+  }
+
+  /** feat-A009：指针合法路径的 cited——按注入视图编号表反查候选 chunkId（§9-7 不做逐条文本比对） */
+  private computeCitedChunkIds(
+    answer: string,
+    view: InjectionView,
+    fragments: RecallFragment[],
+    chunkMeta: NovelTracking["chunkMeta"] | null
+  ): Set<string> {
+    const cited = new Set<string>();
+    if (!chunkMeta) {
+      return cited;
+    }
+    const pickedIndices = computePickedIndices(fragments);
+    for (const ref of extractCitePointers(answer)) {
+      const fragmentKey = ref.startsWith("Q")
+        ? view.quoteFragments.get(ref)
+        : ref;
+      const match = fragmentKey && /^片段(\d+)$/.exec(fragmentKey);
+      if (!match) {
+        continue;
+      }
+      const index = pickedIndices[Number(match[1]) - 1];
+      const chunkId = index !== undefined ? chunkMeta[index]?.chunkId : null;
+      if (chunkId) {
+        cited.add(chunkId);
+      }
+    }
+    return cited;
+  }
+
+  /** feat-A009：兜底路径 cited（§3.2 兜底口径）——兜底片段若来自某候选则计入，未经过注入视图故不计入 injected */
+  private computeFallbackCitedChunkIds(
+    fragments: RecallFragment[],
+    query: string,
+    conclusion: string,
+    chunkMeta: NovelTracking["chunkMeta"] | null
+  ): Set<string> {
+    const cited = new Set<string>();
+    if (!chunkMeta || fragments.length === 0) {
+      return cited;
+    }
+    const top = pickBestFallbackFragment(fragments, query, conclusion);
+    const index = fragments.indexOf(top);
+    const chunkId = index >= 0 ? chunkMeta[index]?.chunkId : null;
+    if (chunkId) {
+      cited.add(chunkId);
+    }
+    return cited;
   }
 
   /**
@@ -580,19 +698,44 @@ export class Agent {
     return "auto";
   }
 
-  private async resolveUserContent(query: string, domain?: string): Promise<{ result: string, novelFragments?: RecallFragment[], novelView?: InjectionView }> {
+  private async resolveUserContent(
+    query: string,
+    domain?: string,
+    tracking?: NovelTracking
+  ): Promise<{
+    result: string;
+    novelView?: InjectionView;
+    novelSearched?: boolean;
+  }> {
     if (domain && DOMAIN_ROUTES[domain]) {
-      const novelFragments: RecallFragment[] = [];
       if (domain === DOMAIN_ROUTES["sango-novel"]) {
         const result = await this.searchNovel(query);
-        const fragments = this.collectRecallFragments(result, {
+        const { fragments, chunkIds } = this.collectRecallFragmentsWithChunkIds(result, {
           source: "sanguo-yanyi",
           query,
           limit: 10,
         });
-        novelFragments.push(
-          ...fragments.filter((fragment) => !fragment.text.includes("未召回"))
-        );
+        // 过滤与片段同序对齐（"未召回" 兜底条目不进注入视图，也不参与回填）
+        const kept: RecallFragment[] = [];
+        const keptChunkIds: Array<string | null> = [];
+        for (let i = 0; i < fragments.length; i++) {
+          if (fragments[i].text.includes("未召回")) {
+            continue;
+          }
+          kept.push(fragments[i]);
+          keptChunkIds.push(chunkIds[i] ?? null);
+        }
+        const novelFragments = tracking ? tracking.fragments : kept;
+        if (tracking) {
+          tracking.fragments.push(...kept);
+          tracking.chunkMeta.push(
+            ...keptChunkIds.map((chunkId) => ({
+              chunkId,
+              kind: "fastpath" as const,
+            }))
+          );
+          this.recordRetrievalCall(tracking, result, "fastpath");
+        }
 
         // 注入策略（2026-09-20 定稿）：前 5 段整段保底 + 第 6–10 段预算兜底（INJECT_TAIL_FALLBACK_ENABLED=false 时只注入前 5 段）；
         // 超预算丢整段、不段内裁剪；注入视图只给纯原文 + 服务端编号（`[片段N]` / `⟨Qn⟩`），不带回目、段号、分数（spec §6.3）
@@ -600,8 +743,8 @@ export class Agent {
         const injected = novelFragments.length ? view.text : "（检索无命中）";
         return {
           result: injected,
-          novelFragments,
           novelView: view,
+          novelSearched: true,
         };
       } else if (domain === DOMAIN_ROUTES["fengyunsanguo"]) {
         const result = await this.searchFengyunsanguoQuestions(query);
@@ -619,7 +762,12 @@ export class Agent {
    * 返回 /api/chat 响应 data 统一形状 { answer, citations }（无引用恒 []）。
    */
   async processQueryData(query: string, domain?: string): Promise<ChatData> {
-    let novelFragments: RecallFragment[] = [];
+    // feat-A009：本次请求的小说召回编排追踪（片段 ↔ chunkId + 检索调用登记），收尾回填 injected/cited
+    const tracking: NovelTracking = {
+      fragments: [],
+      chunkMeta: [],
+      calls: [],
+    };
     let novelView: InjectionView | null = null;
     let novelSearched = false;
     const userContent = query.trim();
@@ -628,11 +776,10 @@ export class Agent {
     // L1 / L2 已命中专用域，直接走域内快路径（不经 L3）
     let route = this.resolveRoute(query, domain);
     if (Object.values(DOMAIN_ROUTES).includes(route)) {
-      const result = await this.resolveUserContent(query, domain || route);
+      const result = await this.resolveUserContent(query, domain || route, tracking);
       resolvedContent = result.result;
-      novelFragments = result.novelFragments || [];
       novelView = result.novelView || null;
-      novelSearched = result.novelFragments !== undefined;
+      novelSearched = result.novelSearched ?? false;
     }
 
     // L3 向量匹配注入点：只做风云三国高置信正向识别，命中 fengyunsanguo 后走题库快路径；
@@ -679,8 +826,19 @@ export class Agent {
         let toolContent = JSON.stringify(result.content);
         if (toolName === SANGO_NOVEL_SEARCH_TOOL) {
           novelSearched = true;
-          novelFragments.push(...this.collectRecallFragments(result, toolArgs));
-          const view = buildInjectionView(novelFragments, query);
+          // 模型自主调原著检索（route=auto 的 tool-use 路径）：与快路径同源收集片段 + chunkId，
+          // 并把注入视图（纯原文 + 服务端编号）作为工具出参回填——模型看到的 `⟨Qn⟩` 与指针校验同源
+          const { fragments, chunkIds } =
+            this.collectRecallFragmentsWithChunkIds(result, toolArgs);
+          tracking.fragments.push(...fragments);
+          tracking.chunkMeta.push(
+            ...chunkIds.map((chunkId) => ({
+              chunkId,
+              kind: "tooluse" as const,
+            }))
+          );
+          this.recordRetrievalCall(tracking, result, "tooluse");
+          const view = buildInjectionView(tracking.fragments, query);
           novelView = view;
           toolContent = view.text;
         }
@@ -726,15 +884,66 @@ export class Agent {
       .trim();
 
     // 调过原著检索即进校验：无命中（片段为空）由 guard 统一回「演义中未涉及」+ citations []
+    let data: ChatData;
+    let citedChunkIds = new Set<string>();
     if (novelSearched) {
-      return await this.applyNovelCitationGuard(
+      const guarded = await this.applyNovelCitationGuard(
         answer,
-        novelFragments,
+        tracking.fragments,
         query,
-        novelView
+        novelView,
+        tracking.chunkMeta
       );
+      data = guarded.data;
+      citedChunkIds = guarded.citedChunkIds;
+    } else {
+      data = { answer, citations: [] };
     }
-    return { answer, citations: [] };
+    // feat-A009 收尾：回填 injected/cited 后按 (trace_id, seq) 一次性落库（旁路原则：失败不影响响应）
+    this.persistRetrievalDiagnostics(tracking, citedChunkIds);
+    return data;
+  }
+
+  /** feat-A009：注入视图实际纳入的候选 chunkId（快路径确定性注入计入；
+   * LLM 自主 tool-use 路径按 §3.2 口径不统计注入视图 → injected=0 属预期） */
+  private computeInjectedChunkIds(tracking: NovelTracking): Set<string> {
+    const injected = new Set<string>();
+    const pickedIndices = computePickedIndices(tracking.fragments);
+    for (const index of pickedIndices) {
+      const meta = tracking.chunkMeta[index];
+      if (meta?.kind === "fastpath" && meta.chunkId) {
+        injected.add(meta.chunkId);
+      }
+    }
+    return injected;
+  }
+
+  /** feat-A009：收尾落库（旁路，§3.3/§6）：回填 injected/cited → appendRetrievalLog；
+   * 任一环节失败静默，绝不影响 /api/chat 主流程与响应 */
+  private persistRetrievalDiagnostics(
+    tracking: NovelTracking,
+    citedChunkIds: Set<string>
+  ): void {
+    const injectedChunkIds = this.computeInjectedChunkIds(tracking);
+    const traceId = getTraceId();
+    const traceIdValue =
+      typeof traceId === "string" && traceId !== "" ? traceId : null;
+    for (const call of tracking.calls) {
+      if (!call.diagnostics || call.seq === null) {
+        continue;
+      }
+      try {
+        fillDiagnostics(call.diagnostics, injectedChunkIds, citedChunkIds);
+        persistRetrievalDiagnostics(
+          traceIdValue,
+          call.seq,
+          call.diagnostics,
+          this.options.retrievalDiagnosticsPersister
+        );
+      } catch {
+        // 旁路：回填/落库失败静默，不影响响应
+      }
+    }
   }
 
   /** 兼容旧调用：只返回结论正文（citations 由 processQueryData 承载） */
