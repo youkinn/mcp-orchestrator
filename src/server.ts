@@ -19,7 +19,7 @@ import { runWithTraceId } from './trace.js';
 const MAX_MESSAGE_LENGTH = 300;
 const CHAT_ALLOWED_KEYS = ['message', 'domain'];
 const CHAT_ALLOWED_LABEL = 'message、domain';
-const CHAT_ALLOWED_DOMAINS = ['fengyunsanguo', 'sango-novel'];
+const CHAT_ALLOWED_DOMAINS = ['fengyunsanguo', 'sango-novel', 'weather'];
 const RANDOM_ALLOWED_KEYS = ['message', 'sessionId'];
 const RANDOM_ALLOWED_LABEL = 'message、sessionId';
 
@@ -91,7 +91,7 @@ function sendError(response: Response, code: number, message: string) {
   response.status(code).json({ code, data: null, message });
 }
 
-/** 埋点旁路：日志写失败只告警，绝不影响 /api/chat 主流程与响应 */
+/** 埋点旁路：日志写失败只告警，绝不影响 POST 路由主流程与响应 */
 function trySafe(run: () => void): void {
   try {
     run();
@@ -100,10 +100,18 @@ function trySafe(run: () => void): void {
   }
 }
 
-/** /api/chat 全链路埋点中间件（t1 骨架）：读 X-Trace-Id（缺失兜底生成并回写响应头）、
+/** 请求体 → 主表 domain；/api/chat 取请求体 domain，/api/sango/random 固定 fengyunsanguo */
+type TraceDomainResolver = (body: Record<string, unknown>) => string | null;
+
+/** 全链路埋点中间件（t1 骨架）：读 X-Trace-Id（缺失兜底生成并回写响应头）、
  * X-Client-Sent-At；ensureSkeleton 在业务校验 / 入队之前执行（400 / 413 也落库）；
+ * logType / domain 由调用方给定（chat 取请求体 domain，quiz 固定 fengyunsanguo）；
  * runWithTraceId 包裹后续处理供 agent / transport 明细埋点取用 */
-function chatTracing(logStore: LogStore): RequestHandler {
+function tracingMiddleware(
+  logStore: LogStore,
+  logType: string,
+  resolveDomain: TraceDomainResolver
+): RequestHandler {
   return (request, response, next) => {
     const rawTraceId = request.header('X-Trace-Id');
     const traceId =
@@ -122,17 +130,17 @@ function chatTracing(logStore: LogStore): RequestHandler {
     const body = (request.body ?? {}) as Record<string, unknown>;
     trySafe(() =>
       logStore.ensureSkeleton(
-        'chat',
+        logType,
         traceId,
         typeof body.message === 'string' ? body.message : null,
-        typeof body.domain === 'string' ? body.domain : null,
+        resolveDomain(body),
         Date.now(),
         clientSentAt
       )
     );
 
     runWithTraceId(traceId, () => {
-      response.locals.chatTraceId = traceId;
+      response.locals.traceId = traceId;
       next();
     });
   };
@@ -208,9 +216,11 @@ export function createServer(
 
   app.post(
     '/api/chat',
-    chatTracing(logStore),
+    tracingMiddleware(logStore, 'chat', (body) =>
+      typeof body.domain === 'string' ? body.domain : null
+    ),
     async (request: Request, response: Response) => {
-      const traceId = response.locals.chatTraceId as string;
+      const traceId = response.locals.traceId as string;
       const parsed = parseBody(
         (request.body ?? {}) as Record<string, unknown>,
         CHAT_ALLOWED_KEYS,
@@ -273,34 +283,78 @@ export function createServer(
     }
   );
 
-  app.post('/api/sango/random', async (request: Request, response: Response) => {
-    const parsed = parseBody(
-      (request.body ?? {}) as Record<string, unknown>,
-      RANDOM_ALLOWED_KEYS,
-      RANDOM_ALLOWED_LABEL
-    );
-    if (!parsed.ok) {
-      sendError(response, parsed.code, parsed.message);
-      return;
-    }
-
-    // 确定性命令：薄转发 mcp-server fengyunsanguo_quiz_command（出题 / 判题 / 查答案状态机在 quiz 子进程），
-    // 不经 LLM；citations 恒 []（随机一题无原文引用，行为与现状零变化）
-    try {
-      const data = await enqueue(async () => {
-        const result = await transport.fengyunsanguo_quiz_command(
-          parsed.value.message,
-          parsed.value.sessionId
+  app.post(
+    '/api/sango/random',
+    tracingMiddleware(logStore, 'quiz', () => 'fengyunsanguo'),
+    async (request: Request, response: Response) => {
+      const traceId = response.locals.traceId as string;
+      const parsed = parseBody(
+        (request.body ?? {}) as Record<string, unknown>,
+        RANDOM_ALLOWED_KEYS,
+        RANDOM_ALLOWED_LABEL
+      );
+      if (!parsed.ok) {
+        // 校验失败（400 / 413）同样落主表一条：handle_started_at 为 NULL、t5 回填校验失败时刻
+        trySafe(() =>
+          logStore.markResponded(
+            traceId,
+            Date.now(),
+            'failed',
+            parsed.code,
+            parsed.message,
+            null,
+            null
+          )
         );
-        return { answer: toolResultText(result), citations: [] };
-      });
-      response.json({ code: 200, data, message: '' });
-    } catch (error) {
-      console.error('Failed to process request:', error);
-      const info = processingErrorInfo(error);
-      sendError(response, info.code, info.message);
+        sendError(response, parsed.code, parsed.message);
+        return;
+      }
+
+      // 确定性命令：薄转发 mcp-server fengyunsanguo_quiz_command（出题 / 判题 / 查答案状态机在 quiz 子进程），
+      // 不经 LLM；citations 恒 []（随机一题无原文引用，行为与现状零变化）
+      try {
+        const data = await enqueue(async () => {
+          // 队列出队开始处理：回填 t2（未入队的校验失败请求保持 NULL）
+          trySafe(() => logStore.markHandled(traceId, Date.now()));
+          const result = await transport.fengyunsanguo_quiz_command(
+            parsed.value.message,
+            parsed.value.sessionId
+          );
+          return { answer: toolResultText(result), citations: [] };
+        });
+
+        // 响应完成：回填 t5 与 status / response_code / answer / citations（内容字段 8000 截断）
+        trySafe(() =>
+          logStore.markResponded(
+            traceId,
+            Date.now(),
+            'success',
+            200,
+            '',
+            truncate(data.answer) ?? null,
+            truncate(JSON.stringify(data.citations)) ?? null
+          )
+        );
+        response.json({ code: 200, data, message: '' });
+      } catch (error) {
+        // 异常中断兜底：骨架必然已存在（进入本 handler 前 ensureSkeleton），按失败回填
+        console.error('Failed to process request:', error);
+        const info = processingErrorInfo(error);
+        trySafe(() =>
+          logStore.markResponded(
+            traceId,
+            Date.now(),
+            'failed',
+            info.code,
+            info.message,
+            null,
+            null
+          )
+        );
+        sendError(response, info.code, info.message);
+      }
     }
-  });
+  );
 
   return app;
 }
