@@ -72,6 +72,15 @@ CREATE TABLE IF NOT EXISTS tool_call_logs (
   error_message    TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (trace_id, seq)
 );
+CREATE TABLE IF NOT EXISTS tool_retrieval_logs (
+  trace_id    TEXT NOT NULL,
+  seq         INTEGER NOT NULL,
+  diagnostics TEXT NOT NULL,
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY (trace_id, seq),
+  FOREIGN KEY (trace_id, seq) REFERENCES tool_call_logs(trace_id, seq) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_tool_retrieval_logs_created ON tool_retrieval_logs(created_at);
 `;
 
 export interface LlmCallPayload {
@@ -179,6 +188,8 @@ export interface ToolCallLog {
   resultSummary: string | null;
   status: 'success' | 'failed';
   errorMessage: string;
+  /** feat-A009：解析后的检索诊断对象；无诊断 / 旁路丢失 / 解析失败为 null */
+  diagnostics: Record<string, unknown> | null;
 }
 
 export interface LogDetail {
@@ -228,7 +239,10 @@ export interface LogStore {
     citations: string | null
   ): void;
   appendLlmCall(traceId: string, payload: LlmCallPayload): void;
-  appendToolCall(traceId: string, payload: ToolCallPayload): void;
+  /** 返回本次工具明细行号（tool_call_logs.seq，1 起）；写入失败 / no-op 降级为 null */
+  appendToolCall(traceId: string, payload: ToolCallPayload): number | null;
+  /** feat-A009：写入检索诊断（trace_id+seq 复合主键；诊断 JSON ≤64KB 已由 sango 截断）；失败静默 */
+  appendRetrievalLog(traceId: string, seq: number, diagnostics: unknown): void;
   reportFrontendEnd(traceId: string, clientReceivedAt: number): void;
   queryList(query: ListQuery): { list: LogListItem[]; total: number };
   queryDetail(traceId: string): LogDetail | null;
@@ -386,7 +400,8 @@ function createNoopStore(): LogStore {
     markHandled: noopWrite,
     markResponded: noopWrite,
     appendLlmCall: noopWrite,
-    appendToolCall: noopWrite,
+    appendToolCall: () => null,
+    appendRetrievalLog: noopWrite,
     reportFrontendEnd: noopWrite,
     flush: noopWrite,
     runRetentionCleanup: noopWrite,
@@ -456,24 +471,26 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
        status, error_message)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  const insertToolCallStmt = db.prepare(`
-    INSERT INTO tool_call_logs
-      (trace_id, seq, mcp_server, tool_name, args_summary, call_sent_at,
-       call_returned_at, result_summary, status, error_message)
-    VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM tool_call_logs WHERE trace_id = ?),
-            ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
   const insertToolCallWithSeqStmt = db.prepare(`
     INSERT OR IGNORE INTO tool_call_logs
       (trace_id, seq, mcp_server, tool_name, args_summary, call_sent_at,
        call_returned_at, result_summary, status, error_message)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  const selectMaxToolSeqStmt = db.prepare(
+    `SELECT COALESCE(MAX(seq), 0) AS m FROM tool_call_logs WHERE trace_id = ?`
+  );
+  const insertRetrievalLogStmt = db.prepare(`
+    INSERT OR IGNORE INTO tool_retrieval_logs (trace_id, seq, diagnostics, created_at)
+    VALUES (?, ?, ?, ?)
+  `);
   const deleteExpiredStmt = db.prepare(
     `DELETE FROM request_logs WHERE created_at < ?`
   );
-
   const pendingOps: Array<() => void> = [];
+
+  /** feat-A009：各 trace 已分配待落盘的工具明细 seq（DB 未追平前的缓冲计数，防同秒连续调用撞号） */
+  const pendingToolSeq = new Map<string, number>();
 
   const flush = (): void => {
     if (pendingOps.length === 0) {
@@ -530,6 +547,9 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   );
   const queryToolCallsStmt = db.prepare(
     `SELECT * FROM tool_call_logs WHERE trace_id = ? ORDER BY seq ASC`
+  );
+  const queryRetrievalStmt = db.prepare(
+    `SELECT diagnostics FROM tool_retrieval_logs WHERE trace_id = ? AND seq = ?`
   );
   const queryTokenRowsStmt = db.prepare(
     `SELECT request_at, prompt_tokens, completion_tokens
@@ -611,7 +631,25 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
       });
     },
 
-    appendToolCall(traceId, payload): void {
+    appendToolCall(traceId, payload): number | null {
+      // feat-A009：同步预计算 seq 并回传给调用方（transport 透传 agent 供回填落库）。
+      // 正确性：同 trace 内工具调用串行（await 边界），但写入走 1s 缓冲——未落盘前 DB MAX 不前进，
+      // 故需合并「已落库 MAX」与「待落盘缓冲中已分配的 seq」再 +1；跨 trace 互不影响。
+      // 旁路：DB 不可读（连接已关闭等）时本次不分配、不入队，返回 null，绝不影响调用方。
+      let seq: number | null;
+      if (payload.seq != null) {
+        seq = payload.seq;
+      } else {
+        try {
+          const flushed =
+            (selectMaxToolSeqStmt.get(traceId) as { m: number | null } | undefined)?.m ?? 0;
+          seq = Math.max(flushed, pendingToolSeq.get(traceId) ?? 0) + 1;
+        } catch (error) {
+          console.error('Failed to read tool call seq:', error);
+          return null;
+        }
+      }
+      pendingToolSeq.set(traceId, seq);
       enqueue(() => {
         const base = [
           payload.mcpServer,
@@ -623,10 +661,44 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           payload.status,
           payload.errorMessage ?? '',
         ];
-        if (payload.seq != null) {
-          insertToolCallWithSeqStmt.run(traceId, payload.seq, ...base);
-        } else {
-          insertToolCallStmt.run(traceId, traceId, ...base);
+        insertToolCallWithSeqStmt.run(traceId, seq, ...base);
+      });
+      // 缓冲 seq 表防膨胀：DB 已追平则清理该 trace 的待分配记录（低频 prune，不阻塞写入）
+      if (pendingToolSeq.size > 5000) {
+        for (const [trace, seqValue] of pendingToolSeq) {
+          try {
+            const flushed =
+              (selectMaxToolSeqStmt.get(trace) as { m: number | null } | undefined)?.m ?? 0;
+            if (seqValue <= flushed) {
+              pendingToolSeq.delete(trace);
+            }
+          } catch {
+            // 旁路：prune 失败忽略
+          }
+        }
+      }
+      return seq;
+    },
+
+    appendRetrievalLog(traceId, seq, diagnostics): void {
+      let text: string;
+      try {
+        text = JSON.stringify(diagnostics);
+      } catch (error) {
+        console.error('Failed to serialize retrieval diagnostics:', error);
+        return;
+      }
+      if (typeof text !== 'string') {
+        return;
+      }
+      enqueue(() => {
+        // INSERT OR IGNORE：幂等 + FK 行缺失（tool_call_logs 未落 / seq 对不上）时静默跳过，不影响其他写入（旁路）
+        // 旁路（硬约束 4）：INSERT OR IGNORE 不忽略 FK 约束，seq 无对应 tool_call 行会抛错——
+        // 单条 try/catch 静默跳过，绝不影响同事务其它写入与主流程（落库失败告警即可，不重试）
+        try {
+          insertRetrievalLogStmt.run(traceId, seq, text, Date.now());
+        } catch (error) {
+          console.error('Failed to write retrieval diagnostics (bypass):', error);
         }
       });
     },
@@ -753,17 +825,32 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
         })
       );
       const toolCalls = (queryToolCallsStmt.all(traceId) as ToolLogRow[]).map(
-        (tool): ToolCallLog => ({
-          seq: tool.seq,
-          mcpServer: tool.mcp_server,
-          toolName: tool.tool_name,
-          argsSummary: tool.args_summary,
-          callSentAt: tool.call_sent_at,
-          callReturnedAt: tool.call_returned_at,
-          resultSummary: tool.result_summary,
-          status: tool.status as 'success' | 'failed',
-          errorMessage: tool.error_message,
-        })
+        (tool): ToolCallLog => {
+          // feat-A009：工具明细附检索诊断（解析后对象；无行 / 解析失败 → null，不炸前端）
+          const retrieval = queryRetrievalStmt.get(traceId, tool.seq) as
+            | { diagnostics: string }
+            | undefined;
+          let diagnostics: Record<string, unknown> | null = null;
+          if (retrieval) {
+            try {
+              diagnostics = JSON.parse(retrieval.diagnostics) as Record<string, unknown>;
+            } catch {
+              diagnostics = null;
+            }
+          }
+          return {
+            seq: tool.seq,
+            mcpServer: tool.mcp_server,
+            toolName: tool.tool_name,
+            argsSummary: tool.args_summary,
+            callSentAt: tool.call_sent_at,
+            callReturnedAt: tool.call_returned_at,
+            resultSummary: tool.result_summary,
+            status: tool.status as 'success' | 'failed',
+            errorMessage: tool.error_message,
+            diagnostics,
+          };
+        }
       );
       return {
         log: {
@@ -896,8 +983,13 @@ export function appendLlmCall(traceId: string, payload: LlmCallPayload): void {
   getLogStore().appendLlmCall(traceId, payload);
 }
 
-export function appendToolCall(traceId: string, payload: ToolCallPayload): void {
-  getLogStore().appendToolCall(traceId, payload);
+export function appendToolCall(traceId: string, payload: ToolCallPayload): number | null {
+  return getLogStore().appendToolCall(traceId, payload);
+}
+
+/** feat-A009：写入检索诊断（trace_id+seq 复合主键）；失败静默，不影响主流程（旁路） */
+export function appendRetrievalLog(traceId: string, seq: number, diagnostics: unknown): void {
+  getLogStore().appendRetrievalLog(traceId, seq, diagnostics);
 }
 
 export function reportFrontendEnd(traceId: string, clientReceivedAt: number): void {

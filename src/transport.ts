@@ -6,7 +6,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { ToolExecutionError, type MCPToolDefinition, type ToolCallResult } from "./types.js";
 import { getTraceId } from "./trace.js";
-import { appendToolCall, truncate } from "./storage/logs.js";
+import { getLogStore, truncate, type LogStore } from "./storage/logs.js";
 
 // feat-A007 工具明细埋点辅助（旁路静默）：序列化失败兜底 String，统一 8000 截断
 function summarizeJson(value: unknown, max = 8000): string {
@@ -21,6 +21,24 @@ function summarizeJson(value: unknown, max = 8000): string {
 
 function toErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * feat-A009 落 result_summary 前剥离 _meta.diagnostics（硬约束 2：诊断单独落 tool_retrieval_logs，
+ * 不挤占 result_summary 8000 预算）；_meta 仅剩空对象时整体置空。契约口径见 §3.1。
+ */
+function stripDiagnostics(result: ToolCallResult): unknown {
+  const meta = result._meta;
+  if (!meta || typeof meta !== "object") {
+    return result;
+  }
+  const restMeta: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(meta)) {
+    if (key === "diagnostics") continue;
+    restMeta[key] = value;
+  }
+  const rest = Object.keys(restMeta).length > 0 ? restMeta : undefined;
+  return { ...result, _meta: rest };
 }
 
 /** isError 返回的错误描述：取返回内容中的文本拼接；无文本返回空串（调用方兜底文案） */
@@ -56,7 +74,11 @@ export const FENGYUNSANGUO_QUIZ_ROUTE_TOOL = "fengyunsanguo_quiz_route";
 export interface MCPServerConnection {
   connect(): Promise<void>;
   listTools(): Promise<MCPToolDefinition[]>;
-  callTool(name: string, args: Record<string, unknown>): Promise<ToolCallResult>;
+  callTool(
+    name: string,
+    args: Record<string, unknown>,
+    meta?: Record<string, unknown>
+  ): Promise<ToolCallResult>;
   close(): Promise<void>;
 }
 
@@ -98,12 +120,18 @@ export class StdioMCPServerConnection implements MCPServerConnection {
 
   async callTool(
     name: string,
-    args: Record<string, unknown>
+    args: Record<string, unknown>,
+    meta?: Record<string, unknown>
   ): Promise<ToolCallResult> {
+    // feat-A009：转发 tools/call 前统一注入 _meta（当前请求上下文 traceId 存在时；其余工具忽略该键）
+    const params: Record<string, unknown> = { name, arguments: args };
+    if (meta && Object.keys(meta).length > 0) {
+      params._meta = meta;
+    }
     const result = await this.client.request(
       {
         method: "tools/call",
-        params: { name, arguments: args },
+        params,
       },
       CallToolResultSchema
     );
@@ -162,11 +190,16 @@ export class MCPTransport {
   private factory: MCPServerConnectionFactory;
   private servers: Map<string, MCPServerConnection> = new Map();
   private toolToServer: Map<string, string> = new Map();
+  /** feat-A009：工具明细 / 检索诊断落库的存储实例；未注入时回退进程级共享 store */
+  private logStore: LogStore;
 
   constructor(
     config: MCPServerConfig[] | string,
-    factory?: MCPServerConnectionFactory
+    factory?: MCPServerConnectionFactory,
+    /** feat-A009：测试可注入 :memory: store；缺省用进程级共享 store（getLogStore） */
+    logStore?: LogStore
   ) {
+    this.logStore = logStore ?? getLogStore();
     this.configs =
       typeof config === "string"
         ? [{ name: WEATHER_SERVER_NAME, scriptPath: config, required: true }]
@@ -225,28 +258,39 @@ export class MCPTransport {
       throw new Error(`Unknown MCP tool: ${name}`);
     }
     // feat-A007 工具明细：发出 = MCP 收到（只记一次）；仅请求上下文（getTraceId 非空）时记录
+    // feat-A009：上下文就位时统一向 tools/call 注入 _meta.traceId（全部工具一致；协议允许未知 _meta 键）
     const traceId = getTraceId();
     const activeTraceId =
       typeof traceId === "string" && traceId !== "" ? traceId : null;
+    const meta = activeTraceId ? { traceId: activeTraceId } : undefined;
     const callSentAt = Date.now();
     const argsSummary = activeTraceId ? summarizeJson(args) : "";
     try {
-      const result = await connection.callTool(name, args);
+      const result = await connection.callTool(name, args, meta);
       if (activeTraceId) {
         try {
           const toolFailed = (result as { isError?: boolean }).isError === true;
-          appendToolCall(activeTraceId, {
+          // 落 result_summary 前剥离 _meta.diagnostics（硬约束 2：诊断单独落库，不挤占 8000 预算）
+          const seq = this.logStore.appendToolCall(activeTraceId, {
             mcpServer: serverName,
             toolName: name,
             argsSummary,
             callSentAt,
             callReturnedAt: Date.now(),
-            resultSummary: summarizeJson(result),
+            resultSummary: summarizeJson(stripDiagnostics(result)),
             status: toolFailed ? "failed" : "success",
             errorMessage: toolFailed
               ? extractToolError(result) || "MCP 工具返回错误（isError=true）"
               : "",
           });
+          // feat-A009：sango 回传诊断时，把工具明细行号透传给 agent（供其收尾回填 injected/cited 后落库）
+          if (
+            seq !== null &&
+            typeof result._meta?.diagnostics === "object" &&
+            result._meta.diagnostics !== null
+          ) {
+            result._meta = { ...result._meta, retrievalSeq: seq };
+          }
         } catch {
           // 旁路：埋点失败静默，绝不影响工具调用
         }
@@ -255,7 +299,7 @@ export class MCPTransport {
     } catch (error) {
       if (activeTraceId) {
         try {
-          appendToolCall(activeTraceId, {
+          this.logStore.appendToolCall(activeTraceId, {
             mcpServer: serverName,
             toolName: name,
             argsSummary,
