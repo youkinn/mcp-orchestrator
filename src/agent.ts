@@ -341,6 +341,9 @@ export class Agent {
         model: this.config.model,
         messages,
         tools: this.getOpenAITools(tools),
+        // bug-00018：本模型为思考模型，reasoning_tokens 计入 completion_tokens，max_tokens 同时限制
+        // 「思考 + 正文」；思考不收敛时正文恒为空（放大 max_tokens 无效）。各调用点是否关闭思考
+        // 的口径见 bug-00018，调用点均有对应备注。
         max_tokens: 1000,
         temperature: 0.7,
       });
@@ -555,6 +558,7 @@ export class Agent {
       ? buildInjectionView([top], query).text
       : "（无原文片段）";
     const content = `用户问题：${query}\n\n${fragmentText}`;
+    // bug-00018 口径：已给单段原文、只归纳一句结论 → 本轮应关闭思考。
     const response = await this.invokeModel(
       [
         { role: "system", content: CITATION_FALLBACK_CONCLUSION_PROMPT },
@@ -596,6 +600,8 @@ export class Agent {
     const recallPersonIds = scanRecallPersonIds(recallText, aliasTable);
     // 软性域：问候 / 天气等非原著问句（无别名人物、无指针）不套用原著检索格式
     // 判定基于原始输出：安全网只做内容回收，不得把非原著答案误吞成空串
+    // bug-00018：空答案（生成轮 finish_reason=length 且 content 为空）不得经此分支当成功返回，
+    // 须按 bug-00018 的空答案兜底口径处置（重试 / 兜底结论 / 报错）。
     const isNovelAnswer =
       scanRecallPersonIds(answer, aliasTable).size > 0 ||
       /\[Q\d+\]/.test(answer) ||
@@ -814,6 +820,7 @@ export class Agent {
       } else {
         // 轻量分类轮（§2.1）：请求体无 tools，仅 [system: 分类提示] + [user: 用户问题]，
         // 模型只输出编号；服务端按编号预调工具并注入（生成轮不带工具定义）
+        // bug-00018 口径：任务已确定（只判域）+ 输出已锁成编号 → 本轮应关闭思考。
         const classifyResponse = await this.invokeModel(
           [
             { role: "system", content: CLASSIFY_SYSTEM_PROMPT },
@@ -853,6 +860,8 @@ export class Agent {
     if (resolvedContent) {
       messages.push({ role: "system", content: resolvedContent });
     }
+    // bug-00018 口径：有注入（域锁定快路径 / auto 分到 1、2）→ 任务已确定、输出已约束 → 关闭思考；
+    // 仅「无注入的自由模式 99」保留思考（模型需自行作答）。
     const currentResponse = await this.invokeModel(messages, [], "generation");
 
     let answer = currentResponse.content
