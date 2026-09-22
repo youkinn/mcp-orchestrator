@@ -592,6 +592,32 @@ test('题库未收录：分类 2 预调无候选 → 生成轮注入「未召回
   );
 });
 
+test('题库非空但候选与问题不相关 → 注入该候选且服务端原样返回未收录话术', async (t) => {
+  const fixed = '题库未收录该题，请换个问法';
+  const { baseUrl, model } = await startApp(t, {
+    questions: [
+      {
+        question: '吕布的字是什么？',
+        options: { A: '奉孝', B: '奉先', C: '公瑾', D: '伯符' },
+        answer: '奉先',
+      },
+    ],
+    script: [text('2'), text(fixed)],
+  });
+
+  const res = await postJson(baseUrl, '/api/chat', {
+    message: '刘备的字是什么？',
+  });
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.data, { answer: fixed, citations: [] });
+  assert.ok(
+    JSON.stringify(model.calls[1].messages[2]).includes('吕布的字是什么？ → 奉先'),
+    '有候选时注入该候选，走「有候选」分支'
+  );
+  assert.notEqual(res.body.data.answer, '奉先', '服务端未把答案替换为候选答案');
+});
+
 test('闲聊 auto → 分类 99：自由对话提示，无注入、无预调、无 tools', async (t) => {
   const answer = '你好，我在，有什么可以帮你的？';
   const { baseUrl, transport, model } = await startApp(t, {
