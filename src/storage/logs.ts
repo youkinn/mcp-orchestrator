@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS llm_call_logs (
   tool_calls         TEXT,
   prompt_tokens      INTEGER,
   completion_tokens  INTEGER,
+  cached_tokens      INTEGER,
   finish_reason      TEXT,
   status             TEXT NOT NULL,
   error_message      TEXT NOT NULL DEFAULT '',
@@ -95,6 +96,8 @@ export interface LlmCallPayload {
   toolCalls?: string | null;
   promptTokens?: number | null;
   completionTokens?: number | null;
+  /** feat-A011：本次调用缓存命中 token 数；provider 未返回（或缺省调用方不传）为 null，与 promptTokens 同口径 */
+  cachedTokens?: number | null;
   finishReason?: string | null;
   status: 'success' | 'failed';
   errorMessage?: string;
@@ -174,6 +177,7 @@ export interface LlmCallLog {
   toolCalls: string | null;
   promptTokens: number | null;
   completionTokens: number | null;
+  cachedTokens: number | null;
   finishReason: string | null;
   status: 'success' | 'failed';
   errorMessage: string;
@@ -305,6 +309,7 @@ interface LlmLogRow {
   tool_calls: string | null;
   prompt_tokens: number | null;
   completion_tokens: number | null;
+  cached_tokens: number | null;
   finish_reason: string | null;
   status: string;
   error_message: string;
@@ -434,6 +439,13 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
     db = new Database(dbPath);
     db.pragma('foreign_keys = ON');
     db.exec(SCHEMA_SQL);
+    // feat-A011 旧库迁移：既有 llm_call_logs 缺 cached_tokens 列，补列（SQLite 缺省 NULL）；
+    // 新库建表已含该列，重复执行（duplicate column）忽略，幂等。
+    try {
+      db.exec(`ALTER TABLE llm_call_logs ADD COLUMN cached_tokens INTEGER`);
+    } catch {
+      // 旁路：duplicate column 等忽略（新库 / 已迁移库）
+    }
   } catch (error) {
     console.error('Failed to initialize log store (logging disabled):', error);
     return createNoopStore();
@@ -460,17 +472,17 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   const insertLlmCallStmt = db.prepare(`
     INSERT INTO llm_call_logs
       (trace_id, seq, stage, model, request_at, response_at, request_summary,
-       response_summary, tool_calls, prompt_tokens, completion_tokens, finish_reason,
-       status, error_message)
+       response_summary, tool_calls, prompt_tokens, completion_tokens, cached_tokens,
+       finish_reason, status, error_message)
     VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM llm_call_logs WHERE trace_id = ?),
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertLlmCallWithSeqStmt = db.prepare(`
     INSERT OR IGNORE INTO llm_call_logs
       (trace_id, seq, stage, model, request_at, response_at, request_summary,
-       response_summary, tool_calls, prompt_tokens, completion_tokens, finish_reason,
-       status, error_message)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       response_summary, tool_calls, prompt_tokens, completion_tokens, cached_tokens,
+       finish_reason, status, error_message)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertToolCallWithSeqStmt = db.prepare(`
     INSERT OR IGNORE INTO tool_call_logs
@@ -620,6 +632,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           truncate(payload.toolCalls ?? null) ?? null,
           payload.promptTokens ?? null,
           payload.completionTokens ?? null,
+          payload.cachedTokens ?? null,
           payload.finishReason ?? null,
           payload.status,
           payload.errorMessage ?? '',
@@ -824,6 +837,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           toolCalls: llm.tool_calls,
           promptTokens: llm.prompt_tokens,
           completionTokens: llm.completion_tokens,
+          cachedTokens: llm.cached_tokens,
           finishReason: llm.finish_reason,
           status: llm.status as 'success' | 'failed',
           errorMessage: llm.error_message,

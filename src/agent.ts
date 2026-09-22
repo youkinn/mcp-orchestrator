@@ -415,6 +415,7 @@ export class Agent {
           toolCalls: summarizeToolCalls(message?.tool_calls),
           promptTokens: response.usage?.prompt_tokens ?? null,
           completionTokens: response.usage?.completion_tokens ?? null,
+          cachedTokens: response.usage?.prompt_tokens_details?.cached_tokens ?? null,
           finishReason: response.choices?.[0]?.finish_reason ?? null,
           status: "success",
           errorMessage: "",
