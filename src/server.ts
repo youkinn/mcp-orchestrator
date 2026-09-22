@@ -9,6 +9,7 @@ import type { Agent, ChatData } from './agent.js';
 import type { MCPTransport } from './transport.js';
 import { ToolExecutionError, type ToolCallResult } from './types.js';
 import { createLogsApi } from './api/v1/logs.js';
+import { createSangoApi } from './api/v1/sango.js';
 import {
   getLogStore,
   truncate,
@@ -179,6 +180,8 @@ export function createServer(
 
   // feat-A007：v1 日志查询接口独立处理器；/api/v1/logs* 不参与本特性埋点（防递归）
   app.use('/api/v1/logs', createLogsApi(logStore));
+  // feat-A010：三国演义原文接口；后台直调器坊 sango_novel_chapter，不参与模型工具装配
+  app.use('/api/v1/sango', createSangoApi(transport));
 
   app.get('/health', (_request: Request, response: Response) => {
     response.json({

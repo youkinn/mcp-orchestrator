@@ -1,4 +1,4 @@
-﻿import Anthropic from "@anthropic-ai/sdk";
+import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
 import {
   ToolExecutionError,
@@ -163,6 +163,19 @@ export type FengyunsanguoVectorMatcher = (
 
 /** 本地题库工具名（index.ts 装配同名 localTool）：fengyunsanguo 域快路径预调它，不经模型决策 */
 export const FENGYUNSANGUO_QUERY_TOOL = "fengyunsanguo_query";
+
+/** feat-A010 模型可见工具白名单（硬约束）：登记对象 = 工具定义清单（MCP 工具 + options.tools 注入的本地工具定义），
+ * 不是 options.localTools 的 key（localTools 只是「工具名 → 处理器」派发映射）。
+ * 器坊新增后台专用工具（sango_novel_chapter）默认不在白名单 → 模型不可见；后台 HTTP 直调不受影响。
+ * 初始值按当前 /api/tools 实际输出核对登记（见 api/feat-A010-original-text-reader.md §4.2）。 */
+const MODEL_VISIBLE_TOOLS: string[] = [
+  'get-alerts',
+  'get-forecast',
+  FENGYUNSANGUO_QUERY_TOOL,
+  'fengyunsanguo_quiz_command',
+  'fengyunsanguo_quiz_route',
+  SANGO_NOVEL_SEARCH_TOOL,
+];
 
 /** L1 前端标签 → 域：domain 取值与 server.ts 白名单同源，命中即跳过后续所有路由判断 */
 const DOMAIN_ROUTES: Record<string, RouteTarget> = {
@@ -416,7 +429,13 @@ export class Agent {
 
   /** 上报的能力 = 模型实际可见的能力：与 processQuery 的 availableTools 同源 */
   async listTools(): Promise<MCPToolDefinition[]> {
-    return this.options.tools ?? (await this.transport.listTools());
+    return this.resolveModelTools();
+  }
+
+  /** feat-A010：模型可见工具 = 白名单过滤后的工具定义（options.tools 注入路径同样过滤，保证「模型可见 = 白名单」恒成立） */
+  private async resolveModelTools(): Promise<MCPToolDefinition[]> {
+    const tools = this.options.tools ?? (await this.transport.listTools());
+    return tools.filter((tool) => MODEL_VISIBLE_TOOLS.includes(tool.name));
   }
 
   /** MCP 工具失败包装为 ToolExecutionError（server.ts 据此判 503）；本地工具失败原样上抛 */
@@ -801,7 +820,7 @@ export class Agent {
     if (resolvedContent) {
       messages.push({ role: "system", content: resolvedContent, });
     }
-    let availableTools = this.options.tools ?? (await this.transport.listTools());
+    let availableTools = await this.resolveModelTools();
     let currentResponse = await this.invokeModel(messages, availableTools, "routing"); // 调LLM
 
     const MAX_TOOL_ROUNDS = 8

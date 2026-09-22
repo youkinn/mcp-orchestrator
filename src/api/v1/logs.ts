@@ -58,6 +58,12 @@ export function createLogsApi(logStore: LogStore): Router {
         return;
       }
 
+      const domain = parseQueryString(request.query.domain);
+      if (domain !== undefined && domain !== 'weather' && domain !== 'fengyunsanguo' && domain !== 'sango-novel') {
+        sendError(response, 400, 'domain 只支持 weather/fengyunsanguo/sango-novel');
+        return;
+      }
+
       const pageNo = pageNoRaw ?? 1;
       const pageSizeRawClamped = pageSizeRaw ?? 20;
       const pageSize = Math.min(100, Math.max(1, pageSizeRawClamped));
@@ -72,6 +78,7 @@ export function createLogsApi(logStore: LogStore): Router {
         status,
         responseCode: responseCodeRaw,
         keyword: parseQueryString(request.query.keyword),
+        domain,
       });
 
       response.json({
@@ -165,3 +172,4 @@ export function createLogsApi(logStore: LogStore): Router {
 
   return router;
 }
+

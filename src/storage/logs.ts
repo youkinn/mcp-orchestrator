@@ -116,6 +116,7 @@ export interface ListQuery {
   pageNo?: number;
   pageSize?: number;
   logType?: string;
+  domain?: string;
   traceId?: string;
   startAt?: number;
   endAt?: number;
@@ -713,6 +714,10 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
       if (query.logType !== undefined) {
         where.push('r.log_type = ?');
         params.push(query.logType);
+      }
+      if (query.domain !== undefined) {
+        where.push('r.domain = ?');
+        params.push(query.domain);
       }
       if (query.traceId !== undefined) {
         where.push('r.trace_id = ?');
