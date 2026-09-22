@@ -39,7 +39,15 @@ test("③ fengyunsanguo 域提示：§2.4 原文照录，含固定话术与未�
   assert.match(FENGYUNSANGUO_DOMAIN_PROMPT, /当前为「风云三国题库」场景/);
   assert.match(FENGYUNSANGUO_DOMAIN_PROMPT, /不要再调用检索工具/);
   assert.match(FENGYUNSANGUO_DOMAIN_PROMPT, /「题库未收录该题，请换个问法」/);
-  assert.match(FENGYUNSANGUO_DOMAIN_PROMPT, /「未召回到任何候选题目」/);
+  assert.match(FENGYUNSANGUO_DOMAIN_PROMPT, /候选为空、或候选中没有含义对应的题目/);
+});
+
+test("③a 题库域候选不相关（含义不对应 → 未收录）时不得用题库外知识作答", () => {
+  assert.match(
+    FENGYUNSANGUO_DOMAIN_PROMPT,
+    /候选中没有含义对应的题目.*「题库未收录该题，请换个问法」/
+  );
+  assert.match(FENGYUNSANGUO_DOMAIN_PROMPT, /禁止用题库外的知识作答、补充或改写答案/);
 });
 
 test("④ 自由对话提示：§2.4 原文照录，自由作答不套模板不提及工具名", () => {
