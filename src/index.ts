@@ -4,7 +4,7 @@ import {
   resolveMCPServerConfigs,
   WEATHER_SERVER_NAME,
 } from './transport.js';
-import { Agent, UNIFIED_SYSTEM_PROMPT } from './agent.js';
+import { Agent } from './agent.js';
 import { createServer } from './server.js';
 import type { LLMProvider } from './types.js';
 
@@ -53,7 +53,6 @@ async function main() {
   // 统一 Agent：工具集全部来自 MCP server（weather / sango 演义 / fengyunsanguo），总台无本地工具
   const mcpTools = await transport.listTools();
   const agent = new Agent(transport, llmConfig, {
-    systemPrompt: UNIFIED_SYSTEM_PROMPT,
     tools: mcpTools,
     // L3：无 domain 且 L2 未命中时，先调 fengyunsanguo server 做题库高置信识别（可选 server，缺配/失败不命中）
     fengyunsanguoVectorMatcher: (query) => transport.fengyunsanguo_quiz_route(query),

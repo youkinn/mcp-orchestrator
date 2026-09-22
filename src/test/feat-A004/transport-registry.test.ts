@@ -395,7 +395,7 @@ test("fengyunsanguo_quiz_command：server 调用失败 → ToolExecutionError（
   );
 });
 
-test("缺配 fengyunsanguo：经 Agent 调用其工具 → ToolExecutionError（503 语义）", async () => {
+test("缺配 fengyunsanguo：domain=fengyunsanguo 快路径预调 → ToolExecutionError（503 语义）", async () => {
   const factory = new FakeFactory({
     weather: [FORECAST, ALERTS],
     sango: [NOVEL],
@@ -406,19 +406,12 @@ test("缺配 fengyunsanguo：经 Agent 调用其工具 → ToolExecutionError（
   const agent = new Agent(transport, makeLLMConfig(), {
     tools: [...FENGYUNSANGUO_TOOLS],
     modelCaller: async () => ({
-      content: [
-        {
-          type: "tool_use",
-          id: "call_1",
-          name: "fengyunsanguo_query",
-          input: { text: "夏侯惇的字是什么？" },
-        },
-      ],
+      content: [{ type: "text", text: "不应到达" }],
     }),
   });
 
   await assert.rejects(
-    () => agent.processQuery("夏侯惇的字是什么？"),
+    () => agent.processQuery("夏侯惇的字是什么？", "fengyunsanguo"),
     (error: unknown) =>
       error instanceof ToolExecutionError &&
       error.toolName === "fengyunsanguo_query"

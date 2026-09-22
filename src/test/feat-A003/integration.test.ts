@@ -2,7 +2,13 @@ import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
-import { Agent, UNIFIED_SYSTEM_PROMPT } from '../../agent.js';
+import {
+  Agent,
+  CLASSIFY_SYSTEM_PROMPT,
+  FENGYUNSANGUO_DOMAIN_PROMPT,
+  FREE_CHAT_SYSTEM_PROMPT,
+  SANGO_NOVEL_DOMAIN_PROMPT,
+} from '../../agent.js';
 import { createServer } from '../../server.js';
 import { MCPTransport } from '../../transport.js';
 import type {
@@ -13,34 +19,27 @@ import type {
 } from '../../types.js';
 
 /**
- * feat-A003 端到端集成用例（A005 适配版）：真实 server.ts + 真实 Agent + 替身 MCP transport，
+ * feat-A003 端到端集成用例（feat-A011 适配版）：真实 server.ts + 真实 Agent + 替身 MCP transport，
  * 只把 MCP server 与 LLM 换成替身（零网络、不起真实 MCP Server）。
- * 风云三国能力全部经 MCP（fengyunsanguo_query / fengyunsanguo_quiz_route / fengyunsanguo_quiz_command），
- * 总台无本地工具；/api/sango/random 为薄转发。这里验「HTTP 请求 → 统一 Agent → MCP 工具」整条链路。
- *
- * 与同目录 server.test.ts（StubAgent，只验 HTTP 契约）、agent-routing.test.ts
- * （直调 Agent，不起服务，小胡维护）互补。
+ * feat-A011：auto 首轮改无 tools 轻量分类（classify）→ 服务端按编号预调工具并注入 → 生成轮不带工具；
+ * 天气能力已下线；生成轮消息固定 [system 域提示 + user + system 注入]。
  */
 
 const FORECAST_TOOL: MCPToolDefinition = {
   name: 'get-forecast',
-  description:
-    '获取美国境内某个经纬度位置的天气预报（数据源：美国国家气象局 NWS）。仅覆盖美国境内；非美国地区（如中国北京）不要调用本工具，应直接告知用户仅支持美国天气，不要编造数据。',
+  description: '获取美国境内某个经纬度位置的天气预报（数据源：美国国家气象局 NWS）。仅覆盖美国境内。',
   inputSchema: { type: 'object' },
 };
 
 const ALERTS_TOOL: MCPToolDefinition = {
   name: 'get-alerts',
-  description:
-    '获取美国某个州的当前天气预警（数据源：美国国家气象局 NWS）。仅覆盖美国境内，state 必须是美国两字母州代码；非美国地区不要调用本工具。',
+  description: '获取美国某个州的当前天气预警（数据源：美国国家气象局 NWS）。仅覆盖美国境内。',
   inputSchema: { type: 'object' },
 };
 
-/** 与 mcp-server fengyunsanguo 工具契约同文的工具定义（MCP 上报，总台无本地工具） */
 const FENGYUNSANGUO_QUERY_TOOL: MCPToolDefinition = {
   name: 'fengyunsanguo_query',
-  description:
-    '风云三国题库检索：仅当用户询问风云三国游戏内招募武将问答题时调用；参数 text 传用户原始问法，返回候选题目（题干 → 答案）',
+  description: '风云三国题库检索：参数 text 传用户原始问法，返回候选题目（题干 → 答案）',
   inputSchema: {
     type: 'object',
     properties: { text: { type: 'string' } },
@@ -59,14 +58,29 @@ const FENGYUNSANGUO_QUIZ_COMMAND_TOOL: MCPToolDefinition = {
   inputSchema: { type: 'object' },
 };
 
+const SANGO_NOVEL_TOOL: MCPToolDefinition = {
+  name: 'sango_novel_search',
+  description: '《三国演义》原著检索：参数 source=sanguo-yanyi、query=用户白话问句、limit 默认 5',
+  inputSchema: { type: 'object' },
+};
+
+/** 全部 MCP 上报工具（含已下线的天气，供 /api/tools 白名单过滤验证） */
 const MCP_TOOLS: MCPToolDefinition[] = [
   FORECAST_TOOL,
   ALERTS_TOOL,
   FENGYUNSANGUO_QUERY_TOOL,
   FENGYUNSANGUO_QUIZ_ROUTE_TOOL,
   FENGYUNSANGUO_QUIZ_COMMAND_TOOL,
+  SANGO_NOVEL_TOOL,
 ];
-const UNIFIED_TOOL_NAMES = MCP_TOOLS.map((tool) => tool.name);
+
+/** 白名单后的模型可见工具（feat-A011：无天气） */
+const VISIBLE_TOOL_NAMES = [
+  'fengyunsanguo_query',
+  'fengyunsanguo_quiz_command',
+  'fengyunsanguo_quiz_route',
+  'sango_novel_search',
+].sort();
 
 type SangoOptionKey = 'A' | 'B' | 'C' | 'D';
 
@@ -124,10 +138,6 @@ function bigrams(text: string): Set<string> {
   return grams;
 }
 
-/**
- * fengyunsanguo server 替身：候选召回（bigram Dice）+ 随机一题状态机（出题 / 判题 / 查答案），
- * 行为与搬迁前 SangoService 一致，只存在于测试进程内。
- */
 class FengyunsanguoSim {
   private sessions = new Map<string, { question: SangoQuestion; createdAt: number }>();
 
@@ -261,8 +271,23 @@ function formatAnswer(answer: { key: SangoOptionKey; text: string }): string {
   return `正确答案：${answer.text}（${answer.key}）`;
 }
 
+/** 原著召回出参（裸 JSON 数组，与 mcp-server 同构） */
+const NOVEL_RECALL = JSON.stringify([
+  {
+    id: 'sanguo-yanyi:0005:c0001',
+    text: '众皆大惊曰：“云长提刀出阵，斩华雄于帐前！”',
+    chapter: 5,
+    title: '发矫诏诸镇应曹公　破关兵三英战吕布',
+    type: 'narration',
+    segFrom: 4,
+    segTo: 4,
+    quoteBalanced: true,
+    quotes: [{ offset: 7, len: 13 }],
+  },
+]);
+
 /**
- * MCP transport 替身：模拟 weather + fengyunsanguo 两个 MCP server 的工具行为，
+ * MCP transport 替身：模拟 weather + fengyunsanguo + sango 演义 三个 MCP server 的工具行为，
  * 只记录调用，不发真实 stdio 连接；可注入指定工具失败 / 全局失败 / quiz_route 命中。
  */
 class MockTransport extends MCPTransport {
@@ -305,6 +330,8 @@ class MockTransport extends MCPTransport {
         return textResult('晴，5℃');
       case 'get-alerts':
         return textResult('大风预警');
+      case 'sango_novel_search':
+        return textResult(NOVEL_RECALL);
       case 'fengyunsanguo_query': {
         const query = typeof args.text === 'string' ? args.text : '';
         const hits = this.sim.candidates(query);
@@ -368,10 +395,6 @@ class FakeModel {
   };
 }
 
-function toolUse(name: string, input: Record<string, unknown>): ModelResponse {
-  return { content: [{ type: 'tool_use', id: 'call_' + name, name, input }] };
-}
-
 function text(answer: string): ModelResponse {
   return { content: [{ type: 'text', text: answer }] };
 }
@@ -418,7 +441,6 @@ async function startApp(
   const model = new FakeModel(options.script ?? []);
 
   const agent = new Agent(transport, LLM_CONFIG, {
-    systemPrompt: UNIFIED_SYSTEM_PROMPT,
     tools: MCP_TOOLS,
     // 与 index.ts 同形：L3 无 domain 自动路由走 transport 的 fengyunsanguo_quiz_route
     fengyunsanguoVectorMatcher: (query) => transport.fengyunsanguo_quiz_route(query),
@@ -460,18 +482,16 @@ function assertEnvelope(body: any, code: number) {
   assert.equal(body.code, code);
 }
 
-test('1/6 美国天气语义：只传 message，真实 Agent 调 get-forecast，200 信封回传播报文本', async (t) => {
-  const answer =
-    '纽约今天基本适合通勤，5℃有小雨。出门必备：手机、乘车码、证件、钥匙、雨伞';
+test('域锁定快路径：domain=sango-novel 单轮生成（无 tools），注入片段恒在消息末尾', async (t) => {
+  // 泛答不含人物名/指针：引用校验早退，单轮生成断言聚焦 A011 消息排布（引用行为见 agent-novel）
+  const answer = '这是测试回复。';
   const { baseUrl, transport, model } = await startApp(t, {
-    script: [
-      toolUse('get-forecast', { latitude: 40.71, longitude: -74.01 }),
-      text(answer),
-    ],
+    script: [text(answer)],
   });
 
   const res = await postJson(baseUrl, '/api/chat', {
-    message: '  纽约今天适合坐地铁通勤吗  ',
+    message: '谁斩了华雄？',
+    domain: 'sango-novel',
   });
 
   assert.equal(res.status, 200);
@@ -480,96 +500,58 @@ test('1/6 美国天气语义：只传 message，真实 Agent 调 get-forecast，
     data: { answer, citations: [] },
     message: '',
   });
-  assert.deepEqual(
-    transport.callToolCalls[0],
-    { name: 'fengyunsanguo_quiz_route', args: { text: '纽约今天适合坐地铁通勤吗' } }
+  assert.equal(model.calls.length, 1, '域锁定只走一轮生成');
+  assert.equal(model.calls[0].systemPrompt, SANGO_NOVEL_DOMAIN_PROMPT);
+  assert.deepEqual(model.calls[0].toolNames, [], '快路径生成轮不携带工具定义');
+  assert.equal(
+    model.calls[0].messages[1].content,
+    '谁斩了华雄？',
+    '问题 trim 后原样透传'
   );
-  assert.deepEqual(callsNamed(transport.callToolCalls, 'get-forecast'), [
-    { name: 'get-forecast', args: { latitude: 40.71, longitude: -74.01 } },
-  ]);
-  // 问题原文 trim 后透传给模型，请求体不含任何路由字段
-  assert.equal(lastMessage(model.calls[0]).content, '纽约今天适合坐地铁通勤吗');
-  assert.deepEqual(model.calls[0].toolNames, UNIFIED_TOOL_NAMES);
+  assert.equal(model.calls[0].messages[2].role, 'system', '注入片段为第三条消息');
+  assert.ok(
+    model.calls[0].messages[2].content.includes('云长提刀出阵，斩华雄于帐前！'),
+    '预调 sango_novel_search 后注入原文片段'
+  );
+  assert.equal(transport.callToolCalls.length, 1);
+  assert.equal(transport.callToolCalls[0]!.name, 'sango_novel_search');
+  assert.deepEqual(transport.callToolCalls[0]!.args, {
+    source: 'sanguo-yanyi',
+    query: '谁斩了华雄？',
+    limit: 10,
+  });
 });
 
-test('1 多轮 tool-use：get-forecast 后 get-alerts 再出文本，调用顺序与参数完整透传', async (t) => {
-  const answer =
-    '纽约今天建议调整时间，5℃有大风预警。出门必备：手机、乘车码、证件、钥匙';
+test('auto 分类轮：请求体无 tools；分类 1 → 预调 sango_novel_search 后生成轮也无 tools', async (t) => {
+  // 泛答不含人物名/指针：引用校验早退，保持分类 + 生成两轮断言（引用行为见 agent-novel）
+  const answer = '这是测试回复。';
   const { baseUrl, transport, model } = await startApp(t, {
-    script: [
-      toolUse('get-forecast', { latitude: 40.71, longitude: -74.01 }),
-      toolUse('get-alerts', { state: 'NY' }),
-      text(answer),
-    ],
+    script: [text('1'), text(answer)],
   });
 
   const res = await postJson(baseUrl, '/api/chat', {
-    message: '纽约今天有预警吗，适合通勤吗',
+    message: '谁斩了华雄？',
   });
 
   assert.equal(res.status, 200);
   assert.deepEqual(res.body.data, { answer, citations: [] });
-  assert.deepEqual(
-    callsNamed(transport.callToolCalls, 'get-forecast').map((call) => call.name),
-    ['get-forecast']
-  );
-  assert.deepEqual(
-    transport.callToolCalls.map((call) => call.name).filter((name) => name !== 'fengyunsanguo_quiz_route'),
-    ['get-forecast', 'get-alerts']
-  );
-  assert.equal(model.calls.length, 3);
-});
-
-test('2/6 无 domain 题库问法：L3 经 fengyunsanguo_quiz_route 未命中 → 模型自主调 fengyunsanguo_query，答案取题库原文', async (t) => {
-  const { baseUrl, transport, model } = await startApp(t, {
-    script: [toolUse('fengyunsanguo_query', { text: '夏侯的字是什么' }), text('元让')],
-  });
-
-  const res = await postJson(baseUrl, '/api/chat', {
-    message: '夏侯的字是什么',
-  });
-
-  assert.equal(res.status, 200);
-  assert.deepEqual(res.body.data, { answer: '元让', citations: [] });
-  assert.deepEqual(transport.callToolCalls[0], {
-    name: 'fengyunsanguo_quiz_route',
-    args: { text: '夏侯的字是什么' },
-  });
-  assert.deepEqual(callsNamed(transport.callToolCalls, 'fengyunsanguo_query'), [
-    { name: 'fengyunsanguo_query', args: { text: '夏侯的字是什么' } },
-  ]);
-  // MCP 召回结果按「题干 → 答案」回填给模型，模型才有机会输出题库原文
+  assert.equal(model.calls.length, 2, 'auto 未命中能力域分分类 + 生成两轮');
+  assert.equal(model.calls[0].systemPrompt, CLASSIFY_SYSTEM_PROMPT);
+  assert.deepEqual(model.calls[0].toolNames, [], '分类轮请求体无 tools');
+  assert.equal(model.calls[0].messages.length, 2, '分类轮仅 system 分类提示 + user 问题');
+  assert.equal(model.calls[1].systemPrompt, SANGO_NOVEL_DOMAIN_PROMPT);
+  assert.deepEqual(model.calls[1].toolNames, [], '生成轮不携带工具定义');
   assert.ok(
-    JSON.stringify(lastMessage(model.calls[1])).includes('夏侯惇的字是什么？ → 元让')
+    model.calls[1].messages[2].content.includes('云长提刀出阵'),
+    '编号 1 预调 sango_novel_search 并注入'
   );
+  assert.equal(transport.callToolCalls[0]!.name, 'fengyunsanguo_quiz_route', 'L3 先识别');
+  assert.equal(transport.callToolCalls[1]!.name, 'sango_novel_search', '分类 1 服务端预调');
 });
 
-test('3/6 题库未收录：fengyunsanguo_query 无候选，回答固定话术且不用题库外知识', async (t) => {
-  const fixed = '题库未收录该题，请换个问法';
+test('auto 分类 2 → 服务端预调 fengyunsanguo_query 注入题库候选，生成轮按域提示作答', async (t) => {
   const { baseUrl, transport, model } = await startApp(t, {
-    questions: [],
-    script: [
-      toolUse('fengyunsanguo_query', { text: '司马懿的字是什么' }),
-      text(fixed),
-    ],
-  });
-
-  const res = await postJson(baseUrl, '/api/chat', {
-    message: '司马懿的字是什么',
-  });
-
-  assert.equal(res.status, 200);
-  assert.deepEqual(res.body.data, { answer: fixed, citations: [] });
-  assert.deepEqual(callsNamed(transport.callToolCalls, 'fengyunsanguo_query').length, 1);
-  assert.ok(
-    JSON.stringify(lastMessage(model.calls[1])).includes('未召回到任何候选题目')
-  );
-});
-
-test('L3 识别失败（可选 server 异常）→ 不命中，自动路由照常，其余功能正常', async (t) => {
-  const { baseUrl, transport } = await startApp(t, {
-    failTools: ['fengyunsanguo_quiz_route'],
-    script: [toolUse('fengyunsanguo_query', { text: '夏侯惇的字是什么？' }), text('元让')],
+    script: [text('2'), text('元让')],
   });
 
   const res = await postJson(baseUrl, '/api/chat', {
@@ -578,36 +560,42 @@ test('L3 识别失败（可选 server 异常）→ 不命中，自动路由照�
 
   assert.equal(res.status, 200);
   assert.deepEqual(res.body.data, { answer: '元让', citations: [] });
+  assert.equal(transport.callToolCalls.length, 2);
+  assert.equal(transport.callToolCalls[0]!.name, 'fengyunsanguo_quiz_route');
+  assert.deepEqual(transport.callToolCalls[1], {
+    name: 'fengyunsanguo_query',
+    args: { text: '夏侯惇的字是什么？' },
+  });
+  assert.equal(model.calls[1].systemPrompt, FENGYUNSANGUO_DOMAIN_PROMPT);
   assert.ok(
-    callsNamed(transport.callToolCalls, 'fengyunsanguo_query').length === 1,
-    'L3 失败后模型仍可自主调 fengyunsanguo_query'
+    JSON.stringify(model.calls[1].messages[2]).includes('夏侯惇的字是什么？ → 元让'),
+    '题库候选注入生成轮末尾'
   );
 });
 
-test('4/6 非美国天气：不调用任何工具，明确告知仅支持美国境内且不编造数据', async (t) => {
-  const answer = '仅支持美国境内天气查询，无法提供北京的天气数据。';
-  const { baseUrl, transport, model } = await startApp(t, {
-    script: [text(answer)],
+test('题库未收录：分类 2 预调无候选 → 生成轮注入「未召回到任何候选题目」话术', async (t) => {
+  const fixed = '题库未收录该题，请换个问法';
+  const { baseUrl, model } = await startApp(t, {
+    questions: [],
+    script: [text('2'), text(fixed)],
   });
 
   const res = await postJson(baseUrl, '/api/chat', {
-    message: '北京今天天气怎么样',
+    message: '司马懿的字是什么？',
   });
 
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body.data, { answer, citations: [] });
-  assert.deepEqual(
-    transport.callToolCalls.map((call) => call.name),
-    [],
-    'L2 关键词已锁定 weather，L3 题库识别不再调用（路由分层：L3 仅 auto 生效）'
+  assert.deepEqual(res.body.data, { answer: fixed, citations: [] });
+  assert.ok(
+    JSON.stringify(model.calls[1].messages[2]).includes('未召回到任何候选题目'),
+    '无候选时注入固定话术'
   );
-  assert.equal(model.calls.length, 1);
 });
 
-test('5/6 闲聊：不调用任何工具（仅 L3 识别），自由作答，不套天气与题库模板', async (t) => {
+test('闲聊 auto → 分类 99：自由对话提示，无注入、无预调、无 tools', async (t) => {
   const answer = '你好，我在，有什么可以帮你的？';
   const { baseUrl, transport, model } = await startApp(t, {
-    script: [text(answer)],
+    script: [text('99'), text(answer)],
   });
 
   const res = await postJson(baseUrl, '/api/chat', { message: '你好' });
@@ -616,38 +604,75 @@ test('5/6 闲聊：不调用任何工具（仅 L3 识别），自由作答，不
   assert.deepEqual(res.body.data, { answer, citations: [] });
   assert.deepEqual(
     transport.callToolCalls.map((call) => call.name),
-    ['fengyunsanguo_quiz_route']
+    ['fengyunsanguo_quiz_route'],
+    '99 不预调任何能力工具'
   );
-  assert.equal(model.calls.length, 1);
-  // 工具仍然可见（由模型自主决定不用），不是靠前端或 server 收窄能力
-  assert.deepEqual(model.calls[0].toolNames, UNIFIED_TOOL_NAMES);
+  assert.equal(model.calls.length, 2);
+  assert.equal(model.calls[1].systemPrompt, FREE_CHAT_SYSTEM_PROMPT);
+  assert.equal(model.calls[1].messages.length, 2, '99 无注入段');
+  assert.deepEqual(model.calls[1].toolNames, [], '生成轮无 tools');
 });
 
-test('6 默认路径：天气、题库、兜底三种语义共用同一份统一提示词与同一份可见工具', async (t) => {
-  const { baseUrl, model } = await startApp(t, {
-    script: [
-      toolUse('get-forecast', { latitude: 40.71, longitude: -74.01 }),
-      text('纽约今天适合通勤，5℃。出门必备：手机、乘车码、证件、钥匙'),
-      toolUse('fengyunsanguo_query', { text: '夏侯惇的字是什么？' }),
-      text('元让'),
-      text('你好，我在。'),
-    ],
+test('天气能力下线：纽约天气语义不再调任何天气工具，走分类 99 自由对话', async (t) => {
+  const answer = '我可以聊聊别的。';
+  const { baseUrl, transport, model } = await startApp(t, {
+    script: [text('99'), text(answer)],
   });
 
-  await postJson(baseUrl, '/api/chat', { message: '纽约今天天气' });
-  await postJson(baseUrl, '/api/chat', { message: '夏侯惇的字是什么？' });
-  await postJson(baseUrl, '/api/chat', { message: '你好' });
+  const res = await postJson(baseUrl, '/api/chat', {
+    message: '纽约今天适合坐地铁通勤吗？',
+  });
 
-  assert.equal(model.calls.length, 5);
-  const prompts = new Set(model.calls.map((call) => call.systemPrompt));
-  assert.equal(prompts.size, 1);
-  assert.equal(model.calls[0].systemPrompt, UNIFIED_SYSTEM_PROMPT);
-  for (const call of model.calls) {
-    assert.deepEqual(call.toolNames, UNIFIED_TOOL_NAMES);
-  }
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.data, { answer, citations: [] });
+  assert.deepEqual(
+    transport.callToolCalls.map((call) => call.name),
+    ['fengyunsanguo_quiz_route'],
+    '天气能力下线：不调用 get-forecast / get-alerts'
+  );
+  assert.equal(model.calls[1].systemPrompt, FREE_CHAT_SYSTEM_PROMPT);
 });
 
-test('7 旧字段 scenario / service 一律 400，请求完全不触达 Agent 与工具', async (t) => {
+test('L3 命中 → 题库快路径（不经分类轮）：quiz_route 识别命中后预调 fengyunsanguo_query 单轮生成', async (t) => {
+  const { baseUrl, transport, model } = await startApp(t, {
+    quizRouteHit: true,
+    script: [text('元让')],
+  });
+
+  const res = await postJson(baseUrl, '/api/chat', {
+    message: '夏侯惇的字是什么？',
+  });
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.data, { answer: '元让', citations: [] });
+  assert.equal(model.calls.length, 1, 'L3 命中直接走题库快路径，不经分类轮');
+  assert.equal(model.calls[0].systemPrompt, FENGYUNSANGUO_DOMAIN_PROMPT);
+  assert.deepEqual(model.calls[0].toolNames, []);
+  assert.deepEqual(
+    transport.callToolCalls.map((call) => call.name),
+    ['fengyunsanguo_quiz_route', 'fengyunsanguo_query']
+  );
+});
+
+test('L3 识别失败（可选 server 异常）→ 按未命中处理，auto 分类照常', async (t) => {
+  const { baseUrl, transport, model } = await startApp(t, {
+    failTools: ['fengyunsanguo_quiz_route'],
+    script: [text('2'), text('元让')],
+  });
+
+  const res = await postJson(baseUrl, '/api/chat', {
+    message: '夏侯惇的字是什么？',
+  });
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.data, { answer: '元让', citations: [] });
+  assert.equal(transport.callToolCalls.length, 2, 'quiz_route 失败被记录一次 + 分类 2 预调一次');
+  assert.equal(transport.callToolCalls[0]!.name, 'fengyunsanguo_quiz_route', 'L3 识别失败调用被记录');
+  assert.equal(transport.callToolCalls[1]!.name, 'fengyunsanguo_query', '分类 2 预调题库检索');
+  assert.equal(model.calls.length, 2);
+});
+
+test('旧字段 scenario / service 一律 400，请求完全不触达 Agent 与工具', async (t) => {
   const { baseUrl, transport, model } = await startApp(t);
 
   const legacyOne = await postJson(baseUrl, '/api/chat', {
@@ -676,29 +701,32 @@ test('7 旧字段 scenario / service 一律 400，请求完全不触达 Agent �
   assert.deepEqual(transport.callToolCalls, []);
 });
 
-test('8 GET /api/tools：真实 Agent 上报 MCP 工具（含 fengyunsanguo_query），总台无本地工具', async (t) => {
+test('GET /api/tools：白名单过滤后仅 4 个能力工具（无天气 / 无后台），description 为 §1.2 瘦身全文', async (t) => {
   const { baseUrl, transport, model } = await startApp(t);
 
   const res = await getJson(baseUrl, '/api/tools');
 
   assert.equal(res.status, 200);
   assertEnvelope(res.body, 200);
+  const tools = res.body.data.tools as MCPToolDefinition[];
   assert.deepEqual(
-    res.body.data.tools.map((tool: any) => tool.name),
-    UNIFIED_TOOL_NAMES
+    tools.map((tool) => tool.name).sort(),
+    VISIBLE_TOOL_NAMES,
+    '天气工具已下线，后台专用工具不在白名单'
   );
-  assert.deepEqual(res.body.data.tools[2], FENGYUNSANGUO_QUERY_TOOL);
-  assert.equal(
-    res.body.data.tools.length,
-    UNIFIED_TOOL_NAMES.length,
-    '总台无本地工具：上报列表与 MCP 工具集完全一致'
+  assert.match(
+    tools.find((tool) => tool.name === 'sango_novel_search')!.description,
+    /检索《三国演义》原著原文/
+  );
+  assert.match(
+    tools.find((tool) => tool.name === 'fengyunsanguo_query')!.description,
+    /风云三国题库候选召回/
   );
   assert.equal(model.calls.length, 0);
-  // 上报能力与模型可见能力同源：注入 tools 后不打 MCP
-  assert.equal(transport.listToolsCount, 0);
+  assert.equal(transport.listToolsCount, 0, '注入 tools 后 /api/tools 不打 MCP');
 });
 
-test('9 POST /api/sango/random：出题、判对、判错、查答案、无会话，薄转发 fengyunsanguo_quiz_command，全程不调 Agent / LLM', async (t) => {
+test('POST /api/sango/random：出题、判对、判错、查答案、无会话，薄转发 fengyunsanguo_quiz_command，全程不调 Agent / LLM', async (t) => {
   const { baseUrl, transport, model, sim } = await startApp(t);
   const sessionId = 'sid-a003';
 
@@ -755,10 +783,10 @@ test('9 POST /api/sango/random：出题、判对、判错、查答案、无会�
   });
 });
 
-test('9 quiz 调用失败 → /api/sango/random 503，/api/chat 其余功能正常', async (t) => {
+test('quiz 调用失败 → /api/sango/random 503，/api/chat 其余功能正常', async (t) => {
   const { baseUrl } = await startApp(t, {
     failTools: ['fengyunsanguo_quiz_command'],
-    script: [text('你好，我在。')],
+    script: [text('99'), text('你好，我在。')],
   });
 
   const random = await postJson(baseUrl, '/api/sango/random', {
@@ -777,7 +805,9 @@ test('9 quiz 调用失败 → /api/sango/random 503，/api/chat 其余功能正�
 });
 
 test('10 所有端点均为 { code, data, message } 信封：成功 data 有值，失败 data 为 null', async (t) => {
-  const { baseUrl } = await startApp(t, { script: [text('你好，我在。')] });
+  const { baseUrl } = await startApp(t, {
+    script: [text('99'), text('你好，我在。')],
+  });
 
   const health = await getJson(baseUrl, '/health');
   assert.equal(health.status, 200);
@@ -816,13 +846,16 @@ test('10 所有端点均为 { code, data, message } 信封：成功 data 有值�
   assert.equal(tooLong.body.data, null);
 });
 
-test('503：MCP 工具失败经真实 Agent 包装为 ToolExecutionError，判工具服务暂不可用', async (t) => {
+test('503：domain=sango-novel 预调 sango_novel_search 失败 → 判工具服务暂不可用', async (t) => {
   const { baseUrl } = await startApp(t, {
-    script: [toolUse('get-forecast', { latitude: 40.71, longitude: -74.01 })],
     callToolError: new Error('MCP stdio closed'),
+    script: [],
   });
 
-  const res = await postJson(baseUrl, '/api/chat', { message: '纽约天气' });
+  const res = await postJson(baseUrl, '/api/chat', {
+    message: '谁斩了华雄？',
+    domain: 'sango-novel',
+  });
 
   assert.equal(res.status, 503);
   assert.deepEqual(res.body, {
@@ -832,10 +865,10 @@ test('503：MCP 工具失败经真实 Agent 包装为 ToolExecutionError，判�
   });
 });
 
-test('503：fengyunsanguo_query 失败同样判工具服务暂不可用（MCP 链路统一语义）', async (t) => {
+test('503：auto 分类 2 预调 fengyunsanguo_query 失败同样判工具服务暂不可用', async (t) => {
   const { baseUrl } = await startApp(t, {
-    script: [toolUse('fengyunsanguo_query', { text: '夏侯惇的字是什么？' })],
     failTools: ['fengyunsanguo_query'],
+    script: [text('2')],
   });
 
   const res = await postJson(baseUrl, '/api/chat', {
