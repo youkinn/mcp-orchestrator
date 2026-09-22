@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Agent, UNIFIED_SYSTEM_PROMPT } from "../../agent.js";
+import {
+  Agent,
+  CLASSIFY_SYSTEM_PROMPT,
+  FREE_CHAT_SYSTEM_PROMPT,
+} from "../../agent.js";
 import { MCPTransport } from "../../transport.js";
 import type {
   LLMConfig,
@@ -33,7 +37,7 @@ class MockTransport extends MCPTransport {
   }
 }
 
-/** 子类覆写 callModel：验证 legacy 字符串 form systemPrompt，不发网络请求 */
+/** 子类覆写 callModel：记录每轮 system 提示词与是否携带 tools，不发网络请求 */
 class RecordingAgent extends Agent {
   prompts: string[] = [];
 
@@ -46,21 +50,6 @@ class RecordingAgent extends Agent {
   }
 }
 
-const FENGYUNSANGUO_QUIZ_TOOL: MCPToolDefinition = {
-  name: "fengyunsanguo_query",
-  description: "风云三国知识问答：查题库",
-  inputSchema: {
-    type: "object",
-    properties: { text: { type: "string" } },
-  },
-};
-
-const WEATHER_TOOL: MCPToolDefinition = {
-  name: "get_weather",
-  description: "查询美国城市天气",
-  inputSchema: { type: "object" },
-};
-
 function makeConfig(provider: LLMProvider = "deepseek"): LLMConfig {
   return {
     provider,
@@ -70,21 +59,12 @@ function makeConfig(provider: LLMProvider = "deepseek"): LLMConfig {
   };
 }
 
-function toolUseResponse(
-  name: string,
-  input: Record<string, unknown>
-): ModelResponse {
-  return {
-    content: [{ type: "tool_use", id: "call_1", name, input }],
-  };
-}
-
 function textResponse(text: string): ModelResponse {
   return { content: [{ type: "text", text }] };
 }
 
 test("general 模式：options.tools=[] 时不执行任何工具，也不查 transport.listTools", async () => {
-  const transport = new MockTransport([FENGYUNSANGUO_QUIZ_TOOL]);
+  const transport = new MockTransport();
   const seenTools: MCPToolDefinition[][] = [];
 
   const modelCaller = async (
@@ -103,107 +83,24 @@ test("general 模式：options.tools=[] 时不执行任何工具，也不查 tra
   const answer = await agent.processQuery("三国是什么？");
 
   assert.equal(answer, "直接回答");
-  assert.equal(seenTools.length, 1);
-  assert.equal(seenTools[0]!.length, 0, "传给 LLM 的工具列表应为空");
+  assert.equal(seenTools.length, 2, "auto 应分分类轮 + 生成轮两次调用");
+  for (const tools of seenTools) {
+    assert.equal(tools.length, 0, "分类轮与生成轮都不应携带工具定义");
+  }
   assert.equal(transport.listToolsCount, 0, "不应走 transport.listTools()");
   assert.equal(transport.callToolCalls.length, 0, "不应执行任何工具");
 });
 
-// anthropic 用例暂注释：provider 消息格式回填基线失败（与本次改动无关），恢复时删除 continue 即可
-for (const provider of ["deepseek", "anthropic"] as const) {
-  if (provider === "anthropic") continue; // 暂不注册 anthropic 用例
-  test(`本地工具命中（${provider}）：走 localTools 而非 transport.callTool，回填符合 ${provider} 消息格式`, async () => {
-    const transport = new MockTransport([FENGYUNSANGUO_QUIZ_TOOL]);
-    let localCalls = 0;
-    const localTools = {
-      fengyunsanguo_query: async (args: Record<string, unknown>) => {
-        localCalls += 1;
-        return {
-          content: [{ type: "text", text: `题干：${String(args.text)}` }],
-        };
-      },
-    };
-
-    let modelCallCount = 0;
-    const modelCaller = async (
-      messages: any[],
-      _tools: MCPToolDefinition[]
-    ): Promise<ModelResponse> => {
-      modelCallCount += 1;
-      if (modelCallCount === 1) {
-        return toolUseResponse("fengyunsanguo_query", {
-          text: "赤壁之战发生在哪一年？",
-        });
-      }
-
-      const last = messages[messages.length - 1];
-      if (provider === ("anthropic" as "deepseek" | "anthropic")) {
-        assert.equal(last.role, "user");
-        assert.equal(last.content[0].type, "tool_result");
-        assert.equal(last.content[0].tool_use_id, "call_1");
-        assert.match(JSON.stringify(last.content[0].content), /题干/);
-      } else {
-        assert.equal(last.role, "tool");
-        assert.equal(last.tool_call_id, "call_1");
-        assert.match(last.content, /题干/);
-      }
-
-      return textResponse("赤壁之战发生在公元208年");
-    };
-
-    const agent = new Agent(transport, makeConfig(provider), {
-      localTools,
-      modelCaller,
-    });
-
-    const answer = await agent.processQuery("赤壁之战发生在哪一年？");
-
-    assert.equal(answer, "赤壁之战发生在公元208年");
-    assert.equal(localCalls, 1, "本地工具应被调用一次");
-    assert.equal(transport.callToolCalls.length, 0, "不应走 transport.callTool");
-    assert.equal(transport.listToolsCount, 1, "未显式传 tools 时应走 listTools");
-  });
-}
-
-test("未命中本地工具时回退 transport.callTool（天气链路回归）", async () => {
-  const transport = new MockTransport([WEATHER_TOOL]);
-
-  const localTools = {
-    fengyunsanguo_query: async () => ({
-      content: [{ type: "text", text: "不应被调用" }],
-    }),
-  };
-
-  let modelCallCount = 0;
-  const modelCaller = async (): Promise<ModelResponse> => {
-    modelCallCount += 1;
-    if (modelCallCount === 1) {
-      return toolUseResponse("get_weather", { city: "New York" });
-    }
-    return textResponse("纽约今日适合出行");
-  };
-
-  const agent = new Agent(transport, makeConfig(), {
-    localTools,
-    modelCaller,
-  });
-
-  const answer = await agent.processQuery("纽约天气怎么样？");
-
-  assert.equal(answer, "纽约今日适合出行");
-  assert.equal(transport.callToolCalls.length, 1);
-  assert.equal(transport.callToolCalls[0]!.name, "get_weather");
-  assert.deepEqual(transport.callToolCalls[0]!.args, { city: "New York" });
-});
-
-test("向后兼容：第 3 参字符串仍作为 systemPrompt；不传时默认统一路由提示词", async () => {
+test("向后兼容：第 3 参字符串仍作为 systemPrompt（99 自由对话轮生效）；不传时默认 FREE_CHAT_SYSTEM_PROMPT", async () => {
   const transport = new MockTransport();
 
   const legacy = new RecordingAgent(transport, makeConfig(), "你是自定义助手");
   await legacy.processQuery("你好");
-  assert.equal(legacy.prompts[0], "你是自定义助手");
+  assert.equal(legacy.prompts[0], CLASSIFY_SYSTEM_PROMPT, "分类轮固定使用分类提示，不替换自定义提示词");
+  assert.equal(legacy.prompts[1], "你是自定义助手", "第 3 参字符串作为 99 自由对话轮 systemPrompt");
 
   const defaultAgent = new RecordingAgent(transport, makeConfig());
-  await defaultAgent.processQuery("纽约天气？");
-  assert.equal(defaultAgent.prompts[0], UNIFIED_SYSTEM_PROMPT);
+  await defaultAgent.processQuery("你好");
+  assert.equal(defaultAgent.prompts[0], CLASSIFY_SYSTEM_PROMPT, "分类轮固定使用分类提示");
+  assert.equal(defaultAgent.prompts[1], FREE_CHAT_SYSTEM_PROMPT, "未传时 99 自由对话轮默认自由对话提示");
 });

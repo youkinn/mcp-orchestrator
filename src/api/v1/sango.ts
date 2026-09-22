@@ -46,7 +46,11 @@ export function createSangoApi(transport: MCPTransport): Router {
 
       let result: ToolCallResult;
       try {
-        result = await transport.callTool(SANGO_NOVEL_CHAPTER_TOOL, { chapter });
+        // bug-00019：后台原文阅读器直调（非对话链路），显式标注 caller=server / stage=admin
+        result = await transport.callTool(SANGO_NOVEL_CHAPTER_TOOL, { chapter }, {
+          caller: 'server',
+          stage: 'admin',
+        });
       } catch (error) {
         // MCP 未连接 / 子进程退出 / 协议错误等通道失败 → 503（判定顺序第 2 条）
         console.error(`Failed to call ${SANGO_NOVEL_CHAPTER_TOOL}:`, error);

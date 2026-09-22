@@ -1,84 +1,77 @@
-﻿import { test } from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
-import { UNIFIED_SYSTEM_PROMPT } from "../../agent.js";
+import {
+  CLASSIFY_SYSTEM_PROMPT,
+  FENGYUNSANGUO_DOMAIN_PROMPT,
+  FREE_CHAT_SYSTEM_PROMPT,
+  SANGO_NOVEL_DOMAIN_PROMPT,
+} from "../../agent.js";
 
-/** feat-A004 能力三 6 条不变量（定稿，措辞微调后语义不得改） */
-const NOVEL_RULES = [
-  "1. 回答前必须先调用 sango_novel_search 工具检索《三国演义》原文。",
-  "2. 只依据工具返回的原文作答：人物、情节、数字都必须能在原文里找到。",
-  "3. 人名一律以召回原文为准：原文写谁就是谁，不得按常识/记忆替换、不得补别名、不得解释成别人。",
-  "4. 原文里没有相关内容的问句，必须回答「演义中未涉及」，禁止用先验知识补全。",
-  "5. 不评价、不纠正、不对比：不得说原文写错，不得提正史/影视/游戏，不得出现「实际上是…」这类转折。",
-];
+/** feat-A011：统一提示词拆分后的不变量（接口文档 §2.3 / §2.4，逐字节照录，测试即文档） */
+const ALL_PROMPTS = [
+  CLASSIFY_SYSTEM_PROMPT,
+  SANGO_NOVEL_DOMAIN_PROMPT,
+  FENGYUNSANGUO_DOMAIN_PROMPT,
+  FREE_CHAT_SYSTEM_PROMPT,
+].join("\n");
 
-test("① prompt·能力三：6 条生成约束不变量原文照搬（第 6 条 = 引语指针格式）", () => {
+test("① 分类提示词：§2.3 原文照录，含 1/2/99 编号与兜底取向", () => {
   assert.match(
-    UNIFIED_SYSTEM_PROMPT,
-    /【能力三 ·《三国演义》原著检索（sango_novel_search）】/
+    CLASSIFY_SYSTEM_PROMPT,
+    /你是路由分类器，只输出一个数字编号，不要任何解释、标点或多余文字。/
   );
-  for (const rule of NOVEL_RULES) {
-    assert.ok(
-      UNIFIED_SYSTEM_PROMPT.includes(rule),
-      `原著检索规则原文缺失：${rule}`
-    );
-  }
+  assert.match(CLASSIFY_SYSTEM_PROMPT, /1 = 《三国演义》原著检索域/);
+  assert.match(CLASSIFY_SYSTEM_PROMPT, /2 = 风云三国题库问答域/);
+  assert.match(CLASSIFY_SYSTEM_PROMPT, /99 = 其他（自由对话）/);
+  assert.match(CLASSIFY_SYSTEM_PROMPT, /不确定时倾向选 1 或 2。/);
 });
 
-test("①.1 prompt·能力三：标题声明条数与实际规则条数一致（防漂移）", () => {
+test("② sango-novel 域提示：§2.4 原文照录，含指针 / 片段 / 兜底条款，不指示调用工具", () => {
+  assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /当前为「三国演义原著解读」场景/);
+  assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /不要再调用检索工具/);
+  assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /\[Qn\]/);
+  assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /\[片段N\]/);
+  assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /「演义中未涉及」/);
+  assert.doesNotMatch(SANGO_NOVEL_DOMAIN_PROMPT, /sango_novel_search/);
+});
+
+test("③ fengyunsanguo 域提示：§2.4 原文照录，含固定话术与未召回兜底", () => {
+  assert.match(FENGYUNSANGUO_DOMAIN_PROMPT, /当前为「风云三国题库」场景/);
+  assert.match(FENGYUNSANGUO_DOMAIN_PROMPT, /不要再调用检索工具/);
+  assert.match(FENGYUNSANGUO_DOMAIN_PROMPT, /「题库未收录该题，请换个问法」/);
+  assert.match(FENGYUNSANGUO_DOMAIN_PROMPT, /候选为空、或候选中没有含义对应的题目/);
+});
+
+test("③a 题库域候选不相关（含义不对应 → 未收录）时不得用题库外知识作答", () => {
   assert.match(
-    UNIFIED_SYSTEM_PROMPT,
-    /调了之后怎么答（以下 6 条必须严格遵守）：/
+    FENGYUNSANGUO_DOMAIN_PROMPT,
+    /候选中没有含义对应的题目.*「题库未收录该题，请换个问法」/
   );
-  for (let i = 1; i <= 6; i++) {
-    assert.ok(
-      UNIFIED_SYSTEM_PROMPT.includes(`${i}. `),
-      `能力三规则 ${i} 缺失`
-    );
-  }
+  assert.match(FENGYUNSANGUO_DOMAIN_PROMPT, /禁止用题库外的知识作答、补充或改写答案/);
 });
 
-test("② prompt·能力三调用时机：sango_novel_search 参数契约（source/query/limit 默认 5）", () => {
-  assert.match(
-    UNIFIED_SYSTEM_PROMPT,
-    /什么时候调：用户询问《三国演义》原著情节、人物、事件等需要原文依据的问题时/
-  );
-  assert.match(UNIFIED_SYSTEM_PROMPT, /sango_novel_search/);
-  assert.match(UNIFIED_SYSTEM_PROMPT, /source=sanguo-yanyi/);
-  assert.match(UNIFIED_SYSTEM_PROMPT, /query=用户白话问句/);
-  assert.match(UNIFIED_SYSTEM_PROMPT, /limit 默认 5/);
+test("④ 自由对话提示：§2.4 原文照录，自由作答不套模板不提及工具名", () => {
+  assert.match(FREE_CHAT_SYSTEM_PROMPT, /你是统一对话助手，用简体中文回答用户问题。/);
+  assert.match(FREE_CHAT_SYSTEM_PROMPT, /不加模板、不提及工具名/);
 });
 
-test("③ prompt·判断次序：三个专用域互斥命中即停，原著检索并入且不破坏既有次序锚点", () => {
-  assert.match(UNIFIED_SYSTEM_PROMPT, /【判断次序（自上而下，命中即停）】/);
-  assert.match(UNIFIED_SYSTEM_PROMPT, /三个专用域互斥，按语义命中即停/);
-  // 既有 A003 次序锚点必须原样保留（不回归）
-  const order = UNIFIED_SYSTEM_PROMPT.indexOf("【判断次序（自上而下，命中即停）】");
-  const sangoStep = UNIFIED_SYSTEM_PROMPT.indexOf("1. 意图是否命中风云三国");
-  const novelStep = UNIFIED_SYSTEM_PROMPT.indexOf(
-    "1.1 意图是否命中《三国演义》原著情节 / 人物 / 事件等需要原文依据的问句"
-  );
-  const weatherStep = UNIFIED_SYSTEM_PROMPT.indexOf("2. 意图是否命中美国境内城市");
-  const fallbackStep = UNIFIED_SYSTEM_PROMPT.indexOf("3. 以上都未命中");
-
-  assert.ok(order > -1, "缺少判断次序小节");
-  assert.ok(sangoStep > order, "题库判断应在次序小节内");
-  assert.ok(novelStep > sangoStep, "原著检索判断应排在题库之后（可放在题库之后）");
-  assert.ok(weatherStep > novelStep, "天气判断应排在原著检索之后");
-  assert.ok(fallbackStep > weatherStep, "兜底应排在三个专用域之后");
+test("⑤ 统一提示词已无天气条款：四常量不含天气能力 / 工具 / 判断次序 / 分域兜底条款", () => {
+  assert.doesNotMatch(ALL_PROMPTS, /get-forecast|get-alerts/);
+  assert.doesNotMatch(ALL_PROMPTS, /美国天气播报/);
+  assert.doesNotMatch(ALL_PROMPTS, /仅适用于美国境内/);
+  assert.doesNotMatch(ALL_PROMPTS, /非美国天气域/);
+  assert.doesNotMatch(ALL_PROMPTS, /出门必备/);
+  assert.doesNotMatch(ALL_PROMPTS, /判断次序/);
 });
 
-test("④ prompt·分域兜底：原著检索域无命中 / 校验不过 → 原文片段 + 出处 + 结论归纳", () => {
-  assert.match(UNIFIED_SYSTEM_PROMPT, /原著检索域/);
-  assert.match(UNIFIED_SYSTEM_PROMPT, /检索无命中/);
-  assert.match(UNIFIED_SYSTEM_PROMPT, /引用校验不过/);
-  assert.match(UNIFIED_SYSTEM_PROMPT, /原文片段 \+ 出处/);
-  assert.match(UNIFIED_SYSTEM_PROMPT, /结论归纳/);
-  assert.match(UNIFIED_SYSTEM_PROMPT, /按原文，斩华雄者系关羽/);
-  assert.match(UNIFIED_SYSTEM_PROMPT, /演义中未涉及/);
+test("⑥ 提示词无路由字段与多轮记忆措辞（分域规则只能写在提示词里）", () => {
+  assert.doesNotMatch(ALL_PROMPTS, /scenario|service|sessionId|HTTP/i);
+  assert.doesNotMatch(ALL_PROMPTS, /多轮|历史对话|上一轮|记住之前/);
 });
 
-test("⑤ prompt·总原则与输出格式约束同步为三项能力", () => {
-  assert.match(UNIFIED_SYSTEM_PROMPT, /你有三项专用能力/);
-  assert.match(UNIFIED_SYSTEM_PROMPT, /《三国演义》原著检索（sango_novel_search）/);
-  assert.match(UNIFIED_SYSTEM_PROMPT, /只有天气域、题库域与原著检索域有强制格式/);
+test("⑦ 提示词保持 TS 常量（不外部化）：四常量均可直接引用且非空", () => {
+  assert.ok(CLASSIFY_SYSTEM_PROMPT.length > 0);
+  assert.ok(SANGO_NOVEL_DOMAIN_PROMPT.length > 0);
+  assert.ok(FENGYUNSANGUO_DOMAIN_PROMPT.length > 0);
+  assert.ok(FREE_CHAT_SYSTEM_PROMPT.length > 0);
 });

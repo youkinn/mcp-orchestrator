@@ -1,6 +1,6 @@
 // feat-A009 编排侧诊断回填测试（story-A009-03，测试即文档）：
 // 覆盖：候选进注入视图 → injected 标记 / 被引用 → cited 标记 / 未进 top-N 不标记 /
-// 落库失败旁路不影响响应 / LLM 自主 tool-use 路径 injected=0（§3.2 预期）与 cited 正常回填 /
+// 落库失败旁路不影响响应 / auto 分类编号 1 确定性预调注入的 injected/cited 回填（原 tool-use 路径已废止）/
 // 无诊断检索不登记不落库。全部用既有 FakeModel（modelCaller）+ mock transport，不调用任何 LLM。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -67,10 +67,6 @@ function funnelField(
 
 function textResponse(text: string): ModelResponse {
   return { content: [{ type: 'text', text }] };
-}
-
-function toolUseResponse(name: string, input: Record<string, unknown>): ModelResponse {
-  return { content: [{ type: 'tool_use', id: 'call_1', name, input }] };
 }
 
 const ALIAS_TABLE = loadAliasTable('a009-not-exist'); // stub 别名表（关羽=P002、华雄=P013）
@@ -282,7 +278,7 @@ test('④ 落库失败旁路：persister 抛错不影响 /api/chat 响应与 dat
   assert.equal(data.citations.length, 1);
 });
 
-test('⑤ LLM 自主 tool-use 路径：funnel.injected=0（§3.2 预期）+ cited 正常回填', async () => {
+test('⑤ auto 分类编号 1 → 确定性预调注入：injected/cited 正常回填（原 LLM 自主 tool-use 路径已废止）', async () => {
   const recorded: Array<{ diagnostics: Record<string, unknown> }> = [];
   let callCount = 0;
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
@@ -295,8 +291,9 @@ test('⑤ LLM 自主 tool-use 路径：funnel.injected=0（§3.2 预期）+ cite
     fallbackConcluder: async () => '斩华雄者系关羽',
     modelCaller: async () => {
       callCount += 1;
+      // A011 起 auto 首轮为无 tools 分类轮：模型只输出编号，检索由服务端按编号确定性预调，不再模型自主调工具
       return callCount === 1
-        ? toolUseResponse('sango_novel_search', { source: 'sanguo-yanyi', query: '谁斩了华雄？', limit: 10 })
+        ? textResponse('1')
         : textResponse('按原文，斩华雄者系关羽。[Q1]');
     },
     retrievalDiagnosticsPersister: (_traceId, _seq, diagnostics) => {
@@ -305,15 +302,16 @@ test('⑤ LLM 自主 tool-use 路径：funnel.injected=0（§3.2 预期）+ cite
   });
 
   const data = await runWithTraceId(TRACE_ID, () => agent.processQueryData('谁斩了华雄？'));
+  assert.equal(recorded.length, 1, '分类编号 1 → 服务端确定性预调 sango_novel_search，登记一条检索诊断');
   const diag = recorded[0].diagnostics;
-  assert.equal(funnelField(diag, 'injected'), 0, 'LLM 自主 tool-use 路径无确定性注入视图 → injected=0（§3.2 预期）');
+  assert.equal(funnelField(diag, 'injected'), 3, '确定性预调注入视图 → 3 条候选全部进注入（与域锁定快路径同口径）');
   assert.equal(funnelField(diag, 'cited'), 1, 'citations 仍由总台渲染，cited 正常回填');
   const c1 = (diag.candidates as Array<{ chunkId: string; injected: boolean; cited: boolean }>).find(
     (c) => c.chunkId === CHUNK_1
   );
-  assert.equal(c1?.injected, false, 'tool-use 路径候选 injected=false');
+  assert.equal(c1?.injected, true, '确定性预调注入 → 候选 injected=true');
   assert.equal(c1?.cited, true, '被引用候选 cited=true');
-  assert.ok(data.answer.includes('云长提刀出阵'), 'tool-use 路径引用渲染正常');
+  assert.ok(data.answer.includes('云长提刀出阵'), '注入 + 引用渲染正常');
 });
 
 test('⑥ 无诊断检索：不登记调用、persister 不被触发（旁路）', async () => {

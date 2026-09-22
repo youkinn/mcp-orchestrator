@@ -358,31 +358,35 @@ test('⑦ /api/chat 携带 scenario / service / sessionId → 400，无效字段
   assert.deepEqual(agent.queries, [], '校验失败不应触达 Agent');
 });
 
-test('域名白名单：fengyunsanguo / sango-novel / weather 透传给 Agent（旧值 sango 已废弃返回 400）', async (t) => {
+test('域名白名单：fengyunsanguo / sango-novel 透传给 Agent，domain=weather 下线后 400（旧值 sango 已废弃返回 400）', async (t) => {
   const agent = new StubAgent({ reply: 'ok' });
   const baseUrl = await startServer(t, { agent });
 
-  for (const domain of ['fengyunsanguo', 'sango-novel', 'weather']) {
+  for (const domain of ['fengyunsanguo', 'sango-novel']) {
     const res = await post(baseUrl, '/api/chat', { message: '你好', domain });
     assert.equal(res.status, 200, domain);
   }
   assert.deepEqual(
     agent.domains,
-    ['fengyunsanguo', 'sango-novel', 'weather'],
+    ['fengyunsanguo', 'sango-novel'],
     'domain 应原样透传给 Agent'
   );
+
+  const weather = await post(baseUrl, '/api/chat', { message: '天气', domain: 'weather' });
+  assert.equal(weather.status, 400, 'weather 已下线，校验拒绝');
+  assertEnvelope(weather.body, 400, null, 'domain 字段仅支持 fengyunsanguo、sango-novel');
 
   const LEGACY_SANGO_VALUE = 'sango';
   const legacy = await post(baseUrl, '/api/chat', { message: '你好', domain: LEGACY_SANGO_VALUE });
   assert.equal(legacy.status, 400);
-  assertEnvelope(legacy.body, 400, null, 'domain 字段仅支持 fengyunsanguo、sango-novel、weather');
+  assertEnvelope(legacy.body, 400, null, 'domain 字段仅支持 fengyunsanguo、sango-novel');
 
   const bad = await post(baseUrl, '/api/chat', {
     message: '你好',
     domain: 'banana',
   });
   assert.equal(bad.status, 400);
-  assertEnvelope(bad.body, 400, null, 'domain 字段仅支持 fengyunsanguo、sango-novel、weather');
+  assertEnvelope(bad.body, 400, null, 'domain 字段仅支持 fengyunsanguo、sango-novel');
 });
 
 test('⑦ /api/sango/random 白名单为 message、sessionId，其余键 400', async (t) => {
@@ -478,7 +482,7 @@ test('装配回归：index.ts 工具集全部来自 MCP、L3 走 fengyunsanguo_q
   assert.match(source, /new Agent\(transport, llmConfig, \{/);
   assert.match(
     source,
-    /fengyunsanguoVectorMatcher: \(query\) => transport\.fengyunsanguo_quiz_route\(query\)/
+    /fengyunsanguoVectorMatcher: \(query\) => transport\.fengyunsanguo_quiz_route\(query, \{ caller: 'server', stage: 'l3' \}\)/
   );
   assert.match(
     source,

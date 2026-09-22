@@ -20,7 +20,8 @@ import { runWithTraceId } from './trace.js';
 const MAX_MESSAGE_LENGTH = 300;
 const CHAT_ALLOWED_KEYS = ['message', 'domain'];
 const CHAT_ALLOWED_LABEL = 'message、domain';
-const CHAT_ALLOWED_DOMAINS = ['fengyunsanguo', 'sango-novel', 'weather'];
+// feat-A011 天气下线：/api/chat 校验移除 weather（日志过滤枚举保留 weather，见 api/v1/logs.ts）
+const CHAT_ALLOWED_DOMAINS = ['fengyunsanguo', 'sango-novel'];
 const RANDOM_ALLOWED_KEYS = ['message', 'sessionId'];
 const RANDOM_ALLOWED_LABEL = 'message、sessionId';
 
@@ -319,9 +320,11 @@ export function createServer(
         const data = await enqueue(async () => {
           // 队列出队开始处理：回填 t2（未入队的校验失败请求保持 NULL）
           trySafe(() => logStore.markHandled(traceId, Date.now()));
+          // bug-00019：随机一题为后台直调（非对话链路），显式标注 caller=server / stage=admin
           const result = await transport.fengyunsanguo_quiz_command(
             parsed.value.message,
-            parsed.value.sessionId
+            parsed.value.sessionId,
+            { caller: 'server', stage: 'admin' }
           );
           return { answer: toolResultText(result), citations: [] };
         });
