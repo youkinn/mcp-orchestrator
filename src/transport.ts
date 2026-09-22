@@ -144,8 +144,8 @@ export class StdioMCPServerConnection implements MCPServerConnection {
 }
 
 /**
- * 从环境变量解析注册表配置（weather 必需、sango 与 fengyunsanguo 可缺配）：
- * - MCP_WEATHER_SCRIPT：weather 入口绝对路径（必填；缺配 → 启动层报错退出）。
+ * 从环境变量解析注册表配置（sango 与 fengyunsanguo 可缺配）：
+ * - MCP_WEATHER_SCRIPT：天气已下线（feat-A011），残留配置直接忽略、不注册。
  * - MCP_SANGO_SCRIPT：sango 入口绝对路径（可选）；缺配 → sango 不可用。
  * - MCP_FENGYUNSANGUO_SCRIPT：fengyunsanguo 入口绝对路径（可选）；缺配 → fengyunsanguo 不可用。
  * 注册表只认 MCP_*_SCRIPT 环境变量；不再支持命令行参数 / 旧 MCP_SERVER_SCRIPT。
@@ -154,14 +154,6 @@ export function resolveMCPServerConfigs(
   env: Record<string, string | undefined>
 ): MCPServerConfig[] {
   const configs: MCPServerConfig[] = [];
-  const weatherScript = env.MCP_WEATHER_SCRIPT;
-  if (weatherScript) {
-    configs.push({
-      name: WEATHER_SERVER_NAME,
-      scriptPath: weatherScript,
-      required: true,
-    });
-  }
   const sangoScript = env.MCP_SANGO_SCRIPT;
   if (sangoScript) {
     configs.push({

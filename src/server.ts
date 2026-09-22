@@ -20,7 +20,8 @@ import { runWithTraceId } from './trace.js';
 const MAX_MESSAGE_LENGTH = 300;
 const CHAT_ALLOWED_KEYS = ['message', 'domain'];
 const CHAT_ALLOWED_LABEL = 'message、domain';
-const CHAT_ALLOWED_DOMAINS = ['fengyunsanguo', 'sango-novel', 'weather'];
+// feat-A011 天气下线：/api/chat 校验移除 weather（日志过滤枚举保留 weather，见 api/v1/logs.ts）
+const CHAT_ALLOWED_DOMAINS = ['fengyunsanguo', 'sango-novel'];
 const RANDOM_ALLOWED_KEYS = ['message', 'sessionId'];
 const RANDOM_ALLOWED_LABEL = 'message、sessionId';
 

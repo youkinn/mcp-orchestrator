@@ -1,9 +1,5 @@
 ﻿import dotenv from 'dotenv';
-import {
-  MCPTransport,
-  resolveMCPServerConfigs,
-  WEATHER_SERVER_NAME,
-} from './transport.js';
+import { MCPTransport, resolveMCPServerConfigs } from './transport.js';
 import { Agent, UNIFIED_SYSTEM_PROMPT } from './agent.js';
 import { createServer } from './server.js';
 import type { LLMProvider } from './types.js';
@@ -13,14 +9,9 @@ dotenv.config();
 const port = Number(process.env.PORT || 3000);
 const allowedOrigin = process.env.WEB_ORIGIN || 'http://localhost:8001';
 
-// 多 server 注册表：weather 必需（MCP_WEATHER_SCRIPT 必填），sango 演义与 fengyunsanguo 可缺配（MCP_SANGO_SCRIPT / MCP_FENGYUNSANGUO_SCRIPT）
+// 多 server 注册表：sango 演义与 fengyunsanguo 可缺配（MCP_SANGO_SCRIPT / MCP_FENGYUNSANGUO_SCRIPT）；
+// 天气能力已下线（feat-A011），残留 MCP_WEATHER_SCRIPT 直接忽略不报错。
 const mcpServerConfigs = resolveMCPServerConfigs(process.env);
-if (!mcpServerConfigs.some((config) => config.name === WEATHER_SERVER_NAME)) {
-  console.error(
-    'Missing MCP weather server path. Set MCP_WEATHER_SCRIPT in .env (sango / fengyunsanguo optional via MCP_SANGO_SCRIPT / MCP_FENGYUNSANGUO_SCRIPT), then run npm run dev.'
-  );
-  process.exit(1);
-}
 
 function readLLMConfig() {
   const provider = (
@@ -50,7 +41,7 @@ async function main() {
 
   const llmConfig = readLLMConfig();
 
-  // 统一 Agent：工具集全部来自 MCP server（weather / sango 演义 / fengyunsanguo），总台无本地工具
+  // 统一 Agent：工具集全部来自 MCP server（sango 演义 / fengyunsanguo），总台无本地工具
   const mcpTools = await transport.listTools();
   const agent = new Agent(transport, llmConfig, {
     systemPrompt: UNIFIED_SYSTEM_PROMPT,

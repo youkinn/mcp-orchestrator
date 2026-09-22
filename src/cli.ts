@@ -1,22 +1,12 @@
 ﻿import dotenv from "dotenv";
 import * as readline from "node:readline";
-import {
-  MCPTransport,
-  resolveMCPServerConfigs,
-  WEATHER_SERVER_NAME,
-} from "./transport.js";
+import { MCPTransport, resolveMCPServerConfigs } from "./transport.js";
 import { Agent } from "./agent.js";
 import type { LLMProvider } from "./types.js";
 
 dotenv.config();
 
 const mcpServerConfigs = resolveMCPServerConfigs(process.env);
-if (!mcpServerConfigs.some((config) => config.name === WEATHER_SERVER_NAME)) {
-  console.log(
-    "Usage: set MCP_WEATHER_SCRIPT in .env (sango / fengyunsanguo optional via MCP_SANGO_SCRIPT / MCP_FENGYUNSANGUO_SCRIPT), then run npm start."
-  );
-  process.exit(1);
-}
 
 function readLLMConfig() {
   const provider = (
