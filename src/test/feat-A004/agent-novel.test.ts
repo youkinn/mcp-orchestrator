@@ -1,4 +1,4 @@
-﻿import { test } from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Agent } from "../../agent.js";
 import { MCPTransport } from "../../transport.js";
@@ -45,12 +45,6 @@ const NOVEL_TOOL: MCPToolDefinition = {
   },
 };
 
-const WEATHER_TOOL: MCPToolDefinition = {
-  name: "get-forecast",
-  description: "获取美国境内天气预报",
-  inputSchema: { type: "object" },
-};
-
 function makeConfig(provider: LLMProvider = "deepseek"): LLMConfig {
   return {
     provider,
@@ -58,13 +52,6 @@ function makeConfig(provider: LLMProvider = "deepseek"): LLMConfig {
     apiKey: "mock-key",
     apiBaseUrl: "https://mock.local",
   };
-}
-
-function toolUseResponse(
-  name: string,
-  input: Record<string, unknown>
-): ModelResponse {
-  return { content: [{ type: "tool_use", id: "call_1", name, input }] };
 }
 
 function textResponse(text: string): ModelResponse {
@@ -92,7 +79,7 @@ const RECALL_TEXT = JSON.stringify([
   },
 ]);
 
-test("domain=sango-novel 时 system 追加三国演义域提示（软性，不拦截非原著问句）", async () => {
+test("domain=sango-novel 时 system 使用三国演义域提示（不再指示调用检索工具）", async () => {
   let capturedSystem = "";
   let callCount = 0;
   const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
@@ -108,7 +95,8 @@ test("domain=sango-novel 时 system 追加三国演义域提示（软性，不�
   });
   await agent.processQuery("谁斩了华雄？", "sango-novel");
   assert.ok(capturedSystem.includes("三国演义原著解读"), "应追加三国演义域提示");
-  assert.ok(capturedSystem.includes("sango_novel_search"), "域提示应指向原著检索工具");
+  assert.ok(capturedSystem.includes("不要再调用检索工具"), "域提示明确不再调用检索工具");
+  assert.ok(!capturedSystem.includes("sango_novel_search"), "域提示不命名检索工具（feat-A011 不携带工具定义）");
 });
 
 test("① 指针合法：模型只给结论 + 指针，服务端渲染引文 + 角标，citations 下沉片段（无额外模型调用）", async () => {
@@ -116,11 +104,7 @@ test("① 指针合法：模型只给结论 + 指针，服务端渲染引文 + �
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
     return modelCallCount === 1
-      ? toolUseResponse("sango_novel_search", {
-          source: "sanguo-yanyi",
-          query: "谁斩了华雄？",
-          limit: 5,
-        })
+      ? textResponse("1")
       : textResponse("斩华雄者系关羽，原文见[Q1]。");
   };
 
@@ -151,11 +135,7 @@ test("② 断言人物不在召回原文（曹操）：丢弃模型输出，输�
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
     return modelCallCount === 1
-      ? toolUseResponse("sango_novel_search", {
-          source: "sanguo-yanyi",
-          query: "谁斩了华雄？",
-          limit: 5,
-        })
+      ? textResponse("1")
       : textResponse("曹操斩了华雄。");
   };
 
@@ -186,11 +166,7 @@ test("②.1 指针非法（不在本次注入集合内）：丢弃模型输出�
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
     return modelCallCount === 1
-      ? toolUseResponse("sango_novel_search", {
-          source: "sanguo-yanyi",
-          query: "谁斩了华雄？",
-          limit: 5,
-        })
+      ? textResponse("1")
       : textResponse("斩华雄者系关羽，原文见[Q9]。");
   };
 
@@ -223,11 +199,7 @@ test("②.2 缺指针（结论无引用）：丢弃模型输出，走兜底", as
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
     return modelCallCount === 1
-      ? toolUseResponse("sango_novel_search", {
-          source: "sanguo-yanyi",
-          query: "谁斩了华雄？",
-          limit: 5,
-        })
+      ? textResponse("1")
       : textResponse("斩华雄者系关羽。");
   };
 
@@ -261,11 +233,7 @@ test("②.3 长引语安全网：模型违规抄写超 30 字引语被丢弃，�
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
     return modelCallCount === 1
-      ? toolUseResponse("sango_novel_search", {
-          source: "sanguo-yanyi",
-          query: "谁斩了华雄？",
-          limit: 5,
-        })
+      ? textResponse("1")
       : textResponse(`斩华雄者系关羽，曰「${longQuote}」[Q1]。`);
   };
 
@@ -326,11 +294,7 @@ test("②.4 注入编号连续（bug-00009）：窗口裁掉证据段引语时�
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
     return modelCallCount === 1
-      ? toolUseResponse("sango_novel_search", {
-          source: "sanguo-yanyi",
-          query: "华雄是怎么死的",
-          limit: 5,
-        })
+      ? textResponse("1")
       : textResponse("关羽（云长）温酒斩华雄。[Q2]");
   };
 
@@ -367,11 +331,7 @@ test("③ 检索无命中：回答「演义中未涉及」，不做归纳生成"
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
     return modelCallCount === 1
-      ? toolUseResponse("sango_novel_search", {
-          source: "sanguo-yanyi",
-          query: "诸葛亮借东风后去了哪？",
-          limit: 5,
-        })
+      ? textResponse("1")
       : textResponse("借东风后诸葛亮回了夏口。");
   };
 
@@ -391,33 +351,26 @@ test("③ 检索无命中：回答「演义中未涉及」，不做归纳生成"
   assert.equal(modelCallCount, 2, "无命中不应触发提取/NER/结论模型调用");
 });
 
-test("④ 未调原著工具的其他域：不触发引用校验，无额外模型调用", async () => {
+test("④ 自由对话兜底：分类 99 无预调不触发引用校验，citations 恒 []", async () => {
   let modelCallCount = 0;
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
     return modelCallCount === 1
-      ? toolUseResponse("get-forecast", { latitude: 40.7, longitude: -74 })
+      ? textResponse("99")
       : textResponse("纽约今日适合出行。");
   };
 
-  const agent = new Agent(new MockTransport([WEATHER_TOOL]), makeConfig(), {
-    tools: [WEATHER_TOOL],
-    modelCaller,
-  });
+  const agent = new Agent(new MockTransport(), makeConfig(), { modelCaller });
 
   const data = await agent.processQueryData("纽约天气怎么样？");
   assert.equal(data.answer, "纽约今日适合出行。");
   assert.deepEqual(data.citations, [], "未调原著工具的其他域 citations 恒 []");
-  assert.equal(modelCallCount, 2, "天气域不应触发引用校验的额外模型调用");
+  assert.equal(modelCallCount, 2, "自由对话域不应触发引用校验的额外模型调用");
 });
 
 test("⑤ 默认链路（本地别名表扫描 + 兜底结论）：校验不过走兜底", async () => {
   const responses = [
-    toolUseResponse("sango_novel_search", {
-      source: "sanguo-yanyi",
-      query: "谁斩了华雄？",
-      limit: 5,
-    }),
+    textResponse("1"),
     textResponse("许褚斩华雄。"), // 主问答答案（格式不符 + 许褚不在召回 → 触发兜底）
     textResponse("按原文，斩华雄者系关羽"), // 兜底结论（本地扫描，无提取/NER 模型调用）
   ];
@@ -560,11 +513,7 @@ test("⑦ 注入上限放宽到 10 + 叙述段指针（bug-00009 张飞题）：
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
     return modelCallCount === 1
-      ? toolUseResponse("sango_novel_search", {
-          source: "sanguo-yanyi",
-          query: "张飞怎么死的",
-          limit: 5,
-        })
+      ? textResponse("1")
       : textResponse("张飞被范疆、张达刺死。[片段5]");
   };
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
