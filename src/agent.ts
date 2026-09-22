@@ -43,6 +43,26 @@ export type { ChatData } from "./citation.js";
 // feat-A011：auto 首轮从「带工具自主决策（routing）」改为「无 tools 轻量分类（classify）」，枚举同步
 type LlmStage = "classify" | "generation";
 
+interface ModelCallOptions {
+  disableThinking?: boolean;
+  temperature?: number;
+}
+
+/** bug-00018 空答案判定：无文本正文（content 为空），或 finish_reason=length（思考不收敛 / 截断）。
+ * 其余终止原因（stop 等）不算空答案，正常走既有路径。 */
+function isEmptyAnswer(
+  content: ModelResponse["content"],
+  finishReason: string | null
+): boolean {
+  const hasText = content.some(
+    (item) =>
+      item.type === "text" &&
+      typeof item.text === "string" &&
+      item.text.trim().length > 0
+  );
+  return !hasText || finishReason === "length";
+}
+
 function summarizeJson(value: unknown, max = 8000): string {
   let text: string;
   try {
@@ -318,11 +338,13 @@ export class Agent {
   protected async callModel(
     messages: any[],
     tools: MCPToolDefinition[],
-    stage?: LlmStage
+    stage?: LlmStage,
+    options?: ModelCallOptions
   ): Promise<ModelResponse> {
     if (!this.openai) {
       throw new Error("OpenAI-compatible client not initialized");
     }
+    const openai = this.openai;
 
     // feat-A007 埋点：仅请求上下文（getTraceId 非空）且显式指定 stage 时记录，其余路径零开销
     const traceId = getTraceId();
@@ -330,91 +352,154 @@ export class Agent {
       stage != null && typeof traceId === "string" && traceId !== ""
         ? { traceId, stage }
         : null;
-    const requestAt = Date.now();
     const requestSummary = logContext ? summarizeJson(messages) : "";
 
-    console.error('[callModel]', 'messages:', messages);
-    console.time('callModel');
-    let response: Awaited<ReturnType<typeof this.openai.chat.completions.create>>;
-    try {
-      response = await this.openai.chat.completions.create({
-        model: this.config.model,
-        messages,
-        tools: this.getOpenAITools(tools),
-        // bug-00018：本模型为思考模型，reasoning_tokens 计入 completion_tokens，max_tokens 同时限制
-        // 「思考 + 正文」；思考不收敛时正文恒为空（放大 max_tokens 无效）。各调用点是否关闭思考
-        // 的口径见 bug-00018，调用点均有对应备注。
-        max_tokens: 1000,
-        temperature: 0.7,
-      });
-    } catch (error) {
-      if (logContext) {
-        try {
-          appendLlmCall(logContext.traceId, {
-            stage: logContext.stage,
-            model: this.config.model,
-            requestAt,
-            responseAt: null,
-            requestSummary,
-            responseSummary: null,
-            status: "failed",
-            errorMessage: toErrorMessage(error),
+    /** 单次请求（参数化温度 / 思考开关）：请求异常记 failed 并上抛，成功返回归一化结果与元信息 */
+    const callOnce = async (
+      callOptions: ModelCallOptions
+    ): Promise<{
+      requestAt: number;
+      response: OpenAI.Chat.Completions.ChatCompletion;
+      message: any;
+      normalizedContent: any[];
+      reasoningContent: string | null;
+      finishReason: string | null;
+    }> => {
+      const requestAt = Date.now();
+      let response: OpenAI.Chat.Completions.ChatCompletion;
+      try {
+        const params: Record<string, unknown> = {
+          model: this.config.model,
+          messages,
+          tools: this.getOpenAITools(tools),
+          // bug-00018：本模型为思考模型，reasoning_tokens 计入 completion_tokens，max_tokens 同时限制
+          // 「思考 + 正文」；思考不收敛时正文恒为空（放大 max_tokens 无效）。各调用点是否关闭思考
+          // 的口径见 bug-00018，调用点均有对应备注。
+          max_tokens: 1000,
+          temperature: callOptions.temperature ?? 0.7,
+        };
+        if (callOptions.disableThinking) {
+          // bug-00018：provider 实测生效参数（OpenAI SDK 类型未收录，按扩展字段透传）
+          params.thinking = { type: "disabled" };
+        }
+        response = (await openai.chat.completions.create(
+          params as any
+        )) as OpenAI.Chat.Completions.ChatCompletion;
+      } catch (error) {
+        if (logContext) {
+          try {
+            appendLlmCall(logContext.traceId, {
+              stage: logContext.stage,
+              model: this.config.model,
+              requestAt,
+              responseAt: null,
+              requestSummary,
+              responseSummary: null,
+              status: "failed",
+              errorMessage: toErrorMessage(error),
+            });
+          } catch {
+            // 旁路：埋点失败静默，绝不影响 LLM 编排
+          }
+        }
+        throw error;
+      }
+
+      const message = response.choices[0]?.message;
+      const normalizedContent: any[] = [];
+      const reasoningContent =
+        typeof (message as any)?.reasoning_content === "string"
+          ? (message as any).reasoning_content
+          : null;
+
+      if (message?.content) {
+        normalizedContent.push(...this.normalizeOpenAIMessage(message));
+      }
+
+      if (message?.tool_calls?.length) {
+        for (const toolCall of message.tool_calls as any[]) {
+          const toolName = toolCall.function.name;
+          const toolArgs = JSON.parse(toolCall.function.arguments || "{}");
+          normalizedContent.push({
+            type: "tool_use",
+            id: toolCall.id,
+            name: toolName,
+            input: toolArgs,
           });
-        } catch {
-          // 旁路：埋点失败静默，绝不影响 LLM 编排
         }
       }
-      throw error;
-    }
-    console.timeEnd('callModel');
 
-    const message = response.choices[0]?.message;
-    const normalizedContent: any[] = [];
-    const reasoningContent =
-      typeof (message as any)?.reasoning_content === "string"
-        ? (message as any).reasoning_content
-        : null;
+      return {
+        requestAt,
+        response,
+        message,
+        normalizedContent,
+        reasoningContent,
+        finishReason: response.choices?.[0]?.finish_reason ?? null,
+      };
+    };
 
-    if (message?.content) {
-      normalizedContent.push(...this.normalizeOpenAIMessage(message));
-    }
-
-    if (message?.tool_calls?.length) {
-      for (const toolCall of message.tool_calls as any[]) {
-        const toolName = toolCall.function.name;
-        const toolArgs = JSON.parse(toolCall.function.arguments || "{}");
-        normalizedContent.push({
-          type: "tool_use",
-          id: toolCall.id,
-          name: toolName,
-          input: toolArgs,
-        });
+    /** 落库一条 LLM 调用明细（success / failed + error_message），旁路：埋点失败静默 */
+    const recordCall = (
+      call: Awaited<ReturnType<typeof callOnce>>,
+      status: "success" | "failed",
+      errorMessage: string
+    ): void => {
+      if (!logContext) {
+        return;
       }
-    }
-
-    if (logContext) {
       try {
         appendLlmCall(logContext.traceId, {
           stage: logContext.stage,
           model: this.config.model,
-          requestAt,
+          requestAt: call.requestAt,
           responseAt: Date.now(),
           requestSummary,
-          responseSummary: summarizeJson(normalizedContent),
-          toolCalls: summarizeToolCalls(message?.tool_calls),
-          promptTokens: response.usage?.prompt_tokens ?? null,
-          completionTokens: response.usage?.completion_tokens ?? null,
-          cachedTokens: response.usage?.prompt_tokens_details?.cached_tokens ?? null,
-          finishReason: response.choices?.[0]?.finish_reason ?? null,
-          status: "success",
-          errorMessage: "",
+          responseSummary: summarizeJson(call.normalizedContent),
+          toolCalls: summarizeToolCalls(call.message?.tool_calls),
+          promptTokens: call.response.usage?.prompt_tokens ?? null,
+          completionTokens: call.response.usage?.completion_tokens ?? null,
+          cachedTokens:
+            call.response.usage?.prompt_tokens_details?.cached_tokens ?? null,
+          finishReason: call.finishReason,
+          status,
+          errorMessage,
         });
       } catch {
         // 旁路：埋点失败静默，绝不影响 LLM 编排
       }
+    };
+
+    // 首轮：按调用点口径（options 缺省 = 保留思考 + temperature 0.7）
+    const first = await callOnce({
+      disableThinking: options?.disableThinking,
+      temperature: options?.temperature,
+    });
+    if (!isEmptyAnswer(first.normalizedContent, first.finishReason)) {
+      recordCall(first, "success", "");
+      return {
+        content: first.normalizedContent,
+        reasoningContent: first.reasoningContent,
+      };
     }
 
-    return { content: normalizedContent, reasoningContent };
+    // bug-00018 空答案兜底：content 为空 / finish_reason=length → 变参重试 1 次
+    // （temperature=0 必做；该轮若开着思考则一并关闭）。超时 / 限流 / 工具不可用不重试（异常路径直接上抛）。
+    recordCall(
+      first,
+      "failed",
+      `空答案：content 为空 / finish_reason=${first.finishReason}`
+    );
+    const retry = await callOnce({ disableThinking: true, temperature: 0 });
+    if (isEmptyAnswer(retry.normalizedContent, retry.finishReason)) {
+      recordCall(retry, "failed", "空答案：变参重试后仍为空");
+      throw new Error("模型返回空答案，请稍后重试");
+    }
+    recordCall(retry, "success", "");
+    return {
+      content: retry.normalizedContent,
+      reasoningContent: retry.reasoningContent,
+    };
   }
 
   /** 上报的能力 = 模型实际可见的能力：与 processQuery 的 availableTools 同源 */
@@ -468,12 +553,13 @@ export class Agent {
   private invokeModel(
     messages: any[],
     tools: MCPToolDefinition[],
-    stage?: LlmStage
+    stage?: LlmStage,
+    options?: ModelCallOptions
   ): Promise<ModelResponse> {
     if (this.options.modelCaller) {
       return this.options.modelCaller(messages, tools);
     }
-    return this.callModel(messages, tools, stage);
+    return this.callModel(messages, tools, stage, options);
   }
 
   /** 工具返回的纯文本片段（空文本不计入） */
@@ -565,7 +651,8 @@ export class Agent {
         { role: "user", content },
       ],
       [],
-      "generation"
+      "generation",
+      { disableThinking: true }
     );
     return response.content
       .filter((item) => item.type === "text")
@@ -827,7 +914,8 @@ export class Agent {
             { role: "user", content: userContent },
           ],
           [],
-          "classify"
+          "classify",
+          { disableThinking: true }
         );
         const routeId = parseClassifyRouteId(classifyResponse.content);
         if (routeId === CLASSIFY_ROUTE_IDS.sangoNovel) {
@@ -862,7 +950,12 @@ export class Agent {
     }
     // bug-00018 口径：有注入（域锁定快路径 / auto 分到 1、2）→ 任务已确定、输出已约束 → 关闭思考；
     // 仅「无注入的自由模式 99」保留思考（模型需自行作答）。
-    const currentResponse = await this.invokeModel(messages, [], "generation");
+    const currentResponse = await this.invokeModel(
+      messages,
+      [],
+      "generation",
+      resolvedContent ? { disableThinking: true } : undefined
+    );
 
     let answer = currentResponse.content
       .filter((item) => item.type === "text")
