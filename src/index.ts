@@ -46,7 +46,8 @@ async function main() {
   const agent = new Agent(transport, llmConfig, {
     tools: mcpTools,
     // L3：无 domain 且 L2 未命中时，先调 fengyunsanguo server 做题库高置信识别（可选 server，缺配/失败不命中）
-    fengyunsanguoVectorMatcher: (query) => transport.fengyunsanguo_quiz_route(query),
+    // bug-00019：L3 预检由服务端发起，显式标注调用方 + 发起阶段（落工具调用明细）
+    fengyunsanguoVectorMatcher: (query) => transport.fengyunsanguo_quiz_route(query, { caller: 'server', stage: 'l3' }),
   });
 
   const app = createServer(agent, transport, { port, allowedOrigin });

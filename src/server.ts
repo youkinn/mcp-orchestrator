@@ -320,9 +320,11 @@ export function createServer(
         const data = await enqueue(async () => {
           // 队列出队开始处理：回填 t2（未入队的校验失败请求保持 NULL）
           trySafe(() => logStore.markHandled(traceId, Date.now()));
+          // bug-00019：随机一题为后台直调（非对话链路），显式标注 caller=server / stage=admin
           const result = await transport.fengyunsanguo_quiz_command(
             parsed.value.message,
-            parsed.value.sessionId
+            parsed.value.sessionId,
+            { caller: 'server', stage: 'admin' }
           );
           return { answer: toolResultText(result), citations: [] };
         });

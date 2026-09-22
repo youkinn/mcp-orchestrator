@@ -7,7 +7,7 @@ import {
   type ModelResponse,
   type ToolCallResult,
 } from "./types.js";
-import type { MCPTransport } from "./transport.js";
+import type { MCPTransport, ToolCallOrigin } from "./transport.js";
 import { getTraceId } from "./trace.js";
 import { appendLlmCall, truncate } from "./storage/logs.js";
 import {
@@ -519,35 +519,46 @@ export class Agent {
       });
   }
 
-  /** MCP 工具失败包装为 ToolExecutionError（server.ts 据此判 503）；本地工具失败原样上抛 */
+  /** MCP 工具失败包装为 ToolExecutionError（server.ts 据此判 503）；本地工具失败原样上抛。
+   * bug-00019：origin（调用方 + 发起阶段）必填，由调用点显式指定并透传给 transport 落工具明细。
+   * 值域：caller ∈ {model, server}；stage ∈ {l3, fastpath, classify, generation}。
+   * 其中 { caller: "model", stage: "generation" }（模型自主调用）在 feat-A011 删除 tool-use 循环后已无产生者，
+   * 值域保留作历史口径（当前全部调用点均为服务端预调）。 */
   private async callTransportTool(
     toolName: string,
-    toolArgs: Record<string, unknown>
+    toolArgs: Record<string, unknown>,
+    origin: ToolCallOrigin
   ): Promise<ToolCallResult> {
     try {
-      return await this.transport.callTool(toolName, toolArgs);
+      return await this.transport.callTool(toolName, toolArgs, origin);
     } catch (error) {
       throw new ToolExecutionError(toolName, { cause: error });
     }
   }
 
   /** sango-novel 快路径：直接调检索工具（不经模型决策）；测试可用 localTools 注入 */
-  private async searchNovel(query: string): Promise<ToolCallResult> {
+  private async searchNovel(
+    query: string,
+    origin: ToolCallOrigin
+  ): Promise<ToolCallResult> {
     // 返回收缩到 10 条（候选人来自 mcp-server 侧 50 路候选 + 重排），与 INJECT_FRAGMENT_LIMIT 联动
     const args = { source: "sanguo-yanyi", query, limit: 10 };
     const localTool = this.options.localTools?.[SANGO_NOVEL_SEARCH_TOOL];
     return localTool
       ? await localTool(args)
-      : await this.callTransportTool(SANGO_NOVEL_SEARCH_TOOL, args);
+      : await this.callTransportTool(SANGO_NOVEL_SEARCH_TOOL, args, origin);
   }
 
   /** fengyunsanguo 域快路径：直接调题库工具（不经模型决策）；测试可用 localTools 注入 */
-  private async searchFengyunsanguoQuestions(query: string): Promise<ToolCallResult> {
+  private async searchFengyunsanguoQuestions(
+    query: string,
+    origin: ToolCallOrigin
+  ): Promise<ToolCallResult> {
     const args = { text: query };
     const localTool = this.options.localTools?.[FENGYUNSANGUO_QUERY_TOOL];
     return localTool
       ? await localTool(args)
-      : await this.callTransportTool(FENGYUNSANGUO_QUERY_TOOL, args);
+      : await this.callTransportTool(FENGYUNSANGUO_QUERY_TOOL, args, origin);
   }
 
   private invokeModel(
@@ -800,9 +811,11 @@ export class Agent {
     return "auto";
   }
 
+  /** bug-00019：origin 必填——域内快路径预调均由服务端发起，发起阶段由调用点显式指定（不做推断）。 */
   private async resolveUserContent(
     query: string,
-    domain?: string,
+    domain: string | undefined,
+    origin: ToolCallOrigin,
     tracking?: NovelTracking
   ): Promise<{
     result: string;
@@ -811,7 +824,7 @@ export class Agent {
   }> {
     if (domain && DOMAIN_ROUTES[domain]) {
       if (domain === DOMAIN_ROUTES["sango-novel"]) {
-        const result = await this.searchNovel(query);
+        const result = await this.searchNovel(query, origin);
         const { fragments, chunkIds } = this.collectRecallFragmentsWithChunkIds(result, {
           source: "sanguo-yanyi",
           query,
@@ -849,7 +862,7 @@ export class Agent {
           novelSearched: true,
         };
       } else if (domain === DOMAIN_ROUTES["fengyunsanguo"]) {
-        const result = await this.searchFengyunsanguoQuestions(query);
+        const result = await this.searchFengyunsanguoQuestions(query, origin);
         return { result: this.collectTexts(result).join("\n") };
       }
     }
@@ -886,6 +899,8 @@ export class Agent {
       const result = await this.resolveUserContent(
         query,
         lockedRoute,
+        // bug-00019：L1 前端标签 / L2 关键词锁域后的域内快路径预调 → fastpath
+        { caller: "server", stage: "fastpath" },
         tracking
       );
       resolvedContent = result.result;
@@ -900,7 +915,9 @@ export class Agent {
       if (fengyunsanguoHit === true || fengyunsanguoHit === "fengyunsanguo") {
         const { result } = await this.resolveUserContent(
           query,
-          DOMAIN_ROUTES.fengyunsanguo
+          DOMAIN_ROUTES.fengyunsanguo,
+          // bug-00019：L3 命中后的题库预调 → l3
+          { caller: "server", stage: "l3" }
         );
         resolvedContent = result;
         systemPrompt = DOMAIN_PROMPTS.fengyunsanguo;
@@ -922,6 +939,8 @@ export class Agent {
           const result = await this.resolveUserContent(
             query,
             DOMAIN_ROUTES["sango-novel"],
+            // bug-00019：分类轮判定 1（原著）后的预调 → classify
+            { caller: "server", stage: "classify" },
             tracking
           );
           resolvedContent = result.result;
@@ -931,7 +950,9 @@ export class Agent {
         } else if (routeId === CLASSIFY_ROUTE_IDS.fengyunsanguo) {
           const { result } = await this.resolveUserContent(
             query,
-            DOMAIN_ROUTES.fengyunsanguo
+            DOMAIN_ROUTES.fengyunsanguo,
+            // bug-00019：分类轮判定 2（题库）后的预调 → classify
+            { caller: "server", stage: "classify" }
           );
           resolvedContent = result;
           systemPrompt = DOMAIN_PROMPTS.fengyunsanguo;

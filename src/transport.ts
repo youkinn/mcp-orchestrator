@@ -6,7 +6,13 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { ToolExecutionError, type MCPToolDefinition, type ToolCallResult } from "./types.js";
 import { getTraceId } from "./trace.js";
-import { getLogStore, truncate, type LogStore } from "./storage/logs.js";
+import {
+  getLogStore,
+  truncate,
+  type LogStore,
+  type ToolCallCaller,
+  type ToolCallStage,
+} from "./storage/logs.js";
 
 // feat-A007 工具明细埋点辅助（旁路静默）：序列化失败兜底 String，统一 8000 截断
 function summarizeJson(value: unknown, max = 8000): string {
@@ -69,6 +75,16 @@ export const FENGYUNSANGUO_SERVER_NAME = "fengyunsanguo";
 export const FENGYUNSANGUO_QUERY_TOOL = "fengyunsanguo_query";
 export const FENGYUNSANGUO_QUIZ_COMMAND_TOOL = "fengyunsanguo_quiz_command";
 export const FENGYUNSANGUO_QUIZ_ROUTE_TOOL = "fengyunsanguo_quiz_route";
+
+/**
+ * bug-00019：工具调用来源（调用方 + 发起阶段）。由调用点显式传值，不做推断 / 默认兜底；
+ * 调用点不传时工具调用明细的 caller / stage 落 NULL，与历史行同口径。
+ */
+export interface ToolCallOrigin {
+  caller: ToolCallCaller;
+  /** 发起阶段：ToolCallStage 值域（单一来源见 storage/logs.ts，拼错即编译失败） */
+  stage: ToolCallStage;
+}
 
 /** 单个 MCP server 的连接抽象：默认为 SDK Client + stdio 子进程，测试可注入假实现 */
 export interface MCPServerConnection {
@@ -239,10 +255,14 @@ export class MCPTransport {
     return merged;
   }
 
-  /** 按工具名路由到归属 server 转发；未知工具名报错（agent 包装为 ToolExecutionError → 503） */
+  /**
+   * 按工具名路由到归属 server 转发；未知工具名报错（agent 包装为 ToolExecutionError → 503）。
+   * bug-00019：origin（调用方 + 发起阶段）由调用点显式传入，成功 / 失败两条埋点路径都写入工具明细。
+   */
   async callTool(
     name: string,
-    args: Record<string, unknown>
+    args: Record<string, unknown>,
+    origin?: ToolCallOrigin
   ): Promise<ToolCallResult> {
     const serverName = await this.resolveServerForTool(name);
     const connection = this.servers.get(serverName);
@@ -274,6 +294,8 @@ export class MCPTransport {
             errorMessage: toolFailed
               ? extractToolError(result) || "MCP 工具返回错误（isError=true）"
               : "",
+            caller: origin?.caller ?? null,
+            stage: origin?.stage ?? null,
           });
           // feat-A009：sango 回传诊断时，把工具明细行号透传给 agent（供其收尾回填 injected/cited 后落库）
           if (
@@ -300,6 +322,8 @@ export class MCPTransport {
             resultSummary: null,
             status: "failed",
             errorMessage: toErrorMessage(error),
+            caller: origin?.caller ?? null,
+            stage: origin?.stage ?? null,
           });
         } catch {
           // 旁路：埋点失败静默，绝不影响工具调用
@@ -312,12 +336,18 @@ export class MCPTransport {
   /**
    * L3 题库自动路由识别：薄转发 fengyunsanguo server 的 fengyunsanguo_quiz_route。
    * quiz 为可选 server，缺配 / 调用失败 → 返回 null（不命中），保持无 domain 自动路由行为不变，其余功能不受影响。
+   * bug-00019：L3 预检由服务端发起，调用方（index.ts 装配）显式传 origin（caller=server, stage=l3）。
    */
   async fengyunsanguo_quiz_route(
-    text: string
+    text: string,
+    origin?: ToolCallOrigin
   ): Promise<boolean | null> {
     try {
-      const result = await this.callTool(FENGYUNSANGUO_QUIZ_ROUTE_TOOL, { text });
+      const result = await this.callTool(
+        FENGYUNSANGUO_QUIZ_ROUTE_TOOL,
+        { text },
+        origin
+      );
       return this.parseQuizRouteResult(result);
     } catch (error) {
       console.warn(
@@ -331,17 +361,19 @@ export class MCPTransport {
   /**
    * 随机一题状态机整体下沉：薄转发 fengyunsanguo server 的 fengyunsanguo_quiz_command。
    * quiz 为可选 server，缺配 / 调用失败 → ToolExecutionError（server.ts 据此判 503）。
+   * bug-00019：后台随机一题直调（非对话链路），调用方（server.ts）显式传 origin（caller=server, stage=admin）。
    */
   async fengyunsanguo_quiz_command(
     message: string,
-    sessionId?: string
+    sessionId?: string,
+    origin?: ToolCallOrigin
   ): Promise<ToolCallResult> {
     const args: Record<string, unknown> = { message };
     if (sessionId) {
       args.sessionId = sessionId;
     }
     try {
-      return await this.callTool(FENGYUNSANGUO_QUIZ_COMMAND_TOOL, args);
+      return await this.callTool(FENGYUNSANGUO_QUIZ_COMMAND_TOOL, args, origin);
     } catch (error) {
       throw new ToolExecutionError(FENGYUNSANGUO_QUIZ_COMMAND_TOOL, { cause: error });
     }

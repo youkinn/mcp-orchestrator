@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS tool_call_logs (
   result_summary   TEXT,
   status           TEXT NOT NULL,
   error_message    TEXT NOT NULL DEFAULT '',
+  caller           TEXT,
+  stage            TEXT,
   PRIMARY KEY (trace_id, seq)
 );
 CREATE TABLE IF NOT EXISTS tool_retrieval_logs (
@@ -103,6 +105,15 @@ export interface LlmCallPayload {
   errorMessage?: string;
 }
 
+/** bug-00019：工具调用发起方（model=模型自主调用；server=服务端预调）；历史行 / 未显式传值为 null */
+export type ToolCallCaller = "model" | "server";
+
+/** bug-00019：工具调用发起阶段（值域单一来源——调用点拼错阶段名即编译失败）：
+ * l3 = L3 预检 / L3 命中后的题库预调；fastpath = L1 标签 / L2 关键词锁域后的域内快路径预调；
+ * classify = 分类轮判定后的预调；generation = 生成轮模型自主调用（feat-A011 删除 tool-use 循环后无产生者，保留口径）；
+ * admin = 后台 / 管理接口直调（非对话链路）。历史行 / 未显式传值为 null。 */
+export type ToolCallStage = "l3" | "fastpath" | "classify" | "generation" | "admin";
+
 export interface ToolCallPayload {
   seq?: number | null;
   mcpServer: string;
@@ -113,6 +124,10 @@ export interface ToolCallPayload {
   resultSummary?: string | null;
   status: 'success' | 'failed';
   errorMessage?: string;
+  /** bug-00019：调用方（model=模型自主调用 / server=服务端预调）；缺省不传 → null，不做推断 */
+  caller?: ToolCallCaller | null;
+  /** bug-00019：发起阶段（ToolCallStage 值域）；缺省不传 → null */
+  stage?: ToolCallStage | null;
 }
 
 export interface ListQuery {
@@ -193,6 +208,10 @@ export interface ToolCallLog {
   resultSummary: string | null;
   status: 'success' | 'failed';
   errorMessage: string;
+  /** bug-00019：调用方（model / server）；无值（历史行 / 未显式传值）为 null */
+  caller: ToolCallCaller | null;
+  /** bug-00019：发起阶段（ToolCallStage 值域）；无值为 null */
+  stage: ToolCallStage | null;
   /** feat-A009：解析后的检索诊断对象；无诊断 / 旁路丢失 / 解析失败为 null */
   diagnostics: Record<string, unknown> | null;
 }
@@ -325,6 +344,8 @@ interface ToolLogRow {
   result_summary: string | null;
   status: string;
   error_message: string;
+  caller: string | null;
+  stage: string | null;
 }
 
 interface ListRow extends RequestLogRow {
@@ -446,6 +467,15 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
     } catch {
       // 旁路：duplicate column 等忽略（新库 / 已迁移库）
     }
+    // bug-00019 旧库迁移：既有 tool_call_logs 缺 caller（调用方）/ stage（发起阶段）两列，补列；
+    // 历史行保持 NULL 不回填（无法事后推断发起方）。新库建表已含两列，重复执行忽略，幂等。
+    for (const column of ["caller", "stage"]) {
+      try {
+        db.exec(`ALTER TABLE tool_call_logs ADD COLUMN ${column} TEXT`);
+      } catch {
+        // 旁路：duplicate column 等忽略（新库 / 已迁移库）
+      }
+    }
   } catch (error) {
     console.error('Failed to initialize log store (logging disabled):', error);
     return createNoopStore();
@@ -487,8 +517,8 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   const insertToolCallWithSeqStmt = db.prepare(`
     INSERT OR IGNORE INTO tool_call_logs
       (trace_id, seq, mcp_server, tool_name, args_summary, call_sent_at,
-       call_returned_at, result_summary, status, error_message)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       call_returned_at, result_summary, status, error_message, caller, stage)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const selectMaxToolSeqStmt = db.prepare(
     `SELECT COALESCE(MAX(seq), 0) AS m FROM tool_call_logs WHERE trace_id = ?`
@@ -674,6 +704,8 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           truncate(payload.resultSummary ?? null) ?? null,
           payload.status,
           payload.errorMessage ?? '',
+          payload.caller ?? null,
+          payload.stage ?? null,
         ];
         insertToolCallWithSeqStmt.run(traceId, seq, ...base);
       });
@@ -867,6 +899,8 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
             resultSummary: tool.result_summary,
             status: tool.status as 'success' | 'failed',
             errorMessage: tool.error_message,
+            caller: tool.caller as ToolCallCaller | null,
+            stage: tool.stage as ToolCallStage | null,
             diagnostics,
           };
         }
