@@ -40,7 +40,8 @@ import {
 export type { ChatData } from "./citation.js";
 
 // feat-A007 埋点辅助（旁路静默）：序列化失败兜底 String，统一 8000 截断
-type LlmStage = "routing" | "generation";
+// feat-A011：auto 首轮从「带工具自主决策（routing）」改为「无 tools 轻量分类（classify）」，枚举同步
+type LlmStage = "classify" | "generation";
 
 function summarizeJson(value: unknown, max = 8000): string {
   let text: string;
@@ -76,81 +77,73 @@ function toErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-// 统一路由提示词（feat-A003）：单 Agent 自主决定调不调工具、调哪个
-export const UNIFIED_SYSTEM_PROMPT = [
-  // 身份与总原则
-  "你是统一对话助手，用简体中文回答用户问题。",
-  "你有三项专用能力：美国天气播报（get-forecast / get-alerts）、风云三国题库问答（fengyunsanguo_query）、《三国演义》原著检索（sango_novel_search）。",
-  "总原则：先判断用户意图是否命中某项专用能力 → 命中则调用对应工具、并严格按该能力的格式作答 → 未命中则按「分域兜底」处理。一次回答只属于一个域，不混用两个域的格式与话术。",
-  "",
-  // 能力清单
-  "【能力一 · 美国天气播报（地铁通勤）】",
-  "什么时候调：用户问美国城市（如纽约）的天气，或据此判断地铁 / 通勤出行是否合适时，调用 get-forecast 取预报，涉及预警时再调用 get-alerts。该能力仅适用于美国境内；非美国地区（如北京、上海）不调用天气工具。",
-  "调了之后怎么答（以下 5 条必须严格遵守）：",
-  "1. 只输出一句话纯文本，总字数不超过 50 字（含标点）；不要换行、不要 Markdown 标题、表格、分点列表或多段建议。",
-  "2. 结论优先：适合 / 基本适合但需准备 / 建议调整时间 / 不建议出行，紧跟日期和地点。",
-  "3. 只写影响结论的天气依据：温度用摄氏度（℃），换算后四舍五入取整即可；再写降水或预警，不罗列风力等次要数据。",
-  "4. 以“出门必备：”结尾，列出手机、乘车码或交通卡、证件、钥匙；天气确实需要时再追加雨伞、薄外套等。",
-  "5. 不输出未来几天预报、预警区域细节或用户没问的建议。",
-  "",
-  "【能力二 · 风云三国题库问答】",
-  "适用域：仅限风云三国游戏内的招募武将问答题；其他三国历史或常识问答不属于本能力，不要调用 fengyunsanguo_query。",
-  "什么时候调：用户的问题指向上述题库题目时（含与题干问法不同、含义相同的问法）。",
-  "调了之后怎么答（以下 5 条必须严格遵守）：",
-  "1. 收到用户提问后必须先调用 fengyunsanguo_query 工具（参数 text 传用户原始问题），取回候选题目。",
-  "2. 先理解用户问题的含义，再判断候选中哪条含义相同；问法不同但含义相同即算对应。",
-  "3. 判定出对应的题目后，只输出该题答案原文，不要输出题干、选项字母、解释或任何多余文字。",
-  "4. 候选中没有含义对应的题目时（包括只是字面相似、含义不同的），只回复「题库未收录该题，请换个问法」。",
-  "5. 禁止使用题库之外的知识作答、补充或改写答案。",
-  "",
-  "【能力三 ·《三国演义》原著检索（sango_novel_search）】",
-  "什么时候调：用户询问《三国演义》原著情节、人物、事件等需要原文依据的问题时，调用 sango_novel_search 工具检索原文（参数 source=sanguo-yanyi、query=用户白话问句、limit 默认 5）。",
-  "调了之后怎么答（以下 6 条必须严格遵守）：",
-  "1. 回答前必须先调用 sango_novel_search 工具检索《三国演义》原文。",
-  "2. 只依据工具返回的原文作答：人物、情节、数字都必须能在原文里找到。",
-  "3. 人名一律以召回原文为准：原文写谁就是谁，不得按常识/记忆替换、不得补别名、不得解释成别人。",
-  "4. 原文里没有相关内容的问句，必须回答「演义中未涉及」，禁止用先验知识补全。",
-  "5. 不评价、不纠正、不对比：不得说原文写错，不得提正史/影视/游戏，不得出现「实际上是…」这类转折。",
-  "6. 回答格式固定：先写一句结论，再用指针引用原文。引语原文与出处一律由服务端按字段渲染，你不得抄写；你只输出指针 `[Qn]`（n 为注入片段中 `⟨Qn⟩` 标记的序号，如 `[Q2]`）。示例：「关羽拒绝了孙权的联姻，回以[Q2]。」严禁输出引语原文、回目、出处或段号。",
-  "",
-  // 优先级判断次序
-  "【判断次序（自上而下，命中即停）】",
-  "三个专用域互斥，按语义命中即停：",
-  "1. 意图是否命中风云三国游戏内招募武将问答题 → 命中：调 fengyunsanguo_query，按能力二的 5 条作答。",
-  "1.1 意图是否命中《三国演义》原著情节 / 人物 / 事件等需要原文依据的问句 → 命中：调 sango_novel_search（参数 source=sanguo-yanyi、query=用户白话问句、limit 默认 5），按能力三的 6 条作答。",
-  "2. 意图是否命中美国境内城市的天气 / 地铁通勤出行 → 命中：调 get-forecast（必要时 get-alerts），按能力一的 5 条作答。",
-  "3. 以上都未命中 → 不调用任何工具，转入分域兜底。",
-  "",
-  // 分域兜底
-  "【分域兜底（未命中专用能力时按所属域处理，不存在笼统的自由回答）】",
-  "- 原著检索域：调过 sango_novel_search 但检索无命中，或引用校验不过 → 不做归纳生成，输出「原文片段 + 出处」并补一句结论归纳（如「按原文，斩华雄者系关羽」）；原文无相关内容时按能力三第 4 条回答「演义中未涉及」。",
-  "- 三国题库域：调过 fengyunsanguo_query 但候选中没有含义对应的题 → 只回复「题库未收录该题，请换个问法」，不用题库之外的知识补答。",
-  "- 非美国天气域：用户问的是美国以外地区（如北京）的天气 → 不调用天气工具，明确告知仅支持美国境内天气查询、无法提供该地区数据；严禁编造温度、降水或预警数值。",
-  "- 其余域：包括问候（如「你好」）、闲聊以及与天气、题库无关的通用问题 → 不调用任何工具，凭自身知识自由作答，简洁清楚；不套用天气播报格式，不套用题库话术，不确定时直接说明。",
-  "",
-  // 输出格式约束
-  "【输出格式约束】",
-  "一律输出简体中文纯文本；只有天气域、题库域与原著检索域有强制格式（见上），其余域按普通对话作答，不加无关模板、不解释自己的判断过程、不提及工具名。",
+// feat-A011：提示词拆分为「分类提示 + 域提示 + 自由对话提示」四常量（接口文档 §2.3 / §2.4，逐字节照录），
+// 原 UNIFIED_SYSTEM_PROMPT 已删除。缓存友好：静态前缀逐字节稳定，变化内容（注入片段）恒在消息末尾。
+
+/** 分类轮 system 提示词（§2.3）：请求体无 tools，模型只输出编号 */
+export const CLASSIFY_SYSTEM_PROMPT = [
+  "你是路由分类器，只输出一个数字编号，不要任何解释、标点或多余文字。",
+  "1 = 《三国演义》原著检索域",
+  "2 = 风云三国题库问答域",
+  "99 = 其他（自由对话）",
+  "不确定时倾向选 1 或 2。",
 ].join("\n");
 
-/** 域提示：命中域后追加在统一提示词之后（域内工具已预调并注入结果，模型不再自行调工具） */
-const ROUTE_HINTS: Record<string, string> = {
-  fengyunsanguo: ["当前用户已明确选择了“风云三国题库”场景（题库域硬锁）。系统已预先调用 fengyunsanguo_query 检索题库，候选题目附在问题下方【已检索到的题库候选】中；请直接依据候选作答，不要再调用 fengyunsanguo_query：候选中含义相同的那道题只输出该题答案原文，候选为「未召回到任何候选题目」时只回复「题库未收录该题，请换个问法」。"].join('\n'),
-  "sango-novel":
-    ['当前用户已明确选择了“三国演义原著解读”场景。系统已预先调用 sango_novel_search（source=sanguo-yanyi）检索《三国演义》原文并附在问题下方【已检索到的《三国演义》原文片段】中；请直接依据这些片段作答，不要再调用 sango_novel_search。',
-      '1. 给出一句结论，结论必须直接回答用户问题的主体。例如用户问“谁温酒斩华雄”，结论应写「关羽温酒斩华雄」；不能只写「酒尚温时斩华雄」。人名用原文中的称呼，关羽、云长、关公均可。',
-      '2. 结论后用指针引用原文：对应答案句是引语时输出 `[Qn]`（n 为 `⟨Qn⟩` 标记序号，如 [Q2]）；答案句是无引号的叙述句时输出 `[片段N]`（n 为该片段编号，如 [片段1]）。引语原文与出处由服务端按字段渲染，你不得抄写；严禁输出引语原文、回目、出处或段号。',
-      '3. 只依据片段作答；片段中确实没有相关内容时才回复「演义中未涉及」。',
-      '4. 正常回答不要以「按原文，」开头，禁止输出解释、总结或格式以外的内容。若提问明显不属于原著检索（如问候、天气等），按普通对话处理。'
-    ].join("\n"),
+/** sango-novel 域提示（§2.4）：域锁定快路径 / 分类编号 1 的生成轮 system 提示词 */
+export const SANGO_NOVEL_DOMAIN_PROMPT = [
+  "当前为「三国演义原著解读」场景。系统已检索《三国演义》原文并附在问题下方【已检索到的原文片段】中；请直接依据片段作答，不要再调用检索工具。",
+  "1. 先给一句直接回答用户问题主体的结论，人名以召回原文为准（关羽、云长、关公均可）。",
+  "2. 结论后引用原文：引语输出 [Qn]（n 为 ⟨Qn⟩ 标记序号）；无引号叙述句输出 [片段N]；引语原文与出处由服务端按字段渲染，你不得抄写，严禁输出回目、出处、段号。",
+  "3. 片段中确实没有相关内容时回复「演义中未涉及」，禁止用先验知识补全。",
+  "4. 不以「按原文，」开头，不输出解释、总结或格式以外的内容；提问明显不属于原著（如问候、天气）时按普通对话处理。",
+].join("\n");
+
+/** fengyunsanguo 域提示（§2.4）：题库快路径 / 分类编号 2 的生成轮 system 提示词 */
+export const FENGYUNSANGUO_DOMAIN_PROMPT =
+  "当前为「风云三国题库」场景。系统已预先检索题库，候选题目附在问题下方【已检索到的题库候选】中；请直接依据候选作答，不要再调用检索工具：候选中含义相同的那道题只输出该题答案原文；候选为「未召回到任何候选题目」时只回复「题库未收录该题，请换个问法」。";
+
+/** 自由对话提示（99，§2.4）：无注入生成轮 system 提示词，也是 Agent 默认 systemPrompt */
+export const FREE_CHAT_SYSTEM_PROMPT =
+  "你是统一对话助手，用简体中文回答用户问题。问候、闲聊与通用问题直接自由作答，简洁清楚，不加模板、不提及工具名。";
+
+/** 域提示分派：与 DOMAIN_ROUTES 同键，域锁定后取对应生成轮提示词 */
+const DOMAIN_PROMPTS: Record<string, string> = {
+  fengyunsanguo: FENGYUNSANGUO_DOMAIN_PROMPT,
+  "sango-novel": SANGO_NOVEL_DOMAIN_PROMPT,
 };
+
+/** feat-A011 分类编号表（接口文档 §2.2）：1~98 预留给能力域（加能力 = 加编号分支），99 恒为自由兜底 */
+export const CLASSIFY_ROUTE_IDS = {
+  sangoNovel: 1,
+  fengyunsanguo: 2,
+  freeChat: 99,
+} as const;
+
+/** feat-A011 分类轮回复解析：取回复文本首个数字（/^\d+/，先 trim）；
+ * 无法解析或解析出非 1/2/99 的编号 → 一律按 99 处理，且不重试（§2.2 输出解析）。 */
+export function parseClassifyRouteId(content: unknown): 1 | 2 | 99 {
+  const text = Array.isArray(content)
+    ? content
+        .filter(
+          (item: any) => item?.type === "text" && typeof item.text === "string"
+        )
+        .map((item: any) => item.text)
+        .join("\n")
+    : String(content ?? "");
+  const match = /^\d+/.exec(text.trim());
+  if (!match) {
+    return 99;
+  }
+  const id = Number(match[0]);
+  return id === 1 || id === 2 || id === 99 ? id : 99;
+}
 
 // feat-A004：引用硬校验的兜底结论归纳提示词（校验 / 格式不过时调用）
 const CITATION_FALLBACK_CONCLUSION_PROMPT =
   "根据给定的《三国演义》原文片段，用一句话归纳结论，以「按原文，」开头；结论必须先回答用户问题的主体（例如用户问“谁”，就要写出对应人物），再写事件，禁止只复述事件。如果用户只是问名字，只回答名字即可。只依据片段内容作答，不得补充片段之外的信息，不得评价、纠正、对比原文。引用的原文片段长度以10字内为佳，最长不得超过20汉字。";
 
-/** 路由目标（docs/sango-mcp-routing-design.md §二）：决定系统提示词、可见工具与是否走域内快路径 */
-export type RouteTarget = "weather" | "fengyunsanguo" | "sango-novel" | "auto";
+/** 路由目标（docs/sango-mcp-routing-design.md §二）：天气能力已下线（feat-A011），仅剩两能力域与 auto */
+export type RouteTarget = "fengyunsanguo" | "sango-novel" | "auto";
 
 /** L3 向量匹配注入点：只做风云三国高置信正向识别，命中返回 fengyunsanguo */
 export type FengyunsanguoVectorMatcher = (
@@ -167,19 +160,30 @@ export const FENGYUNSANGUO_QUERY_TOOL = "fengyunsanguo_query";
 /** feat-A010 模型可见工具白名单（硬约束）：登记对象 = 工具定义清单（MCP 工具 + options.tools 注入的本地工具定义），
  * 不是 options.localTools 的 key（localTools 只是「工具名 → 处理器」派发映射）。
  * 器坊新增后台专用工具（sango_novel_chapter）默认不在白名单 → 模型不可见；后台 HTTP 直调不受影响。
- * 初始值按当前 /api/tools 实际输出核对登记（见 api/feat-A010-original-text-reader.md §4.2）。 */
+ * feat-A011 天气下线：移除 get-forecast / get-alerts，仅剩 4 个能力工具。 */
 const MODEL_VISIBLE_TOOLS: string[] = [
-  'get-alerts',
-  'get-forecast',
   FENGYUNSANGUO_QUERY_TOOL,
   'fengyunsanguo_quiz_command',
   'fengyunsanguo_quiz_route',
   SANGO_NOVEL_SEARCH_TOOL,
 ];
 
+/** feat-A011 模型可见 description 映射表（接口文档 §1.2 全文，逐字节照录）：
+ * 瘦身只发生在总台「模型可见渲染」层（resolveModelTools 白名单过滤后替换 description）；
+ * MCP 传输层与 mcp-server 侧工具定义（name / description / inputSchema 原文）一字不动。 */
+const MODEL_VISIBLE_DESCRIPTIONS: Record<string, string> = {
+  [SANGO_NOVEL_SEARCH_TOOL]:
+    "检索《三国演义》原著原文。仅当用户询问原著情节/人物/事件等需要原文依据的问题时调用；返回结构化条目数组，禁止凭记忆作答。",
+  [FENGYUNSANGUO_QUERY_TOOL]:
+    "风云三国题库候选召回：text 传用户原始问法，返回候选题目（题干→答案），供 LLM 判定对应题。",
+  "fengyunsanguo_quiz_command":
+    "风云三国随机一题状态机（本地规则，不经 LLM）：随机出题/判题/查答案，按 sessionId 维持会话。",
+  "fengyunsanguo_quiz_route":
+    "风云三国 L3 高置信识别（不经 LLM）：判定 text 是否为题库内问题，返回 JSON true/false。",
+};
+
 /** L1 前端标签 → 域：domain 取值与 server.ts 白名单同源，命中即跳过后续所有路由判断 */
 const DOMAIN_ROUTES: Record<string, RouteTarget> = {
-  weather: "weather",
   fengyunsanguo: "fengyunsanguo",
   "sango-novel": "sango-novel",
 };
@@ -198,25 +202,6 @@ const NOVEL_KEYWORDS = [
   "三国时期",
   "罗贯中",
 ];
-const WEATHER_KEYWORDS = [
-  "天气",
-  "气温",
-  "下雨",
-  "下雪",
-  "湿度",
-  "风力",
-  "晴天",
-  "阴天",
-  "温度",
-  "降雨",
-  "雷暴",
-  "大风",
-  "出门",
-  "游玩",
-  "旅游",
-  "美国",
-];
-
 // 重叠题校正（文档 §二 第三层 4）：字 / 籍贯 在题库与文史两域都高频出现，命中后不直接路由
 const AMBIGUOUS_KEYWORDS = ["字", "籍贯"];
 
@@ -224,7 +209,8 @@ export type LocalToolHandler = (
   args: Record<string, unknown>
 ) => ToolCallResult | Promise<ToolCallResult>;
 
-/** feat-A009：检索工具调用路径（fastpath=域内快路径确定性注入；tooluse=LLM 自主 tool-use） */
+/** feat-A009：检索工具调用路径（fastpath=域内快路径确定性注入；
+ * tooluse 原为 LLM 自主 tool-use，feat-A011 删除工具自主决策路径后已无产生者，类型保留作历史口径） */
 type RetrievalKind = "fastpath" | "tooluse";
 
 /** feat-A009：一次带诊断的检索调用登记（seq=tool_call_logs 行号；diagnostics 保留给收尾回填） */
@@ -282,7 +268,7 @@ export class Agent {
       typeof options === "string" || options === undefined ? {} : options;
     this.systemPrompt =
       (typeof options === "string" ? options : options?.systemPrompt) ||
-      UNIFIED_SYSTEM_PROMPT;
+      FREE_CHAT_SYSTEM_PROMPT;
 
     if (config.provider === "anthropic") {
       this.anthropic = new Anthropic({
@@ -432,10 +418,16 @@ export class Agent {
     return this.resolveModelTools();
   }
 
-  /** feat-A010：模型可见工具 = 白名单过滤后的工具定义（options.tools 注入路径同样过滤，保证「模型可见 = 白名单」恒成立） */
+/** feat-A010/A011：模型可见工具 = 白名单过滤后的工具定义，并替换为瘦身 description（§1.2）；
+ * options.tools 注入路径同样过滤，保证「模型可见 = 白名单」恒成立；原对象不原地改动（MCP 侧原文一字不动）。 */
   private async resolveModelTools(): Promise<MCPToolDefinition[]> {
     const tools = this.options.tools ?? (await this.transport.listTools());
-    return tools.filter((tool) => MODEL_VISIBLE_TOOLS.includes(tool.name));
+    return tools
+      .filter((tool) => MODEL_VISIBLE_TOOLS.includes(tool.name))
+      .map((tool) => {
+        const description = MODEL_VISIBLE_DESCRIPTIONS[tool.name];
+        return description === undefined ? tool : { ...tool, description };
+      });
   }
 
   /** MCP 工具失败包装为 ToolExecutionError（server.ts 据此判 503）；本地工具失败原样上抛 */
@@ -695,8 +687,8 @@ export class Agent {
   }
 
   /**
-   * 路由判定（零 LLM）：L1 前端标签 → L2 本地关键词硬匹配。
-   * 返回 "auto" 表示前两层未命中，交统一 Agent 按语义自主决策（L3 题库高置信识别由调用方注入）。
+   * 路由判定（零 LLM）：L1 前端标签 → L2 本地关键词硬匹配（feat-A011 天气关键词分支已删除）。
+   * 返回 "auto" 表示前两层未命中，交由 L3 题库高置信识别（调用方注入）与轻量分类轮处理。
    */
   resolveRoute(query: string, domain?: string): RouteTarget {
     if (domain && DOMAIN_ROUTES[domain]) {
@@ -710,9 +702,6 @@ export class Agent {
     }
     if (hit(NOVEL_KEYWORDS)) {
       return "sango-novel";
-    }
-    if (hit(WEATHER_KEYWORDS)) {
-      return "weather";
     }
     return "auto";
   }
@@ -768,8 +757,6 @@ export class Agent {
       } else if (domain === DOMAIN_ROUTES["fengyunsanguo"]) {
         const result = await this.searchFengyunsanguoQuestions(query);
         return { result: this.collectTexts(result).join("\n") };
-      } else if (domain === DOMAIN_ROUTES["weather"]) {
-        // Handle weather domain
       }
     }
     return { result: '' };
@@ -778,6 +765,9 @@ export class Agent {
   /**
    * 处理用户提问并回答（feat-A006 结构化）：同样走三层路由判定与域内快路径
    * （L1 标签 → L2 关键词 → L3 题库高置信识别，L3 仅 auto 时生效），
+   * feat-A011：L3 未命中 → 无 tools 轻量分类出编号，服务端按编号预调工具并注入；
+   * 生成轮消息固定 [system: 域提示] + [user: 用户问题] + [system: 注入片段]（99 无注入），
+   * 一律不携带工具定义；工具自主决策（tool-use 循环）路径已删除。
    * 返回 /api/chat 响应 data 统一形状 { answer, citations }（无引用恒 []）。
    */
   async processQueryData(query: string, domain?: string): Promise<ChatData> {
@@ -792,109 +782,77 @@ export class Agent {
     const userContent = query.trim();
     let resolvedContent = '';
 
-    // L1 / L2 已命中专用域，直接走域内快路径（不经 L3）
-    let route = this.resolveRoute(query, domain);
-    if (Object.values(DOMAIN_ROUTES).includes(route)) {
-      const result = await this.resolveUserContent(query, domain || route, tracking);
+    // 路由判定（L1 前端标签 → L2 关键词）：命中专用域直接走域内快路径（预调 + 注入），不经分类轮
+    const route = this.resolveRoute(query, domain);
+    const lockedRoute = Object.values(DOMAIN_ROUTES).includes(route)
+      ? route
+      : null;
+    let systemPrompt = this.systemPrompt;
+    if (lockedRoute) {
+      const result = await this.resolveUserContent(
+        query,
+        lockedRoute,
+        tracking
+      );
       resolvedContent = result.result;
       novelView = result.novelView || null;
       novelSearched = result.novelSearched ?? false;
-    }
-
-    // L3 向量匹配注入点：只做风云三国高置信正向识别，命中 fengyunsanguo 后走题库快路径；
-    // 仅 auto（L1/L2 未锁定域）时生效——domain 硬锁（weather/fengyunsanguo/sango-novel）不得被 L3 覆盖
-    if (route === "auto") {
-      const fengyunsanguoHit = await this.options.fengyunsanguoVectorMatcher?.(query);
+      systemPrompt = DOMAIN_PROMPTS[lockedRoute];
+    } else {
+      // L3 向量匹配注入点：只做风云三国高置信正向识别，命中 fengyunsanguo 后走题库快路径；
+      // 仅 auto（L1/L2 未锁定域）时生效——domain 硬锁（fengyunsanguo/sango-novel）不得被 L3 覆盖
+      const fengyunsanguoHit =
+        await this.options.fengyunsanguoVectorMatcher?.(query);
       if (fengyunsanguoHit === true || fengyunsanguoHit === "fengyunsanguo") {
-        route = DOMAIN_ROUTES.fengyunsanguo;
-        const { result } = await this.resolveUserContent(query, route);
+        const { result } = await this.resolveUserContent(
+          query,
+          DOMAIN_ROUTES.fengyunsanguo
+        );
         resolvedContent = result;
+        systemPrompt = DOMAIN_PROMPTS.fengyunsanguo;
+      } else {
+        // 轻量分类轮（§2.1）：请求体无 tools，仅 [system: 分类提示] + [user: 用户问题]，
+        // 模型只输出编号；服务端按编号预调工具并注入（生成轮不带工具定义）
+        const classifyResponse = await this.invokeModel(
+          [
+            { role: "system", content: CLASSIFY_SYSTEM_PROMPT },
+            { role: "user", content: userContent },
+          ],
+          [],
+          "classify"
+        );
+        const routeId = parseClassifyRouteId(classifyResponse.content);
+        if (routeId === CLASSIFY_ROUTE_IDS.sangoNovel) {
+          const result = await this.resolveUserContent(
+            query,
+            DOMAIN_ROUTES["sango-novel"],
+            tracking
+          );
+          resolvedContent = result.result;
+          novelView = result.novelView || null;
+          novelSearched = result.novelSearched ?? false;
+          systemPrompt = DOMAIN_PROMPTS["sango-novel"];
+        } else if (routeId === CLASSIFY_ROUTE_IDS.fengyunsanguo) {
+          const { result } = await this.resolveUserContent(
+            query,
+            DOMAIN_ROUTES.fengyunsanguo
+          );
+          resolvedContent = result;
+          systemPrompt = DOMAIN_PROMPTS.fengyunsanguo;
+        }
+        // 99 / 无法解析 / 非 1/2/99：自由对话兜底，无注入，不重试（systemPrompt 保持默认）
       }
     }
 
-    const systemContent = resolvedContent ? ROUTE_HINTS[route] : this.systemPrompt;
-    let messages: any[] = [
-      { role: "system", content: systemContent, },
-      { role: "user", content: userContent, },
+    // 生成轮消息固定排布（缓存友好）：静态前缀（system 域提示 + user 问题）逐字节稳定，注入片段恒在末尾
+    const messages: any[] = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userContent },
     ];
     if (resolvedContent) {
-      messages.push({ role: "system", content: resolvedContent, });
+      messages.push({ role: "system", content: resolvedContent });
     }
-    let availableTools = await this.resolveModelTools();
-    let currentResponse = await this.invokeModel(messages, availableTools, "routing"); // 调LLM
-
-    const MAX_TOOL_ROUNDS = 8
-    let toolRounds = 0
-    while (true) {
-      let hasToolUse = false;
-
-      for (const item of currentResponse.content) {
-        if (item.type !== "tool_use") {
-          continue;
-        }
-        hasToolUse = true;
-        const toolName = item.name!;
-        const toolArgs = item.input!;
-
-        const localTool = this.options.localTools?.[toolName];
-        const result = localTool
-          ? await localTool(toolArgs)
-          : await this.callTransportTool(toolName, toolArgs);
-        // 模型自行调原著检索工具：与快路径同源收集片段，并把注入视图（纯原文 + 服务端编号）
-        // 作为工具出参回填——模型看到的 `⟨Qn⟩` 与指针校验用的 qid 集合同源
-        let toolContent = JSON.stringify(result.content);
-        if (toolName === SANGO_NOVEL_SEARCH_TOOL) {
-          novelSearched = true;
-          // 模型自主调原著检索（route=auto 的 tool-use 路径）：与快路径同源收集片段 + chunkId，
-          // 并把注入视图（纯原文 + 服务端编号）作为工具出参回填——模型看到的 `⟨Qn⟩` 与指针校验同源
-          const { fragments, chunkIds } =
-            this.collectRecallFragmentsWithChunkIds(result, toolArgs);
-          tracking.fragments.push(...fragments);
-          tracking.chunkMeta.push(
-            ...chunkIds.map((chunkId) => ({
-              chunkId,
-              kind: "tooluse" as const,
-            }))
-          );
-          this.recordRetrievalCall(tracking, result, "tooluse");
-          const view = buildInjectionView(tracking.fragments, query);
-          novelView = view;
-          toolContent = view.text;
-        }
-        const assistantMessage: any = {
-          role: "assistant",
-          content: null,
-          tool_calls: [
-            {
-              id: item.id,
-              type: "function",
-              function: {
-                name: toolName,
-                arguments: JSON.stringify(toolArgs),
-              },
-            },
-          ],
-        };
-
-        if (currentResponse.reasoningContent) {
-          assistantMessage.reasoning_content = currentResponse.reasoningContent;
-        }
-
-        messages.push(assistantMessage);
-        messages.push({
-          role: "tool",
-          tool_call_id: item.id,
-          content: toolContent,
-        });
-      }
-
-      if (!hasToolUse || toolRounds >= MAX_TOOL_ROUNDS) {
-        break;
-      }
-      toolRounds++;
-
-      currentResponse = await this.invokeModel(messages, availableTools, "generation");
-    }
+    const currentResponse = await this.invokeModel(messages, [], "generation");
 
     let answer = currentResponse.content
       .filter((item) => item.type === "text")
@@ -923,8 +881,7 @@ export class Agent {
     return data;
   }
 
-  /** feat-A009：注入视图实际纳入的候选 chunkId（快路径确定性注入计入；
-   * LLM 自主 tool-use 路径按 §3.2 口径不统计注入视图 → injected=0 属预期） */
+  /** feat-A009：注入视图实际纳入的候选 chunkId（feat-A011 起全部为快路径确定性注入，无 tool-use 路径） */
   private computeInjectedChunkIds(tracking: NovelTracking): Set<string> {
     const injected = new Set<string>();
     const pickedIndices = computePickedIndices(tracking.fragments);
