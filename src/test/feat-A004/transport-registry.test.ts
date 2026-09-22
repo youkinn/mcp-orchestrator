@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import {
   MCPTransport,
   SANGO_SERVER_NAME,
-  WEATHER_SERVER_NAME,
   FENGYUNSANGUO_SERVER_NAME,
   FENGYUNSANGUO_QUIZ_COMMAND_TOOL,
   FENGYUNSANGUO_QUIZ_ROUTE_TOOL,
@@ -15,16 +14,6 @@ import { Agent } from "../../agent.js";
 import { ToolExecutionError, type MCPToolDefinition } from "../../types.js";
 import type { LLMConfig } from "../../types.js";
 
-const FORECAST: MCPToolDefinition = {
-  name: "get-forecast",
-  description: "获取美国境内某个经纬度位置的天气预报",
-  inputSchema: { type: "object" },
-};
-const ALERTS: MCPToolDefinition = {
-  name: "get-alerts",
-  description: "获取美国某个州的当前天气预警",
-  inputSchema: { type: "object" },
-};
 const NOVEL: MCPToolDefinition = {
   name: "sango_novel_search",
   description: "检索《三国演义》原著原文段落",
@@ -113,17 +102,16 @@ class FakeFactory implements MCPServerConnectionFactory {
   }
 }
 
-function threeServerConfigs(): MCPServerConfig[] {
+// 天气已下线（feat-A011）：注册表示例只用 sango（演义）与 fengyunsanguo 两个 server，weather 不再装配
+function sangoFengyunsanguoConfigs(): MCPServerConfig[] {
   return [
-    { name: WEATHER_SERVER_NAME, scriptPath: "w.js", required: true },
     { name: SANGO_SERVER_NAME, scriptPath: "s.js", required: false },
     { name: FENGYUNSANGUO_SERVER_NAME, scriptPath: "f.js", required: false },
   ];
 }
 
-function weatherSangoConfigs(): MCPServerConfig[] {
+function sangoOnlyConfigs(): MCPServerConfig[] {
   return [
-    { name: WEATHER_SERVER_NAME, scriptPath: "w.js", required: true },
     { name: SANGO_SERVER_NAME, scriptPath: "s.js", required: false },
   ];
 }
@@ -137,13 +125,12 @@ function makeLLMConfig(): LLMConfig {
   };
 }
 
-test("listTools：合并 weather、sango（演义）与 fengyunsanguo 三个 server 的工具（按注册顺序）", async () => {
+test("listTools：合并 sango（演义）与 fengyunsanguo 两个 server 的工具（按注册顺序）", async () => {
   const factory = new FakeFactory({
-    weather: [FORECAST, ALERTS],
     sango: [NOVEL],
     fengyunsanguo: FENGYUNSANGUO_TOOLS,
   });
-  const transport = new MCPTransport(threeServerConfigs(), factory);
+  const transport = new MCPTransport(sangoFengyunsanguoConfigs(), factory);
   await transport.connect();
 
   const tools = await transport.listTools();
@@ -151,8 +138,6 @@ test("listTools：合并 weather、sango（演义）与 fengyunsanguo 三个 ser
   assert.deepEqual(
     tools.map((tool) => tool.name),
     [
-      "get-forecast",
-      "get-alerts",
       "sango_novel_search",
       "fengyunsanguo_query",
       "fengyunsanguo_quiz_route",
@@ -163,18 +148,13 @@ test("listTools：合并 weather、sango（演义）与 fengyunsanguo 三个 ser
 
 test("callTool：按工具名路由到正确 server 转发，参数完整透传", async () => {
   const factory = new FakeFactory({
-    weather: [FORECAST, ALERTS],
     sango: [NOVEL],
     fengyunsanguo: FENGYUNSANGUO_TOOLS,
   });
-  const transport = new MCPTransport(threeServerConfigs(), factory);
+  const transport = new MCPTransport(sangoFengyunsanguoConfigs(), factory);
   await transport.connect();
   await transport.listTools();
 
-  const forecast = await transport.callTool("get-forecast", {
-    latitude: 40.71,
-    longitude: -74.01,
-  });
   const novel = await transport.callTool("sango_novel_search", {
     query: "温酒斩华雄",
   });
@@ -182,12 +162,8 @@ test("callTool：按工具名路由到正确 server 转发，参数完整透传"
     text: "夏侯惇的字是什么？",
   });
 
-  assert.equal(forecast.content[0]?.text, "ok:get-forecast");
   assert.equal(novel.content[0]?.text, "ok:sango_novel_search");
   assert.equal(query.content[0]?.text, "ok:fengyunsanguo_query");
-  assert.deepEqual(factory.connections.get(WEATHER_SERVER_NAME)!.calls, [
-    { name: "get-forecast", args: { latitude: 40.71, longitude: -74.01 } },
-  ]);
   assert.deepEqual(factory.connections.get(SANGO_SERVER_NAME)!.calls, [
     { name: "sango_novel_search", args: { query: "温酒斩华雄" } },
   ]);
@@ -198,11 +174,10 @@ test("callTool：按工具名路由到正确 server 转发，参数完整透传"
 
 test("callTool：未先 listTools 也能按各 server 上报工具名懒解析归属", async () => {
   const factory = new FakeFactory({
-    weather: [FORECAST],
     sango: [NOVEL],
     fengyunsanguo: FENGYUNSANGUO_TOOLS,
   });
-  const transport = new MCPTransport(threeServerConfigs(), factory);
+  const transport = new MCPTransport(sangoFengyunsanguoConfigs(), factory);
   await transport.connect();
 
   const result = await transport.callTool("fengyunsanguo_query", { text: "x" });
@@ -216,11 +191,10 @@ test("callTool：未先 listTools 也能按各 server 上报工具名懒解析�
 
 test("callTool：未知工具名报错", async () => {
   const factory = new FakeFactory({
-    weather: [FORECAST],
     sango: [NOVEL],
     fengyunsanguo: FENGYUNSANGUO_TOOLS,
   });
-  const transport = new MCPTransport(threeServerConfigs(), factory);
+  const transport = new MCPTransport(sangoFengyunsanguoConfigs(), factory);
   await transport.connect();
 
   await assert.rejects(
@@ -229,18 +203,17 @@ test("callTool：未知工具名报错", async () => {
   );
 });
 
-test("缺配 fengyunsanguo：注册表只含 weather + sango，fengyunsanguo 工具不可见、调用报未知工具", async () => {
+test("缺配 fengyunsanguo：注册表只含 sango，fengyunsanguo 工具不可见、调用报未知工具", async () => {
   const factory = new FakeFactory({
-    weather: [FORECAST, ALERTS],
     sango: [NOVEL],
   });
-  const transport = new MCPTransport(weatherSangoConfigs(), factory);
+  const transport = new MCPTransport(sangoOnlyConfigs(), factory);
   await transport.connect();
 
   const tools = await transport.listTools();
   assert.deepEqual(
     tools.map((tool) => tool.name),
-    ["get-forecast", "get-alerts", "sango_novel_search"]
+    ["sango_novel_search"]
   );
 
   await assert.rejects(
@@ -251,10 +224,9 @@ test("缺配 fengyunsanguo：注册表只含 weather + sango，fengyunsanguo 工
 
 test("缺配 fengyunsanguo：quiz_route 返回 null（不命中），quiz_command 抛 ToolExecutionError（503 语义）", async () => {
   const factory = new FakeFactory({
-    weather: [FORECAST, ALERTS],
     sango: [NOVEL],
   });
-  const transport = new MCPTransport(weatherSangoConfigs(), factory);
+  const transport = new MCPTransport(sangoOnlyConfigs(), factory);
   await transport.connect();
 
   assert.equal(await transport.fengyunsanguo_quiz_route("夏侯惇的字是什么？"), null);
@@ -269,7 +241,6 @@ test("缺配 fengyunsanguo：quiz_route 返回 null（不命中），quiz_comman
 test("fengyunsanguo_quiz_route：按 server 返回文本解析布尔，命中 true、未命中 false", async () => {
   const factory = new FakeFactory(
     {
-      weather: [FORECAST],
       sango: [NOVEL],
       fengyunsanguo: FENGYUNSANGUO_TOOLS,
     },
@@ -283,7 +254,7 @@ test("fengyunsanguo_quiz_route：按 server 返回文本解析布尔，命中 tr
       ],
     })
   );
-  const transport = new MCPTransport(threeServerConfigs(), factory);
+  const transport = new MCPTransport(sangoFengyunsanguoConfigs(), factory);
   await transport.connect();
 
   assert.equal(
@@ -299,7 +270,6 @@ test("fengyunsanguo_quiz_route：按 server 返回文本解析布尔，命中 tr
 test("fengyunsanguo_quiz_route：server 返回 JSON {\"hit\": true} 同样解析为命中", async () => {
   const factory = new FakeFactory(
     {
-      weather: [FORECAST],
       fengyunsanguo: FENGYUNSANGUO_TOOLS,
     },
     [],
@@ -315,7 +285,7 @@ test("fengyunsanguo_quiz_route：server 返回 JSON {\"hit\": true} 同样解析
       ],
     })
   );
-  const transport = new MCPTransport(threeServerConfigs(), factory);
+  const transport = new MCPTransport(sangoFengyunsanguoConfigs(), factory);
   await transport.connect();
 
   assert.equal(await transport.fengyunsanguo_quiz_route("司马懿的字是什么？"), true);
@@ -324,7 +294,6 @@ test("fengyunsanguo_quiz_route：server 返回 JSON {\"hit\": true} 同样解析
 test("fengyunsanguo_quiz_command：message / sessionId 完整透传，返回工具内容", async () => {
   const factory = new FakeFactory(
     {
-      weather: [FORECAST],
       fengyunsanguo: FENGYUNSANGUO_TOOLS,
     },
     [],
@@ -340,7 +309,7 @@ test("fengyunsanguo_quiz_command：message / sessionId 完整透传，返回工�
       ],
     })
   );
-  const transport = new MCPTransport(threeServerConfigs(), factory);
+  const transport = new MCPTransport(sangoFengyunsanguoConfigs(), factory);
   await transport.connect();
 
   const result = await transport.fengyunsanguo_quiz_command("随机一题", "sid-1");
@@ -359,10 +328,9 @@ test("fengyunsanguo_quiz_command：message / sessionId 完整透传，返回工�
 
 test("fengyunsanguo_quiz_command：无 sessionId 时参数不含该字段", async () => {
   const factory = new FakeFactory({
-    weather: [FORECAST],
     fengyunsanguo: FENGYUNSANGUO_TOOLS,
   });
-  const transport = new MCPTransport(threeServerConfigs(), factory);
+  const transport = new MCPTransport(sangoFengyunsanguoConfigs(), factory);
   await transport.connect();
 
   await transport.fengyunsanguo_quiz_command("答案");
@@ -375,10 +343,9 @@ test("fengyunsanguo_quiz_command：无 sessionId 时参数不含该字段", asyn
 
 test("fengyunsanguo_quiz_command：server 调用失败 → ToolExecutionError（503 语义）", async () => {
   const factory = new FakeFactory({
-    weather: [FORECAST],
     fengyunsanguo: FENGYUNSANGUO_TOOLS,
   });
-  const transport = new MCPTransport(threeServerConfigs(), factory);
+  const transport = new MCPTransport(sangoFengyunsanguoConfigs(), factory);
   await transport.connect();
 
   transport.callTool = async () => {
@@ -397,10 +364,9 @@ test("fengyunsanguo_quiz_command：server 调用失败 → ToolExecutionError（
 
 test("缺配 fengyunsanguo：domain=fengyunsanguo 快路径预调 → ToolExecutionError（503 语义）", async () => {
   const factory = new FakeFactory({
-    weather: [FORECAST, ALERTS],
     sango: [NOVEL],
   });
-  const transport = new MCPTransport(weatherSangoConfigs(), factory);
+  const transport = new MCPTransport(sangoOnlyConfigs(), factory);
   await transport.connect();
 
   const agent = new Agent(transport, makeLLMConfig(), {
@@ -418,22 +384,21 @@ test("缺配 fengyunsanguo：domain=fengyunsanguo 快路径预调 → ToolExecut
   );
 });
 
-test("可选 server 启动失败：独立失败，weather / sango（演义）照常，失败 server 的工具不可见", async () => {
+test("可选 server 启动失败：独立失败，sango（演义）照常，失败 server 的工具不可见", async () => {
   const factory = new FakeFactory(
     {
-      weather: [FORECAST, ALERTS],
       sango: [NOVEL],
       fengyunsanguo: FENGYUNSANGUO_TOOLS,
     },
     [FENGYUNSANGUO_SERVER_NAME]
   );
-  const transport = new MCPTransport(threeServerConfigs(), factory);
+  const transport = new MCPTransport(sangoFengyunsanguoConfigs(), factory);
   await transport.connect();
 
   const tools = await transport.listTools();
   assert.deepEqual(
     tools.map((tool) => tool.name),
-    ["get-forecast", "get-alerts", "sango_novel_search"]
+    ["sango_novel_search"]
   );
   await assert.rejects(
     () => transport.callTool("fengyunsanguo_query", { text: "x" }),
@@ -443,10 +408,10 @@ test("可选 server 启动失败：独立失败，weather / sango（演义）照
 
 test("必需 server 启动失败：整体启动失败（connect 抛错）", async () => {
   const configs: MCPServerConfig[] = [
-    { name: WEATHER_SERVER_NAME, scriptPath: "w.js", required: true },
+    { name: SANGO_SERVER_NAME, scriptPath: "s.js", required: true },
   ];
-  const factory = new FakeFactory({ weather: [FORECAST] }, [
-    WEATHER_SERVER_NAME,
+  const factory = new FakeFactory({ sango: [NOVEL] }, [
+    SANGO_SERVER_NAME,
   ]);
   const transport = new MCPTransport(configs, factory);
 

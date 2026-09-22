@@ -3,7 +3,7 @@
 // 工具明细 fengyunsanguo_quiz_command（mcp_server=fengyunsanguo）、无 LLM 明细（列表 tokens=null）、
 // X-Client-Sent-At（t0）+ t6 补报回填 durations.frontend、未知 traceId 补报静默 200、
 // 缺失 X-Trace-Id 响应头兜底 + 可用该值补报、校验失败 400/413 也落主表、
-// /api/chat domain=weather 通过校验且主表 domain=weather、未知 domain 仍 400、
+// /api/chat domain=weather 下线后 400 且文案固定（A011）、未知 domain 仍 400、
 // domain=fengyunsanguo 走题库快路径工具明细落 fengyunsanguo_query、日志存储抛错旁路仍 200。
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -329,7 +329,7 @@ test('quiz 埋点：校验失败（400 / 413）也落主表一条，handle_start
   }
 });
 
-test('/api/chat：domain=weather 通过校验且主表 domain=weather；未知 domain 仍 400', async (t) => {
+test('/api/chat：domain=weather 下线后 400 且文案固定（feat-A011）；未知 domain 仍 400', async (t) => {
   const logStore = createLogStore({ dbPath: ':memory:' });
   t.after(() => logStore.close());
   const { baseUrl } = await startServer(t, { logStore });
@@ -340,13 +340,17 @@ test('/api/chat：domain=weather 通过校验且主表 domain=weather；未知 d
     { message: '北京今天适合出门吗', domain: 'weather' },
     { 'X-Trace-Id': TRACE_ID }
   );
-  assert.equal(weather.status, 200, 'weather 入白名单后通过校验');
-  assert.equal(weather.body.code, 200);
+  assert.equal(weather.status, 400, 'weather 已下线，校验拒绝');
+  assert.equal(weather.body.code, 400);
+  assert.equal(weather.body.message, 'domain 字段仅支持 fengyunsanguo、sango-novel');
 
   logStore.flush();
   const detail = logStore.queryDetail(TRACE_ID)!;
   assert.equal(detail.log.logType, 'chat');
-  assert.equal(detail.log.domain, 'weather', '主表 domain 落 weather');
+  assert.equal(detail.log.domain, 'weather', '校验失败同样落主表，domain 取请求体');
+  assert.equal(detail.log.status, 'failed');
+  assert.equal(detail.log.responseCode, 400);
+  assert.equal(detail.log.errorMessage, 'domain 字段仅支持 fengyunsanguo、sango-novel');
 
   const unknown = await post(baseUrl, '/api/chat', { message: '你好', domain: 'banana' });
   assert.equal(unknown.status, 400, '未知 domain 仍 400');
@@ -359,7 +363,7 @@ test('/api/chat：domain=weather 通过校验且主表 domain=weather；未知 d
   assert.equal(unknownDetail.log.responseCode, 400);
   assert.equal(
     unknownDetail.log.errorMessage,
-    'domain 字段仅支持 fengyunsanguo、sango-novel、weather'
+    'domain 字段仅支持 fengyunsanguo、sango-novel'
   );
 });
 
