@@ -658,7 +658,7 @@ test("env 默认值：CACHE_ENABLED / CACHE_HIT_LINE / CACHE_MAX_ENTRIES 启动�
     assert.equal(fixture.manager.getStatus().enabled, false, "CACHE_ENABLED=false 启动关闭");
     assert.equal(fixture.manager.getStatus().hitLine, 0.9, "CACHE_HIT_LINE=0.9 启动生效");
     assert.equal(fixture.manager.getStatus().maxEntries, 2, "CACHE_MAX_ENTRIES=2 启动生效");
-    // hitLine / maxEntries 运行时不可改（readonly + 无 setter）
+    // hitLine 初始值读 env（§1.3：运行时可用 setHitLine 调整）；maxEntries 仍为启动固定值
     assert.equal((fixture.manager as unknown as { hitLine: number }).hitLine, 0.9);
     // 非法值回退默认
     process.env.CACHE_HIT_LINE = "abc";
@@ -675,4 +675,75 @@ test("env 默认值：CACHE_ENABLED / CACHE_HIT_LINE / CACHE_MAX_ENTRIES 启动�
       }
     }
   }
+});
+
+test("setHitLine：运行时调整命中线立即生效；越界拒绝（返回 NaN 且值不变）", async () => {
+  const { manager, embed } = makeManager(); // 初始 hitLine = 0.92
+  embed.vectors.set("严颜是怎么被义释的", unitVector(0));
+  embed.vectors.set("严颜为什么被义释", vecWithCosine(0, 0.85)); // 与池条目余弦 0.85
+  await writeEntry(manager, "严颜是怎么被义释的", "t1");
+
+  const before = await manager.lookup("严颜为什么被义释", "t2");
+  assert.equal(before?.hit, false, "sim=0.85 < 0.92 → 灰色区未命中");
+  assert.equal(before?.reason, "miss-gray");
+
+  assert.equal(manager.setHitLine(0.8), 0.8);
+  const after = await manager.lookup("严颜为什么被义释", "t3");
+  assert.equal(after?.hit, true, "命中线降至 0.80 后 sim=0.85 应命中");
+  assert.equal(after?.similarity, 0.85);
+  assert.equal(manager.getStatus().hitLine, 0.8, "调整立即反映于状态");
+
+  // 越界拒绝：返回 NaN 且命中线不变
+  assert.equal(manager.setHitLine(1.5), NaN);
+  assert.equal(manager.setHitLine(0), NaN);
+  assert.equal(manager.setHitLine(-0.1), NaN);
+  assert.equal(manager.setHitLine(Number.NaN), NaN);
+  assert.equal(manager.getStatus().hitLine, 0.8, "越界后值不变");
+  const stillGray = await manager.lookup("严颜为什么被义释", "t4");
+  assert.equal(stillGray?.hit, true, "拒绝的非法值不打断已生效的命中线");
+});
+
+test("lookup：人名字号归一化换说法命中（云长→关羽）；落库仍存原始文本", async () => {
+  const { manager, logStore, embed } = makeManager();
+  embed.vectors.set("关羽过五关斩六将", unitVector(0));
+  await writeEntry(manager, "关羽过五关斩六将", "t1");
+
+  // 未归一化时「云长过五关斩六将」无 embedding 映射（降级旁路 null）；归一化后与池中条目同文本 → cosine=1.0 恒命中
+  const result = await manager.lookup("云长过五关斩六将", "t2");
+  assert.equal(result?.hit, true, "云长→关羽 换说法应命中");
+  assert.equal(result?.similarity, 1);
+  assert.equal(result?.reason, "hit");
+  assert.equal(result?.nearestQuery, "关羽过五关斩六将");
+  // 原词保持：cache_logs.user_query 与条目 queryText 仍为原始文本
+  const row = logRow(logStore, "t2");
+  assert.equal(row.userQuery, "云长过五关斩六将");
+  assert.equal(row.nearestQuery, "关羽过五关斩六将");
+  assert.equal(row.hitLine, 0.92);
+});
+
+test("lookup：人名字号归一化长词优先（关云长 / 诸葛孔明）", async () => {
+  const { manager, embed } = makeManager();
+  embed.vectors.set("关羽温酒斩华雄", unitVector(0));
+  embed.vectors.set("诸葛亮三气周瑜", unitVector(1));
+  await writeEntry(manager, "关羽温酒斩华雄", "t1");
+  await writeEntry(manager, "诸葛亮三气周瑜", "t2");
+
+  const r1 = await manager.lookup("关云长温酒斩华雄", "t3");
+  assert.equal(r1?.hit, true, "关云长→关羽（长词优先，不拆成「关关羽」）");
+  const r2 = await manager.lookup("诸葛孔明三气公瑾", "t4");
+  assert.equal(r2?.hit, true, "诸葛孔明→诸葛亮、公瑾→周瑜");
+});
+
+test("lookup：人名字号归一化不放大不相关文本相似度", async () => {
+  const { manager, embed } = makeManager();
+  embed.vectors.set("关羽过五关斩六将", unitVector(0));
+  embed.vectors.set("华容道关羽释曹操", unitVector(1));
+  embed.vectors.set("诸葛亮施计借东风", unitVector(2)); // 归一化后（孔明→诸葛亮）才有映射；未归一化会查不到向量
+  await writeEntry(manager, "关羽过五关斩六将", "t1");
+  await writeEntry(manager, "华容道关羽释曹操", "t2");
+
+  const result = await manager.lookup("孔明施计借东风", "t3");
+  assert.equal(result?.hit, false, "归一化后（诸葛亮施计借东风）与池内仍不相关 → 不命中");
+  assert.equal(result?.reason, "miss-low");
+  assert.equal(result?.similarity, 0);
 });

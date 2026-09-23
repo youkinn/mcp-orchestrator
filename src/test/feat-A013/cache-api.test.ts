@@ -56,6 +56,14 @@ class FakeCacheManager implements CacheManager {
     return this.getStatus();
   }
 
+  setHitLine(value: number): number {
+    if (!Number.isFinite(value) || value <= 0 || value > 1) {
+      return NaN;
+    }
+    this.hitLine = value;
+    return this.hitLine;
+  }
+
   clearAll(): { cleared: number } {
     const cleared = this.entries.size;
     this.entries.clear();
@@ -681,4 +689,28 @@ test('⑬ GET /entries/:id/hits：命中该条目的请求记录 / nearest_query
   assert.equal(badId.status, 400);
   const badPage = await get(baseUrl, `/api/v1/cache/entries/${entryAId}/hits?pageNo=0`);
   assert.equal(badPage.status, 400);
+});
+
+test('⑭ PUT /hit-line：命中线运行时调整 200 / 非法 400 / 值不变（§1.3 / §3.2）', async (t) => {
+  const store = createLogStore({ dbPath: ':memory:' });
+  t.after(() => store.close());
+  const manager = new FakeCacheManager();
+  const baseUrl = await startCacheApi(t, manager, store);
+
+  const ok = await send(baseUrl, 'PUT', '/api/v1/cache/hit-line', { hitLine: 0.85 });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(ok.body.data, { hitLine: 0.85 });
+  const status = await get(baseUrl, '/api/v1/cache/status');
+  assert.equal(status.body.data.hitLine, 0.85, '调整立即生效并反映于状态');
+
+  // 非法 400：≤0 / >1 / 非数字 / 缺 body
+  const badValues = [0, -0.1, 1.5, 'abc', null];
+  for (const bad of badValues) {
+    const res = await send(baseUrl, 'PUT', '/api/v1/cache/hit-line', { hitLine: bad });
+    assert.equal(res.status, 400, `hitLine=${String(bad)} 应 400`);
+  }
+  const noBody = await send(baseUrl, 'PUT', '/api/v1/cache/hit-line', {});
+  assert.equal(noBody.status, 400);
+  const still = await get(baseUrl, '/api/v1/cache/status');
+  assert.equal(still.body.data.hitLine, 0.85, '非法调整后命中线不变');
 });

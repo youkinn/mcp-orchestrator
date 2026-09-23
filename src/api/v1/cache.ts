@@ -56,6 +56,8 @@ export interface CacheOverview {
 export interface CacheManager {
   getStatus(): CacheStatus;
   setEnabled(enabled: boolean): CacheStatus;
+  /** 命中线（§1.3 / §3.2 PUT hit-line）：0 < value ≤ 1；非法返回 NaN（调用方 400） */
+  setHitLine(value: number): number;
   clearAll(): { cleared: number };
   deleteEntry(id: number): boolean;
   listEntries(options: {
@@ -166,6 +168,27 @@ export function createCacheApi(cacheManager: CacheManager, logStore?: LogStore):
       response.json({ code: 200, data: cacheManager.setEnabled(enabled.enabled), message: '' });
     } catch (error) {
       console.error('Failed to set cache status:', error);
+      sendError(response, 500, OPERATE_ERROR_MESSAGE);
+    }
+  });
+
+  // PUT /api/v1/cache/hit-line —— 命中线调整（§3.2 同等风格；0 < hitLine ≤ 1，立即生效，重启回 CACHE_HIT_LINE 初始值；历史 hit_line 不漂移）
+  router.put('/hit-line', (request: Request, response: Response) => {
+    try {
+      const hitLine = (request.body ?? {}) as { hitLine?: unknown };
+      const value = hitLine.hitLine;
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > 1) {
+        sendError(response, 400, 'hitLine 必须为 0~1 的数字（0 < hitLine ≤ 1）');
+        return;
+      }
+      const updated = cacheManager.setHitLine(value);
+      if (Number.isNaN(updated)) {
+        sendError(response, 400, 'hitLine 必须为 0~1 的数字（0 < hitLine ≤ 1）');
+        return;
+      }
+      response.json({ code: 200, data: { hitLine: updated }, message: '' });
+    } catch (error) {
+      console.error('Failed to set cache hit line:', error);
       sendError(response, 500, OPERATE_ERROR_MESSAGE);
     }
   });

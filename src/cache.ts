@@ -48,6 +48,48 @@ function cosine(a: Float32Array, b: Float32Array): number {
   return denom === 0 ? 0 : dot / denom;
 }
 
+/** 三国人物字号/别称 → 本名（判定链路人名字号归一化，§1.2）：长词优先，仅替换字号/别名本身，不替换「字」「号」等提问词 */
+const PERSON_NAME_ALIASES: ReadonlyArray<{ alias: string; name: string }> = [
+  { alias: "关云长", name: "关羽" },
+  { alias: "诸葛孔明", name: "诸葛亮" },
+  { alias: "云长", name: "关羽" },
+  { alias: "玄德", name: "刘备" },
+  { alias: "孟德", name: "曹操" },
+  { alias: "孔明", name: "诸葛亮" },
+  { alias: "翼德", name: "张飞" },
+  { alias: "子龙", name: "赵云" },
+  { alias: "奉先", name: "吕布" },
+  { alias: "公瑾", name: "周瑜" },
+  { alias: "仲达", name: "司马懿" },
+  { alias: "元让", name: "夏侯惇" },
+  { alias: "妙才", name: "夏侯渊" },
+  { alias: "文远", name: "张辽" },
+  { alias: "汉升", name: "黄忠" },
+  { alias: "孟起", name: "马超" },
+  { alias: "文长", name: "魏延" },
+  { alias: "伯约", name: "姜维" },
+  { alias: "伯符", name: "孙策" },
+  { alias: "仲谋", name: "孙权" },
+  { alias: "本初", name: "袁绍" },
+  { alias: "士元", name: "庞统" },
+  { alias: "仲颖", name: "董卓" },
+];
+
+/** 按词条长度降序（长词优先：关云长 先于 云长，避免拆成「关关羽」），命中即替换 */
+const PERSON_NAME_ALIASES_BY_LENGTH: ReadonlyArray<{ alias: string; name: string }> =
+  PERSON_NAME_ALIASES.slice().sort((a, b) => b.alias.length - a.alias.length);
+
+/** 人名字号归一化：表驱动、长词优先；无命中原样返回。只作用判定输入，不落地库文本 */
+function normalizePersonNames(query: string): string {
+  let normalized = query;
+  for (const { alias, name } of PERSON_NAME_ALIASES_BY_LENGTH) {
+    if (normalized.includes(alias)) {
+      normalized = normalized.split(alias).join(name);
+    }
+  }
+  return normalized;
+}
+
 /** 焦点类（§1.2.1）：词表为文档常量，实现照抄 */
 type FocusClass = "chapter" | "process";
 
@@ -341,8 +383,8 @@ export interface CacheManagerOptions {
  *   createCacheApi 使用，勿改形状（接口文档 §三）。
  */
 export class CacheManager {
-  /** 命中线（§1.3）：启动配置项，运行时不可改 */
-  readonly hitLine: number;
+  /** 命中线（§1.3）：启动读 CACHE_HIT_LINE；支持 setHitLine 运行时调整，重启回初始值 */
+  hitLine: number;
   /** 上限（§1.5） */
   readonly maxEntries: number;
 
@@ -384,6 +426,16 @@ export class CacheManager {
   setEnabled(enabled: boolean): CacheStatus {
     this.enabled = enabled;
     return this.getStatus();
+  }
+
+  /** 命中线（§1.3 / 后台 PUT hit-line）：0 < value ≤ 1；非法返回 NaN（调用方 400，值不变）；
+   * 调整立即生效于后续判定与图表着色上沿；不持久化，重启回 CACHE_HIT_LINE 初始值 */
+  setHitLine(value: number): number {
+    if (!Number.isFinite(value) || value <= 0 || value > 1) {
+      return NaN;
+    }
+    this.hitLine = value;
+    return this.hitLine;
   }
 
   /** 全量清除（§1.6 / §3.3）：内存清空 + 镜像清空；cache_logs 不动（历史数据是图表 / 误判率数据源） */
@@ -476,13 +528,16 @@ export class CacheManager {
       return null;
     }
     const userQuery = query.trim();
+    // 步骤 0.5：人名字号归一化（§1.2）：字号/别称统一为本名，只作用判定链路
+    // （embedding 与比对、焦点校验）；cache_logs.user_query / 条目 queryText 仍存原始文本
+    const judgedQuery = normalizePersonNames(userQuery);
     // 步骤 1：embedding 获取（唯一 await 点）；失败 → 降级旁路，等同开关关闭
-    const embedding = await this.fetchEmbedding(userQuery);
+    const embedding = await this.fetchEmbedding(judgedQuery);
     if (!embedding) {
       return null;
     }
     // 步骤 2：同步判定段（无 await；与后台清除 / 删除 / 开关的执行序见 §1.8）
-    return this.judge(userQuery, embedding, traceId);
+    return this.judge(judgedQuery, embedding, traceId, userQuery);
   }
 
   /**
@@ -579,11 +634,13 @@ export class CacheManager {
     return embedding;
   }
 
-  /** §1.2 步骤 2：内存 LRU 同步判定 + §2.4 cache_logs 落一行（判定完成即落，LLM 之前） */
+  /** §1.2 步骤 2：内存 LRU 同步判定 + §2.4 cache_logs 落一行（判定完成即落，LLM 之前）。
+   * judgedQuery = 归一化后判定文本（字号→本名）；userQuery = 原始文本（落库 / 条目展示） */
   private judge(
-    userQuery: string,
+    judgedQuery: string,
     embedding: Float32Array,
-    traceId: string
+    traceId: string,
+    userQuery: string
   ): CacheLookupResult {
     // §1.6 版本失效：条目 versionTag ≠ CACHE_VERSION → 全量清除一次 + warn，本次按池空判定
     const staleIndex = this.entries.findIndex(
@@ -640,7 +697,7 @@ export class CacheManager {
     // b2：唯一候选 → 焦点一致性轻校验（§1.2.1）
     if (candidates.length === 1) {
       const candidate = candidates[0];
-      if (focusClassesDisjoint(userQuery, candidate.entry.queryText)) {
+      if (focusClassesDisjoint(judgedQuery, candidate.entry.queryText)) {
         const result: CacheLookupResult = {
           hit: false,
           reason: "miss-focus",
