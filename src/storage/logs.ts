@@ -362,6 +362,30 @@ export interface GrayZoneLogItem {
   marked: boolean;
 }
 
+/** feat-A013：相似度分布桶明细行（§3.11 下钻清单项；cacheLogId 对齐灰色区命名）。 */
+export interface SimilarityRowsItem {
+  cacheLogId: number;
+  traceId: string;
+  createdAt: number;
+  userQuery: string;
+  nearestQuery: string | null;
+  similarity: number | null;
+  hit: boolean;
+  tieHits: number | null;
+  hitLine: number;
+  marked: boolean;
+}
+
+/** feat-A013：相似度分布桶明细过滤（§3.11 参数；bucketIndex 口径同 §3.7）。 */
+export interface CacheLogBucketFilter {
+  startAt: number;
+  endAt: number;
+  /** 0~49（§3.7 bucketIndex(sim) 同源） */
+  bucketIndex: number;
+  pageNo?: number;
+  pageSize?: number;
+}
+
 /** feat-A013：灰色区清单过滤（§3.8 参数）。 */
 export interface CacheLogsFilter {
   startAt: number;
@@ -503,6 +527,8 @@ export interface LogStore {
   /** 灰色区 query 对清单（§3.8 数据源：hit=0 AND 0.80 ≤ similarity < hit_line） */
   queryCacheLogs(filter: CacheLogsFilter): { list: GrayZoneLogItem[]; total: number };
   queryCacheDistribution(startAt: number, endAt: number): CacheDistributionResult;
+  /** 相似度分布桶明细（§3.11 数据源：按 bucketIndex 过滤 cache_logs，供柱形下钻） */
+  querySimilarityRows(filter: CacheLogBucketFilter): { list: SimilarityRowsItem[]; total: number };
   queryMisjudgeStats(startAt: number, endAt: number): CacheMisjudgeStats;
   /** 误判标记 / 取消：返回行是否存在（已标记重复标记幂等；不存在 → false 供 404） */
   updateCacheLogMark(id: number, marked: boolean, markedBy: string | null): boolean;
@@ -752,6 +778,7 @@ function createNoopStore(): LogStore {
       buckets: [],
       totals: { lowSimilar: 0, grayZone: 0, highConfidence: 0, totalCount: 0 },
     }),
+    querySimilarityRows: () => ({ list: [], total: 0 }),
     queryMisjudgeStats: () => ({ hitTotal: 0, markedMisjudge: 0, misjudgeRate: null }),
     updateCacheLogMark: () => false,
     insertCacheEntry: () => null,
@@ -1511,6 +1538,71 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
       };
     },
 
+    querySimilarityRows(filter): { list: SimilarityRowsItem[]; total: number } {
+      // §3.11 桶过滤口径（与 §3.7 bucketIndex(sim) 同源，桶边界含下不含上）：
+      // 0 → sim IS NULL OR sim < 0.02；1≤i≤48 → i×0.02 ≤ sim < (i+1)×0.02；49 → 0.98 ≤ sim ≤ 1.00
+      let similarityCondition: string;
+      let similarityParams: number[];
+      if (filter.bucketIndex === 0) {
+        similarityCondition = '(similarity IS NULL OR similarity < ?)';
+        similarityParams = [CACHE_DISTRIBUTION_BUCKET_WIDTH];
+      } else if (filter.bucketIndex >= CACHE_DISTRIBUTION_BUCKET_COUNT - 1) {
+        similarityCondition = '(similarity >= ? AND similarity <= ?)';
+        similarityParams = [
+          (CACHE_DISTRIBUTION_BUCKET_COUNT - 1) * CACHE_DISTRIBUTION_BUCKET_WIDTH,
+          1,
+        ];
+      } else {
+        similarityCondition = '(similarity >= ? AND similarity < ?)';
+        similarityParams = [
+          filter.bucketIndex * CACHE_DISTRIBUTION_BUCKET_WIDTH,
+          (filter.bucketIndex + 1) * CACHE_DISTRIBUTION_BUCKET_WIDTH,
+        ];
+      }
+      const conditions = ['created_at >= ?', 'created_at <= ?', similarityCondition];
+      const params: Array<string | number> = [filter.startAt, filter.endAt, ...similarityParams];
+      const whereSql = `WHERE ${conditions.join(' AND ')}`;
+      const countRow = db
+        .prepare(`SELECT COUNT(*) AS total FROM cache_logs ${whereSql}`)
+        .get(...params) as { total: number };
+      const total = countRow.total;
+      const pageNo = Math.max(1, filter.pageNo ?? 1);
+      const pageSizeRaw = filter.pageSize ?? 20;
+      const pageSize = Math.min(100, Math.max(1, pageSizeRaw));
+      const rows = db
+        .prepare(
+          `SELECT id, trace_id, created_at, user_query, nearest_query, similarity, hit, tie_hits, hit_line, marked
+           FROM cache_logs ${whereSql} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+        )
+        .all(...params, pageSize, (pageNo - 1) * pageSize) as Array<{
+        id: number;
+        trace_id: string;
+        created_at: number;
+        user_query: string;
+        nearest_query: string | null;
+        similarity: number | null;
+        hit: number;
+        tie_hits: number | null;
+        hit_line: number;
+        marked: number;
+      }>;
+      return {
+        total,
+        list: rows.map((row) => ({
+          cacheLogId: row.id,
+          traceId: row.trace_id,
+          createdAt: row.created_at,
+          userQuery: row.user_query,
+          nearestQuery: row.nearest_query,
+          similarity: row.similarity,
+          hit: row.hit === 1,
+          tieHits: row.tie_hits,
+          hitLine: row.hit_line,
+          marked: row.marked === 1,
+        })),
+      };
+    },
+
     queryMisjudgeStats(startAt, endAt): CacheMisjudgeStats {
       const hitRow = db
         .prepare(
@@ -1744,6 +1836,12 @@ export function queryCacheLogs(filter: CacheLogsFilter): { list: GrayZoneLogItem
 
 export function queryCacheDistribution(startAt: number, endAt: number): CacheDistributionResult {
   return getLogStore().queryCacheDistribution(startAt, endAt);
+}
+
+export function querySimilarityRows(
+  filter: CacheLogBucketFilter
+): { list: SimilarityRowsItem[]; total: number } {
+  return getLogStore().querySimilarityRows(filter);
 }
 
 export function queryMisjudgeStats(startAt: number, endAt: number): CacheMisjudgeStats {
