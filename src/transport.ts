@@ -86,6 +86,13 @@ export interface ToolCallOrigin {
   stage: ToolCallStage;
 }
 
+/**
+ * feat-A013：内部工具调用返回。ToolCallResult 类型未声明 isError（仅 content / _meta），
+ * 但 MCP 协议 CallToolResult 可携带 isError；callInternal 的失败（含工具侧 isError 与通道异常）
+ * 一律以 `ToolCallResult.isError === true` 形态返回，供缓存层降级旁路（§1.7.2 三不原则）。
+ */
+export type InternalToolResult = ToolCallResult & { isError?: boolean };
+
 /** 单个 MCP server 的连接抽象：默认为 SDK Client + stdio 子进程，测试可注入假实现 */
 export interface MCPServerConnection {
   connect(): Promise<void>;
@@ -330,6 +337,35 @@ export class MCPTransport {
         }
       }
       throw error;
+    }
+  }
+
+  /**
+   * feat-A013：内部工具调用（语义判定设施，§1.7.2 三不原则）：
+   * - 不落 tool_call_logs（无埋点、无 seq 分配）；
+   * - 不注入 _meta.traceId（connection.callTool 不传 meta）；
+   * - 不包装 ToolExecutionError：路由失败 / 通道异常 / 工具侧 isError 一律以
+   *   `ToolCallResult.isError === true` 形态返回，缓存层据此降级旁路（等同开关关闭）。
+   * 工具名按 toolToServer 表路由（内部工具同样登记，同 listTools() 重建口径）。
+   */
+  async callInternal(name: string, args: Record<string, unknown>): Promise<InternalToolResult> {
+    let serverName: string;
+    try {
+      serverName = await this.resolveServerForTool(name);
+    } catch (error) {
+      return { content: [{ type: 'text', text: toErrorMessage(error) }], isError: true };
+    }
+    const connection = this.servers.get(serverName);
+    if (!connection) {
+      return {
+        content: [{ type: 'text', text: `内部工具不可用：${name}` }],
+        isError: true,
+      };
+    }
+    try {
+      return await connection.callTool(name, args);
+    } catch (error) {
+      return { content: [{ type: 'text', text: toErrorMessage(error) }], isError: true };
     }
   }
 

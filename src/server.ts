@@ -10,6 +10,7 @@ import type { MCPTransport } from './transport.js';
 import { ToolExecutionError, type ToolCallResult } from './types.js';
 import { createLogsApi } from './api/v1/logs.js';
 import { createSangoApi } from './api/v1/sango.js';
+import { createCacheApi, type CacheManager } from './api/v1/cache.js';
 import {
   getLogStore,
   truncate,
@@ -162,7 +163,7 @@ function processingErrorInfo(error: unknown): { code: number; message: string } 
 export function createServer(
   agent: Agent,
   transport: MCPTransport,
-  options: { port: number; allowedOrigin: string; logStore?: LogStore }
+  options: { port: number; allowedOrigin: string; logStore?: LogStore; cacheManager?: CacheManager }
 ) {
   const app = express();
   // feat-A007：日志存储（进程级共享实例；测试可注入隔离 store）
@@ -183,6 +184,12 @@ export function createServer(
   app.use('/api/v1/logs', createLogsApi(logStore));
   // feat-A010：三国演义原文接口；后台直调器坊 sango_novel_chapter，不参与模型工具装配
   app.use('/api/v1/sango', createSangoApi(transport));
+  // feat-A013：缓存后台接口；本组接口自身不落日志（防递归，同 /api/v1/logs*）。
+  // cacheManager 由装配层（index.ts）注入 src/cache.ts 实例（小胡实现）；未注入时不挂载路由，
+  // 避免 server 层直接依赖尚在分仓开发的 cache.ts（挂载点与实例形状见 api/v1/cache.ts 注释）。
+  if (options.cacheManager) {
+    app.use('/api/v1/cache', createCacheApi(options.cacheManager, logStore));
+  }
 
   app.get('/health', (_request: Request, response: Response) => {
     response.json({
