@@ -124,20 +124,31 @@ class StageRecordingAgent extends Agent {
   }
 }
 
-test("路由判定：L1 domain 锁定两能力域；天气关键词不再命中路由（纽约天气 → auto）", () => {
+test("路由判定：L1 domain 锁定两能力域（source=label）；天气关键词不再命中路由（纽约天气 → auto）", () => {
   const transport = new MockTransport();
   const agent = new Agent(transport, makeConfig());
 
-  assert.equal(agent.resolveRoute("你好", "sango-novel"), "sango-novel");
-  assert.equal(agent.resolveRoute("你好", "fengyunsanguo"), "fengyunsanguo");
-  assert.equal(agent.resolveRoute("风云三国答题", "fengyunsanguo"), "fengyunsanguo");
-  assert.equal(agent.resolveRoute("谁斩了华雄", "sango-novel"), "sango-novel");
-  assert.equal(
-    agent.resolveRoute("纽约今天适合坐地铁吗？"),
-    "auto",
-    "天气能力下线：天气关键词不再路由到 weather"
-  );
-  assert.equal(agent.resolveRoute("你好"), "auto");
+  assert.deepEqual(agent.resolveRoute("你好", "sango-novel"), {
+    route: "sango-novel",
+    source: "label",
+  });
+  assert.deepEqual(agent.resolveRoute("你好", "fengyunsanguo"), {
+    route: "fengyunsanguo",
+    source: "label",
+  });
+  assert.deepEqual(agent.resolveRoute("风云三国答题", "fengyunsanguo"), {
+    route: "fengyunsanguo",
+    source: "label",
+  });
+  assert.deepEqual(agent.resolveRoute("谁斩了华雄", "sango-novel"), {
+    route: "sango-novel",
+    source: "label",
+  });
+  assert.deepEqual(agent.resolveRoute("纽约今天适合坐地铁吗？"), {
+    route: "auto",
+    source: null,
+  }, "天气能力下线：天气关键词不再路由到 weather");
+  assert.deepEqual(agent.resolveRoute("你好"), { route: "auto", source: null });
 });
 
 test("快路径生成轮：domain=sango-novel 预调 sango_novel_search + 注入 + 域提示，不携带 tools", async () => {

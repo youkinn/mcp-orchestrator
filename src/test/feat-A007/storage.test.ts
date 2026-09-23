@@ -292,9 +292,9 @@ test('token-stats：Asia/Shanghai 日界分桶（UTC 同一天内跨上海日界
   assert.equal(result.granularity, 'day');
   assert.equal(result.timezone, 'Asia/Shanghai');
   assert.deepEqual(result.buckets, [
-    { bucket: '2026-09-20', inputTokens: 100, outputTokens: 10 },
-    { bucket: '2026-09-21', inputTokens: 200, outputTokens: 20 },
-    { bucket: '2026-09-22', inputTokens: 0, outputTokens: 0 },
+    { bucket: '2026-09-20', inputTokens: 100, outputTokens: 10, cachedTokens: 0 },
+    { bucket: '2026-09-21', inputTokens: 200, outputTokens: 20, cachedTokens: 0 },
+    { bucket: '2026-09-22', inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
   ]);
 
   const day2Only = store.queryTokenStats({
@@ -323,9 +323,9 @@ test('token-stats：hour 粒度整点分桶；恰好 7 天不降级，超过 7 �
   });
   assert.equal(hourResult.granularity, 'hour');
   const tenOClock = hourResult.buckets.find((bucket) => bucket.bucket === '2026-09-20T10:00');
-  assert.deepEqual(tenOClock, { bucket: '2026-09-20T10:00', inputTokens: 3, outputTokens: 30 });
+  assert.deepEqual(tenOClock, { bucket: '2026-09-20T10:00', inputTokens: 3, outputTokens: 30, cachedTokens: 0 });
   const nextDay = hourResult.buckets.find((bucket) => bucket.bucket === '2026-09-21T00:00');
-  assert.deepEqual(nextDay, { bucket: '2026-09-21T00:00', inputTokens: 4, outputTokens: 40 });
+  assert.deepEqual(nextDay, { bucket: '2026-09-21T00:00', inputTokens: 4, outputTokens: 40, cachedTokens: 0 });
 
   const exactly7Days = store.queryTokenStats({
     startAt: base,

@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
   client_received_at   INTEGER,
   answer               TEXT,
   citations            TEXT,
+  route_source         TEXT,
   created_at           INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_request_logs_received ON request_logs(server_received_at);
@@ -55,6 +56,10 @@ CREATE TABLE IF NOT EXISTS llm_call_logs (
   prompt_tokens      INTEGER,
   completion_tokens  INTEGER,
   cached_tokens      INTEGER,
+  reasoning_tokens   INTEGER,
+  attempt            INTEGER,
+  input_breakdown    TEXT,
+  max_tokens         INTEGER,
   finish_reason      TEXT,
   status             TEXT NOT NULL,
   error_message      TEXT NOT NULL DEFAULT '',
@@ -86,6 +91,20 @@ CREATE TABLE IF NOT EXISTS tool_retrieval_logs (
 CREATE INDEX IF NOT EXISTS idx_tool_retrieval_logs_created ON tool_retrieval_logs(created_at);
 `;
 
+/** feat-A012：输入分段 token 估算（本地启发式，见接口文档 §2.3）；history/tools 为保留字段当前恒 0 */
+export interface InputBreakdown {
+  system: number;
+  user: number;
+  injected: number;
+  history: number;
+  tools: number;
+}
+
+/** feat-A012：请求路由来源（request_logs.route_source）：
+ * label = L1 前端标签；keyword = L2 关键词；vector = L3 向量；classify = 分类轮 1/2；free = 分类轮 99 兜底。
+ * 历史行 / 未完成路由判定为 null。 */
+export type RouteSource = "label" | "keyword" | "vector" | "classify" | "free";
+
 export interface LlmCallPayload {
   /** 同 trace 内调用序号；缺省由存储层自增（从 1 起） */
   seq?: number | null;
@@ -100,6 +119,14 @@ export interface LlmCallPayload {
   completionTokens?: number | null;
   /** feat-A011：本次调用缓存命中 token 数；provider 未返回（或缺省调用方不传）为 null，与 promptTokens 同口径 */
   cachedTokens?: number | null;
+  /** feat-A012：思考 token 数（provider 原值）；provider 未返回（或缺省调用方不传）为 null */
+  reasoningTokens?: number | null;
+  /** feat-A012：重试标识 1=首次 / 2=变参重试；服务端调用点显式传，历史行 / 未显式传值为 null（前端不推断） */
+  attempt?: number | null;
+  /** feat-A012：输入分段 token 估算对象；缺省不传 → null（历史行） */
+  inputBreakdown?: InputBreakdown | null;
+  /** feat-A012：本次调用输出上限（取调用点 params.max_tokens 原值）；历史行 / 缺省为 null */
+  maxTokens?: number | null;
   finishReason?: string | null;
   status: 'success' | 'failed';
   errorMessage?: string;
@@ -161,6 +188,10 @@ export interface LogListItem {
     total: number | null;
   };
   tokens: { input: number | null; output: number | null } | null;
+  /** feat-A012：路由来源（列表行角标数据源）；历史行 / 未完成判定为 null */
+  routeSource: RouteSource | null;
+  /** feat-A012：该 trace 是否存在 attempt=2 调用（重试角标数据源）；历史行 false */
+  hasRetry: boolean;
 }
 
 export interface LogDetailLog {
@@ -168,6 +199,8 @@ export interface LogDetailLog {
   logType: string;
   userInput: string | null;
   domain: string | null;
+  /** feat-A012：请求路由来源；历史行 / 未完成路由判定为 null */
+  routeSource: RouteSource | null;
   status: 'success' | 'failed';
   responseCode: number;
   errorMessage: string;
@@ -193,6 +226,14 @@ export interface LlmCallLog {
   promptTokens: number | null;
   completionTokens: number | null;
   cachedTokens: number | null;
+  /** feat-A012：思考 token 数（provider 原值）；历史行 / provider 未返回为 null */
+  reasoningTokens: number | null;
+  /** feat-A012：重试标识 1=首次 / 2=变参重试；历史行为 null（前端不推断） */
+  attempt: number | null;
+  /** feat-A012：输入分段 token 估算（§2.3 折算规则）；历史行为 null */
+  inputBreakdown: InputBreakdown | null;
+  /** feat-A012：本次调用输出上限（调用点参数原值）；历史行为 null */
+  maxTokens: number | null;
   finishReason: string | null;
   status: 'success' | 'failed';
   errorMessage: string;
@@ -226,6 +267,8 @@ export interface TokenBucket {
   bucket: string;
   inputTokens: number;
   outputTokens: number;
+  /** feat-A012：桶内缓存命中 token 合计（历史 null 计 0） */
+  cachedTokens: number;
 }
 
 export interface TokenStatsResult {
@@ -267,6 +310,8 @@ export interface LogStore {
   appendToolCall(traceId: string, payload: ToolCallPayload): number | null;
   /** feat-A009：写入检索诊断（trace_id+seq 复合主键；诊断 JSON ≤64KB 已由 sango 截断）；失败静默 */
   appendRetrievalLog(traceId: string, seq: number, diagnostics: unknown): void;
+  /** feat-A012：路由判定完成后回填 request_logs.route_source；旁路静默（失败不影响主流程） */
+  reportRouteSource(traceId: string, routeSource: RouteSource): void;
   reportFrontendEnd(traceId: string, clientReceivedAt: number): void;
   queryList(query: ListQuery): { list: LogListItem[]; total: number };
   queryDetail(traceId: string): LogDetail | null;
@@ -314,6 +359,7 @@ interface RequestLogRow {
   client_received_at: number | null;
   answer: string | null;
   citations: string | null;
+  route_source: string | null;
   created_at: number;
 }
 
@@ -329,6 +375,10 @@ interface LlmLogRow {
   prompt_tokens: number | null;
   completion_tokens: number | null;
   cached_tokens: number | null;
+  reasoning_tokens: number | null;
+  attempt: number | null;
+  input_breakdown: string | null;
+  max_tokens: number | null;
   finish_reason: string | null;
   status: string;
   error_message: string;
@@ -354,6 +404,32 @@ interface ListRow extends RequestLogRow {
   input_tokens: number | null;
   output_tokens: number | null;
   tool_duration: number | null;
+  /** feat-A012：该 trace 内最大 attempt（NULL 计 0）；=2 即存在重试 */
+  max_attempt: number | null;
+}
+
+/** feat-A012：input_breakdown 列（JSON 串）解析为对象；缺失 / 非法 / 解析失败 → null（不炸前端） */
+function parseInputBreakdown(raw: string | null): InputBreakdown | null {
+  if (raw === null || raw === '') {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<InputBreakdown>;
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      typeof parsed.system === 'number' &&
+      typeof parsed.user === 'number' &&
+      typeof parsed.injected === 'number' &&
+      typeof parsed.history === 'number' &&
+      typeof parsed.tools === 'number'
+    ) {
+      return parsed as InputBreakdown;
+    }
+  } catch {
+    // 旁路：解析失败按 null 处理
+  }
+  return null;
 }
 
 function isNumber(value: unknown): value is number {
@@ -429,6 +505,7 @@ function createNoopStore(): LogStore {
     appendLlmCall: noopWrite,
     appendToolCall: () => null,
     appendRetrievalLog: noopWrite,
+    reportRouteSource: noopWrite,
     reportFrontendEnd: noopWrite,
     flush: noopWrite,
     runRetentionCleanup: noopWrite,
@@ -467,6 +544,25 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
     } catch {
       // 旁路：duplicate column 等忽略（新库 / 已迁移库）
     }
+    // feat-A012 旧库迁移：llm_call_logs 增 reasoning_tokens / attempt / input_breakdown / max_tokens，
+    // request_logs 增 route_source；历史行保持 NULL 不回填。新库建表已含各列，重复执行忽略，幂等。
+    for (const column of ["reasoning_tokens", "attempt", "max_tokens"]) {
+      try {
+        db.exec(`ALTER TABLE llm_call_logs ADD COLUMN ${column} INTEGER`);
+      } catch {
+        // 旁路：duplicate column 等忽略
+      }
+    }
+    try {
+      db.exec(`ALTER TABLE llm_call_logs ADD COLUMN input_breakdown TEXT`);
+    } catch {
+      // 旁路：duplicate column 等忽略
+    }
+    try {
+      db.exec(`ALTER TABLE request_logs ADD COLUMN route_source TEXT`);
+    } catch {
+      // 旁路：duplicate column 等忽略
+    }
     // bug-00019 旧库迁移：既有 tool_call_logs 缺 caller（调用方）/ stage（发起阶段）两列，补列；
     // 历史行保持 NULL 不回填（无法事后推断发起方）。新库建表已含两列，重复执行忽略，幂等。
     for (const column of ["caller", "stage"]) {
@@ -499,20 +595,25 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   const reportFrontendEndStmt = db.prepare(
     `UPDATE request_logs SET client_received_at = ? WHERE trace_id = ?`
   );
+  const updateRouteSourceStmt = db.prepare(
+    `UPDATE request_logs SET route_source = ? WHERE trace_id = ?`
+  );
   const insertLlmCallStmt = db.prepare(`
     INSERT INTO llm_call_logs
       (trace_id, seq, stage, model, request_at, response_at, request_summary,
        response_summary, tool_calls, prompt_tokens, completion_tokens, cached_tokens,
+       reasoning_tokens, attempt, input_breakdown, max_tokens,
        finish_reason, status, error_message)
     VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM llm_call_logs WHERE trace_id = ?),
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertLlmCallWithSeqStmt = db.prepare(`
     INSERT OR IGNORE INTO llm_call_logs
       (trace_id, seq, stage, model, request_at, response_at, request_summary,
        response_summary, tool_calls, prompt_tokens, completion_tokens, cached_tokens,
+       reasoning_tokens, attempt, input_breakdown, max_tokens,
        finish_reason, status, error_message)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertToolCallWithSeqStmt = db.prepare(`
     INSERT OR IGNORE INTO tool_call_logs
@@ -576,12 +677,13 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
     SELECT
       r.trace_id, r.log_type, r.user_input, r.domain, r.status, r.response_code, r.error_message,
       r.client_sent_at, r.server_received_at, r.handle_started_at, r.server_responded_at,
-      r.client_received_at, r.created_at,
+      r.client_received_at, r.created_at, r.route_source,
       (SELECT COUNT(*) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS llm_count,
       (SELECT SUM(l.response_at - l.request_at) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS llm_duration,
       (SELECT SUM(l.prompt_tokens) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS input_tokens,
       (SELECT SUM(l.completion_tokens) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS output_tokens,
-      (SELECT SUM(t.call_returned_at - t.call_sent_at) FROM tool_call_logs t WHERE t.trace_id = r.trace_id) AS tool_duration
+      (SELECT SUM(t.call_returned_at - t.call_sent_at) FROM tool_call_logs t WHERE t.trace_id = r.trace_id) AS tool_duration,
+      (SELECT MAX(l.attempt) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS max_attempt
     FROM request_logs r
   `;
   const queryDetailStmt = db.prepare(`SELECT * FROM request_logs WHERE trace_id = ?`);
@@ -595,7 +697,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
     `SELECT diagnostics FROM tool_retrieval_logs WHERE trace_id = ? AND seq = ?`
   );
   const queryTokenRowsStmt = db.prepare(
-    `SELECT request_at, prompt_tokens, completion_tokens
+    `SELECT request_at, prompt_tokens, completion_tokens, cached_tokens
      FROM llm_call_logs WHERE request_at >= ? AND request_at <= ?`
   );
 
@@ -663,6 +765,10 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           payload.promptTokens ?? null,
           payload.completionTokens ?? null,
           payload.cachedTokens ?? null,
+          payload.reasoningTokens ?? null,
+          payload.attempt ?? null,
+          payload.inputBreakdown ? JSON.stringify(payload.inputBreakdown) : null,
+          payload.maxTokens ?? null,
           payload.finishReason ?? null,
           payload.status,
           payload.errorMessage ?? '',
@@ -745,6 +851,17 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           insertRetrievalLogStmt.run(traceId, seq, text, Date.now());
         } catch (error) {
           console.error('Failed to write retrieval diagnostics (bypass):', error);
+        }
+      });
+    },
+
+    /** feat-A012：路由判定完成后回填路由来源；旁路静默（骨架行必然存在，失败不影响主流程） */
+    reportRouteSource(traceId, routeSource): void {
+      enqueue(() => {
+        try {
+          updateRouteSourceStmt.run(routeSource, traceId);
+        } catch (error) {
+          console.error('Failed to update route_source (bypass):', error);
         }
       });
     },
@@ -847,6 +964,8 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
               row.llm_count === 0
                 ? null
                 : { input: row.input_tokens, output: row.output_tokens },
+            routeSource: row.route_source as RouteSource | null,
+            hasRetry: row.max_attempt === 2,
           };
         }),
       };
@@ -870,6 +989,10 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           promptTokens: llm.prompt_tokens,
           completionTokens: llm.completion_tokens,
           cachedTokens: llm.cached_tokens,
+          reasoningTokens: llm.reasoning_tokens,
+          attempt: llm.attempt,
+          inputBreakdown: parseInputBreakdown(llm.input_breakdown),
+          maxTokens: llm.max_tokens,
           finishReason: llm.finish_reason,
           status: llm.status as 'success' | 'failed',
           errorMessage: llm.error_message,
@@ -911,6 +1034,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           logType: row.log_type,
           userInput: row.user_input,
           domain: row.domain,
+          routeSource: row.route_source as RouteSource | null,
           status: row.status as 'success' | 'failed',
           responseCode: row.response_code,
           errorMessage: row.error_message,
@@ -934,13 +1058,15 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
         request_at: number;
         prompt_tokens: number | null;
         completion_tokens: number | null;
+        cached_tokens: number | null;
       }>;
-      const accumulated = new Map<number, { input: number; output: number }>();
+      const accumulated = new Map<number, { input: number; output: number; cached: number }>();
       for (const row of rows) {
         const start = bucketStartMs(row.request_at, granularity);
-        const current = accumulated.get(start) ?? { input: 0, output: 0 };
+        const current = accumulated.get(start) ?? { input: 0, output: 0, cached: 0 };
         current.input += row.prompt_tokens ?? 0;
         current.output += row.completion_tokens ?? 0;
+        current.cached += row.cached_tokens ?? 0;
         accumulated.set(start, current);
       }
       const step = granularity === 'day' ? DAY_MS : 3600 * 1000;
@@ -953,6 +1079,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           bucket: bucketLabel(cursor, granularity),
           inputTokens: current?.input ?? 0,
           outputTokens: current?.output ?? 0,
+          cachedTokens: current?.cached ?? 0,
         });
       }
       return {
@@ -1043,6 +1170,11 @@ export function appendToolCall(traceId: string, payload: ToolCallPayload): numbe
 /** feat-A009：写入检索诊断（trace_id+seq 复合主键）；失败静默，不影响主流程（旁路） */
 export function appendRetrievalLog(traceId: string, seq: number, diagnostics: unknown): void {
   getLogStore().appendRetrievalLog(traceId, seq, diagnostics);
+}
+
+/** feat-A012：路由判定完成后回填路由来源（agent.ts processQueryData 调用；旁路静默，失败不影响主流程） */
+export function reportRouteSource(traceId: string, routeSource: RouteSource): void {
+  getLogStore().reportRouteSource(traceId, routeSource);
 }
 
 export function reportFrontendEnd(traceId: string, clientReceivedAt: number): void {
