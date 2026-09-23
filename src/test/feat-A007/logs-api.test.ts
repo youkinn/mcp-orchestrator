@@ -114,8 +114,8 @@ test('GET /api/v1/logs：成功信封 + 列表项字段 + durations/tokens 派�
   assert.deepEqual(
     Object.keys(item).sort(),
     [
-      'domain', 'durations', 'errorMessage', 'logType', 'responseCode',
-      'serverReceivedAt', 'status', 'tokens', 'traceId', 'userInput',
+      'domain', 'durations', 'errorMessage', 'hasRetry', 'logType', 'responseCode',
+      'routeSource', 'serverReceivedAt', 'status', 'tokens', 'traceId', 'userInput',
     ]
   );
   assert.equal(item.traceId, TRACE_A);
@@ -341,9 +341,9 @@ test('GET /api/v1/logs/token-stats：Asia/Shanghai 日界分桶 + 空桶补零 +
   assert.deepEqual(
     day.body.data.buckets.slice(0, 3),
     [
-      { bucket: '2026-09-20', inputTokens: 100, outputTokens: 10 },
-      { bucket: '2026-09-21', inputTokens: 200, outputTokens: 20 },
-      { bucket: '2026-09-22', inputTokens: 0, outputTokens: 0 },
+      { bucket: '2026-09-20', inputTokens: 100, outputTokens: 10, cachedTokens: 0 },
+      { bucket: '2026-09-21', inputTokens: 200, outputTokens: 20, cachedTokens: 0 },
+      { bucket: '2026-09-22', inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
     ]
   );
 
