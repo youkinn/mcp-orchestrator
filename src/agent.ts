@@ -9,7 +9,13 @@ import {
 } from "./types.js";
 import type { MCPTransport, ToolCallOrigin } from "./transport.js";
 import { getTraceId } from "./trace.js";
-import { appendLlmCall, truncate } from "./storage/logs.js";
+import {
+  appendLlmCall,
+  reportRouteSource,
+  truncate,
+  type InputBreakdown,
+  type RouteSource,
+} from "./storage/logs.js";
 import {
   NOVEL_NO_HIT_ANSWER,
   SANGO_NOVEL_SEARCH_TOOL,
@@ -97,6 +103,67 @@ function toErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** feat-A012 §2.5：本次调用输出上限（请求参数与落库共用同一来源，防两处漂移） */
+const MAX_TOKENS = 1000;
+
+/** feat-A012 §2.3：CJK（含全角标点）1 token/字，其余 1 token/4 字符，累加后四舍五入 */
+function estimateTokens(text: string): number {
+  let cjkCount = 0;
+  let otherCount = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0)!;
+    if (
+      (code >= 0x2e80 && code <= 0x9fff) ||
+      (code >= 0xf900 && code <= 0xfaff) ||
+      (code >= 0xff00 && code <= 0xffef)
+    ) {
+      cjkCount += 1;
+    } else {
+      otherCount += 1;
+    }
+  }
+  return Math.round(cjkCount + otherCount / 4);
+}
+
+/** feat-A012 §2.3：结构化 messages 的文本提取（字符串或 OpenAI 数组 text 项） */
+function messageText(content: unknown): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .filter(
+        (item: any) => item?.type === "text" && typeof item.text === "string"
+      )
+      .map((item: any) => item.text)
+      .join("\n");
+  }
+  return "";
+}
+
+/** feat-A012 §2.3：基于结构化 messages 计算输入分段 token 估算；
+ * system = 第一条 system 消息；user = user 消息；injected = 其余 system 消息；history / tools 恒 0 */
+function computeInputBreakdown(messages: any[]): InputBreakdown {
+  let system = 0;
+  let user = 0;
+  let injected = 0;
+  let firstSystemSeen = false;
+  for (const message of messages) {
+    const text = messageText(message?.content);
+    if (message?.role === "system") {
+      if (firstSystemSeen) {
+        injected += estimateTokens(text);
+      } else {
+        system += estimateTokens(text);
+        firstSystemSeen = true;
+      }
+    } else if (message?.role === "user") {
+      user += estimateTokens(text);
+    }
+  }
+  return { system, user, injected, history: 0, tools: 0 };
+}
+
 // feat-A011：提示词拆分为「分类提示 + 域提示 + 自由对话提示」四常量（接口文档 §2.3 / §2.4，逐字节照录），
 // 原 UNIFIED_SYSTEM_PROMPT 已删除。缓存友好：静态前缀逐字节稳定，变化内容（注入片段）恒在消息末尾。
 
@@ -164,6 +231,13 @@ const CITATION_FALLBACK_CONCLUSION_PROMPT =
 
 /** 路由目标（docs/sango-mcp-routing-design.md §二）：天气能力已下线（feat-A011），仅剩两能力域与 auto */
 export type RouteTarget = "fengyunsanguo" | "sango-novel" | "auto";
+
+/** feat-A012 §2.2：路由判定结果。route = 目标域；source = 路由来源
+ * （label = L1 domain 参数命中；keyword = L2 关键词硬匹配命中；auto 未锁定 = null） */
+export interface RouteDecision {
+  route: RouteTarget;
+  source: "label" | "keyword" | null;
+}
 
 /** L3 向量匹配注入点：只做风云三国高置信正向识别，命中返回 fengyunsanguo */
 export type FengyunsanguoVectorMatcher = (
@@ -353,10 +427,14 @@ export class Agent {
         ? { traceId, stage }
         : null;
     const requestSummary = logContext ? summarizeJson(messages) : "";
+    // feat-A012 §2.3：输入分段 token 估算（基于结构化 messages，仅 logContext 非空时计算；各段之和不与 prompt_tokens 对账）
+    const inputBreakdown = logContext ? computeInputBreakdown(messages) : null;
 
-    /** 单次请求（参数化温度 / 思考开关）：请求异常记 failed 并上抛，成功返回归一化结果与元信息 */
+    /** 单次请求（参数化温度 / 思考开关）：请求异常记 failed 并上抛，成功返回归一化结果与元信息。
+     * feat-A012 §2.1：attempt = 调用轮次（1 = 首轮 / 2 = 变参重试），随返回对象携带，落库显式传。 */
     const callOnce = async (
-      callOptions: ModelCallOptions
+      callOptions: ModelCallOptions,
+      attempt: 1 | 2
     ): Promise<{
       requestAt: number;
       response: OpenAI.Chat.Completions.ChatCompletion;
@@ -364,6 +442,7 @@ export class Agent {
       normalizedContent: any[];
       reasoningContent: string | null;
       finishReason: string | null;
+      attempt: 1 | 2;
     }> => {
       const requestAt = Date.now();
       let response: OpenAI.Chat.Completions.ChatCompletion;
@@ -375,7 +454,7 @@ export class Agent {
           // bug-00018：本模型为思考模型，reasoning_tokens 计入 completion_tokens，max_tokens 同时限制
           // 「思考 + 正文」；思考不收敛时正文恒为空（放大 max_tokens 无效）。各调用点是否关闭思考
           // 的口径见 bug-00018，调用点均有对应备注。
-          max_tokens: 1000,
+          max_tokens: MAX_TOKENS,
           temperature: callOptions.temperature ?? 0.7,
         };
         if (callOptions.disableThinking) {
@@ -395,6 +474,9 @@ export class Agent {
               responseAt: null,
               requestSummary,
               responseSummary: null,
+              attempt,
+              inputBreakdown,
+              maxTokens: MAX_TOKENS,
               status: "failed",
               errorMessage: toErrorMessage(error),
             });
@@ -436,6 +518,7 @@ export class Agent {
         normalizedContent,
         reasoningContent,
         finishReason: response.choices?.[0]?.finish_reason ?? null,
+        attempt,
       };
     };
 
@@ -461,6 +544,12 @@ export class Agent {
           completionTokens: call.response.usage?.completion_tokens ?? null,
           cachedTokens:
             call.response.usage?.prompt_tokens_details?.cached_tokens ?? null,
+          reasoningTokens:
+            call.response.usage?.completion_tokens_details?.reasoning_tokens ??
+            null,
+          attempt: call.attempt,
+          inputBreakdown,
+          maxTokens: MAX_TOKENS,
           finishReason: call.finishReason,
           status,
           errorMessage,
@@ -471,10 +560,13 @@ export class Agent {
     };
 
     // 首轮：按调用点口径（options 缺省 = 保留思考 + temperature 0.7）
-    const first = await callOnce({
-      disableThinking: options?.disableThinking,
-      temperature: options?.temperature,
-    });
+    const first = await callOnce(
+      {
+        disableThinking: options?.disableThinking,
+        temperature: options?.temperature,
+      },
+      1
+    );
     if (!isEmptyAnswer(first.normalizedContent, first.finishReason)) {
       recordCall(first, "success", "");
       return {
@@ -490,7 +582,7 @@ export class Agent {
       "failed",
       `空答案：content 为空 / finish_reason=${first.finishReason}`
     );
-    const retry = await callOnce({ disableThinking: true, temperature: 0 });
+    const retry = await callOnce({ disableThinking: true, temperature: 0 }, 2);
     if (isEmptyAnswer(retry.normalizedContent, retry.finishReason)) {
       recordCall(retry, "failed", "空答案：变参重试后仍为空");
       throw new Error("模型返回空答案，请稍后重试");
@@ -795,20 +887,20 @@ export class Agent {
    * 路由判定（零 LLM）：L1 前端标签 → L2 本地关键词硬匹配（feat-A011 天气关键词分支已删除）。
    * 返回 "auto" 表示前两层未命中，交由 L3 题库高置信识别（调用方注入）与轻量分类轮处理。
    */
-  resolveRoute(query: string, domain?: string): RouteTarget {
+  resolveRoute(query: string, domain?: string): RouteDecision {
     if (domain && DOMAIN_ROUTES[domain]) {
-      return DOMAIN_ROUTES[domain];
+      return { route: DOMAIN_ROUTES[domain], source: "label" };
     }
     const lowered = query.toLowerCase();
     const hit = (keywords: string[]) =>
       keywords.some((keyword) => lowered.includes(keyword.toLowerCase()));
     if (hit(FENGYUNSANGUO_KEYWORDS)) {
-      return "fengyunsanguo";
+      return { route: "fengyunsanguo", source: "keyword" };
     }
     if (hit(NOVEL_KEYWORDS)) {
-      return "sango-novel";
+      return { route: "sango-novel", source: "keyword" };
     }
-    return "auto";
+    return { route: "auto", source: null };
   }
 
   /** bug-00019：origin 必填——域内快路径预调均由服务端发起，发起阶段由调用点显式指定（不做推断）。 */
@@ -890,9 +982,12 @@ export class Agent {
     let resolvedContent = '';
 
     // 路由判定（L1 前端标签 → L2 关键词）：命中专用域直接走域内快路径（预调 + 注入），不经分类轮
-    const route = this.resolveRoute(query, domain);
-    const lockedRoute = Object.values(DOMAIN_ROUTES).includes(route)
-      ? route
+    // feat-A012 §2.2：resolveRoute 返回 route + source（label / keyword / auto=null），
+    // 后续按 L3 / 分类轮组合出完整 routeSource（vector / classify / free）
+    const decision = this.resolveRoute(query, domain);
+    let routeSource: RouteSource | null = decision.source;
+    const lockedRoute = Object.values(DOMAIN_ROUTES).includes(decision.route)
+      ? decision.route
       : null;
     let systemPrompt = this.systemPrompt;
     if (lockedRoute) {
@@ -913,6 +1008,7 @@ export class Agent {
       const fengyunsanguoHit =
         await this.options.fengyunsanguoVectorMatcher?.(query);
       if (fengyunsanguoHit === true || fengyunsanguoHit === "fengyunsanguo") {
+        routeSource = "vector";
         const { result } = await this.resolveUserContent(
           query,
           DOMAIN_ROUTES.fengyunsanguo,
@@ -935,6 +1031,12 @@ export class Agent {
           { disableThinking: true }
         );
         const routeId = parseClassifyRouteId(classifyResponse.content);
+        // feat-A012 §2.2：分类轮解析编号 1/2 → classify；99 / 无法解析 / 非 1/2/99 → free
+        routeSource =
+          routeId === CLASSIFY_ROUTE_IDS.sangoNovel ||
+          routeId === CLASSIFY_ROUTE_IDS.fengyunsanguo
+            ? "classify"
+            : "free";
         if (routeId === CLASSIFY_ROUTE_IDS.sangoNovel) {
           const result = await this.resolveUserContent(
             query,
@@ -968,6 +1070,16 @@ export class Agent {
     ];
     if (resolvedContent) {
       messages.push({ role: "system", content: resolvedContent });
+    }
+    // feat-A012 §2.2：路由判定完成（LLM 调用前）一次性回填 route_source；
+    // 旁路静默（失败不影响主流程）；fallback 轮（引用校验兜底结论轮）不覆盖
+    const routeTraceId = getTraceId();
+    if (
+      routeSource &&
+      typeof routeTraceId === "string" &&
+      routeTraceId !== ""
+    ) {
+      reportRouteSource(routeTraceId, routeSource);
     }
     // bug-00018 口径：有注入（域锁定快路径 / auto 分到 1、2）→ 任务已确定、输出已约束 → 关闭思考；
     // 仅「无注入的自由模式 99」保留思考（模型需自行作答）。
