@@ -29,3 +29,6 @@ pnpm-debug.log*
 
 # feat-A007 runtime SQLite database
 data/logs.db
+
+# feat-A013 acceptance runtime logs
+logs/
