@@ -42,6 +42,7 @@ import {
   persistRetrievalDiagnostics,
   type RetrievalPersister,
 } from "./recallDiagnostics.js";
+import type { CacheLookupResult, CacheManager } from "./cache.js";
 
 export type { ChatData } from "./citation.js";
 
@@ -344,6 +345,8 @@ export interface AgentOptions {
   fengyunsanguoVectorMatcher?: FengyunsanguoVectorMatcher;
   /** feat-A009 诊断落库注入点（测试用）；不注入使用默认实现（appendRetrievalLog，旁路静默） */
   retrievalDiagnosticsPersister?: RetrievalPersister;
+  /** feat-A013：sango-novel 域语义缓存管理器；不注入则缓存不生效（兼容存量调用） */
+  cacheManager?: CacheManager;
 }
 
 export class Agent {
@@ -984,6 +987,8 @@ export class Agent {
     let novelSearched = false;
     const userContent = query.trim();
     let resolvedContent = '';
+    // feat-A013：本次请求的缓存判定结果（sango-novel 域 lookup 产出，收尾交给 record 内部判定写缓存）
+    let cacheLookup: CacheLookupResult | null = null;
 
     // 路由判定（L1 前端标签 → L2 关键词）：命中专用域直接走域内快路径（预调 + 注入），不经分类轮
     // feat-A012 §2.2：resolveRoute 返回 route + source（label / keyword / auto=null），
@@ -995,6 +1000,13 @@ export class Agent {
       : null;
     let systemPrompt = this.systemPrompt;
     if (lockedRoute) {
+      // feat-A013：sango-novel 域路由判定完成、检索预调之前查语义缓存（命中 = 0 次 LLM + 0 次检索）
+      if (lockedRoute === DOMAIN_ROUTES['sango-novel']) {
+        cacheLookup = await this.novelCacheLookup(query, routeSource);
+        if (cacheLookup?.hit === true) {
+          return cacheLookup.data;
+        }
+      }
       const result = await this.resolveUserContent(
         query,
         lockedRoute,
@@ -1042,6 +1054,11 @@ export class Agent {
             ? "classify"
             : "free";
         if (routeId === CLASSIFY_ROUTE_IDS.sangoNovel) {
+          // feat-A013：分类轮判定 sango-novel 完成、检索预调之前查语义缓存（route_source 已定为 classify）
+          cacheLookup = await this.novelCacheLookup(query, routeSource);
+          if (cacheLookup?.hit === true) {
+            return cacheLookup.data;
+          }
           const result = await this.resolveUserContent(
             query,
             DOMAIN_ROUTES["sango-novel"],
@@ -1118,7 +1135,52 @@ export class Agent {
     }
     // feat-A009 收尾：回填 injected/cited 后按 (trace_id, seq) 一次性落库（旁路原则：失败不影响响应）
     this.persistRetrievalDiagnostics(tracking, citedChunkIds);
+    // feat-A013：最终 ChatData 就绪后统一调 record（写缓存内部判定，§1.4；旁路静默）
+    this.recordNovelCache(query, cacheLookup, data);
     return data;
+  }
+
+  /** feat-A013：sango-novel 域路由判定完成后、检索预调前查询语义缓存。
+   * 命中 → 回填 route_source（§4.1：路由判定在缓存检查之前，命中请求也必须有来源）并返回缓存答案深拷贝；
+   * 未命中 / 旁路（开关关闭、embedding 降级）→ 返回判定结果（调用点保存，供收尾 record 内部判定写缓存）。 */
+  private async novelCacheLookup(
+    query: string,
+    routeSource: RouteSource | null
+  ): Promise<CacheLookupResult | null> {
+    const cacheManager = this.options.cacheManager;
+    if (!cacheManager) {
+      return null;
+    }
+    const traceIdValue = getTraceId() ?? '';
+    const lookup = await cacheManager.lookup(query, traceIdValue);
+    if (lookup?.hit === true) {
+      if (routeSource && traceIdValue !== '') {
+        try {
+          reportRouteSource(traceIdValue, routeSource);
+        } catch {
+          // 旁路：埋点失败静默，绝不影响缓存命中返回
+        }
+      }
+    }
+    return lookup;
+  }
+
+  /** feat-A013：最终 ChatData 就绪后调用 record（§1.4 写缓存内部判定；旁路静默失败不影响响应） */
+  private recordNovelCache(
+    query: string,
+    lookup: CacheLookupResult | null,
+    data: ChatData
+  ): void {
+    const cacheManager = this.options.cacheManager;
+    if (!cacheManager) {
+      return;
+    }
+    const traceIdValue = getTraceId() ?? '';
+    try {
+      cacheManager.record(query, traceIdValue, lookup, data);
+    } catch {
+      // 旁路：缓存写失败静默，绝不影响 /api/chat 主流程与响应
+    }
   }
 
   /** feat-A009：注入视图实际纳入的候选 chunkId（feat-A011 起全部为快路径确定性注入，无 tool-use 路径） */
