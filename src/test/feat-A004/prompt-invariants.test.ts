@@ -35,6 +35,11 @@ test("② sango-novel 域提示：§2.4 原文照录，含指针 / 片段 / 兜�
   assert.doesNotMatch(SANGO_NOVEL_DOMAIN_PROMPT, /sango_novel_search/);
 });
 
+test("②a 演义域生成轮含事件结构方向校验（bug-00023：主宾反转 / 错误前提）", () => {
+  assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /施事者=.*动作=.*受事者=/);
+  assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /方向是否一致.*禁止用该文档回答/);
+});
+
 test("③ fengyunsanguo 域提示：§2.4 原文照录，含固定话术与未召回兜底", () => {
   assert.match(FENGYUNSANGUO_DOMAIN_PROMPT, /当前为「风云三国题库」场景/);
   assert.match(FENGYUNSANGUO_DOMAIN_PROMPT, /不要再调用检索工具/);
