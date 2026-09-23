@@ -38,8 +38,10 @@ function cacheLogPayload(overrides: Partial<CacheLogPayload> = {}): CacheLogPayl
   };
 }
 
+let nextEntryId = 1;
 function entryPayload(overrides: Partial<CacheEntryPayload> = {}): CacheEntryPayload {
   return {
+    id: nextEntryId++,
     queryText: '义释严颜是怎么回事',
     embeddingB64: 'aW52YWxpZA==',
     answerJson: '{"answer":"严颜被义释的经过……","citations":[]}',
@@ -299,7 +301,7 @@ test('⑧ queryCacheDistribution 桶聚合（§3.7：50 桶 / sim=null 落桶 0 
   assert.equal(store.queryCacheDistribution(0, Date.now() + 1000).totals.totalCount, 9, '全区间 → 9 行');
 });
 
-test('⑨ queryMisjudgeStats 误判口径（§3.9：命中行总数 / 标记误判 / 4 位小数；hitTotal=0 → rate null）', () => {
+test('⑨ queryMisjudgeStats 误判口径（§3.9：hitTotal=hit 行数 / markedMisjudge=区间 marked 行数含未命中 / 4 位小数；hitTotal=0 → rate null）', () => {
   const store = createLogStore({ dbPath: ':memory:' });
   t_after(store);
   const at = (n: number) => 1000 + n;
@@ -312,16 +314,18 @@ test('⑨ queryMisjudgeStats 误判口径（§3.9：命中行总数 / 标记误�
   ensureSkeleton(store, TRACE_D, at(4));
   store.appendCacheLog(TRACE_D, cacheLogPayload()); // hit=1，随后标记
   ensureSkeleton(store, TRACE_E, at(5));
-  store.appendCacheLog(TRACE_E, cacheLogPayload({ hit: false, similarity: 0.85 })); // hit=0（不计入）
+  store.appendCacheLog(TRACE_E, cacheLogPayload({ hit: false, similarity: 0.85 })); // hit=0（不计入 hitTotal，标记计入 markedMisjudge）
 
   const first = store.queryCacheLogByTrace(TRACE_A)!;
   const fourth = store.queryCacheLogByTrace(TRACE_D)!;
+  const fifth = store.queryCacheLogByTrace(TRACE_E)!;
   store.updateCacheLogMark(fourth.id, true, '测试员');
+  store.updateCacheLogMark(fifth.id, true, '测试员');
 
   const stats = store.queryMisjudgeStats(0, Date.now() + 1000);
   assert.equal(stats.hitTotal, 4);
-  assert.equal(stats.markedMisjudge, 1);
-  assert.equal(stats.misjudgeRate, 0.25);
+  assert.equal(stats.markedMisjudge, 2, 'marked=1 含未命中灰色区标记行');
+  assert.equal(stats.misjudgeRate, 0.5);
 
   // 时间窗口裁剪 → 空命中
   const empty = store.queryMisjudgeStats(1, first.createdAt - 1);
@@ -387,7 +391,7 @@ test('⑪ 旧库兼容：无 cache 表的存量库打开幂等建表（验收 16
   const store = createLogStore({ dbPath });
   assert.equal(store.queryList({}).total, 1, '既有列表接口照常');
   assert.equal(store.queryCacheLogByTrace('9f7c0000-0000-4000-8000-0000000000aa'), null, '历史行无 cache_logs');
-  const id = store.insertCacheEntry(entryPayload());
+  const id = store.insertCacheEntry(entryPayload({ id: 1 }));
   assert.equal(id, 1, '新表幂等创建后可用');
   store.close();
   // 再次打开幂等（重复建表 / 迁移不报错）

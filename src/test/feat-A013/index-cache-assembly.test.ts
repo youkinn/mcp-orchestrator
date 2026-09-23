@@ -96,6 +96,7 @@ test('① CacheManager 构造即清一次 cache_entries 镜像（§2.3 启动清
   const logStore = createLogStore({ dbPath: ':memory:' });
   t.after(() => logStore.close());
   logStore.insertCacheEntry({
+    id: 1,
     queryText: '残留条目',
     embeddingB64: 'x',
     answerJson: '{}',

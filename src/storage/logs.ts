@@ -437,6 +437,8 @@ export interface CacheMisjudgeStats {
 
 /** feat-A013：cache_entries 写入入参（answerJson 由调用方序列化，answerBytes 与 §1.1 口径一致）。 */
 export interface CacheEntryPayload {
+  /** 与内存 LRU 条目同值（§2.1；显式插 id，禁止 DB 自增导致分叉） */
+  id: number;
   queryText: string;
   embeddingB64: string;
   answerJson: string;
@@ -954,8 +956,8 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   );
   const insertCacheEntryStmt = db.prepare(`
     INSERT INTO cache_entries
-      (query_text, embedding_b64, answer_json, answer_bytes, hit_count, last_access_at, created_at, version_tag)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      (id, query_text, embedding_b64, answer_json, answer_bytes, hit_count, last_access_at, created_at, version_tag)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const updateCacheEntryStmt = db.prepare(`
     UPDATE cache_entries
@@ -1642,12 +1644,12 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
         .get(startAt, endAt) as { total: number };
       const markedRow = db
         .prepare(
-          `SELECT COUNT(*) AS total FROM cache_logs WHERE hit = 1 AND marked = 1 AND created_at >= ? AND created_at <= ?`
+          `SELECT COUNT(*) AS total FROM cache_logs WHERE marked = 1 AND created_at >= ? AND created_at <= ?`
         )
         .get(startAt, endAt) as { total: number };
       const hitTotal = hitRow.total;
       const markedMisjudge = markedRow.total;
-      // §3.9：误判率 4 位小数；hitTotal=0 → null（页面显示「—」）
+      // §3.9：markedMisjudge = 区间内 marked=1 行数（含未命中灰色区标记）；误判率 4 位小数；hitTotal=0 → null（页面显示「—」）
       return {
         hitTotal,
         markedMisjudge,
@@ -1678,6 +1680,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
     insertCacheEntry(payload): number | null {
       try {
         const info = insertCacheEntryStmt.run(
+          payload.id,
           payload.queryText,
           payload.embeddingB64,
           payload.answerJson,

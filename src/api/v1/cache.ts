@@ -16,7 +16,7 @@ const QUERY_ERROR_MESSAGE = '查询缓存失败，请稍后重试';
 const OPERATE_ERROR_MESSAGE = '操作缓存失败，请稍后重试';
 const STATS_ERROR_MESSAGE = '查询统计失败，请稍后重试';
 const MISJUDGE_NOTE =
-  '误判率 = 区间标记误判命中数 / 区间命中总数；未标记不计为正确；hitTotal=0 时 rate 为 null';
+  '误判率 = 区间标记误判数 / 区间命中总数；未标记不计为正确；hitTotal=0 时 rate 为 null';
 
 /** feat-A013：缓存池状态（§3.1 / §3.2 返回形状）。 */
 export interface CacheStatus {

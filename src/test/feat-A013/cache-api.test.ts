@@ -468,13 +468,15 @@ test('⑩ GET /misjudge：误判率口径与 note（§3.9；hitTotal=0 → rate 
   const second = store.queryCacheLogByTrace(TRACE_B)!;
   store.updateCacheLogMark(second.id, true, '控制台');
   seedCacheLog(store, '9f7c0000-0000-4000-8000-0000000000c3', { hit: false, similarity: 0.85 } as never);
+  const gray = store.queryCacheLogByTrace('9f7c0000-0000-4000-8000-0000000000c3')!;
+  store.updateCacheLogMark(gray.id, true, '控制台');
 
   const res = await get(baseUrl, `/api/v1/cache/misjudge?startAt=${now - 60000}&endAt=${now + 60000}`);
   assert.equal(res.status, 200);
   assert.equal(res.body.data.hitTotal, 2);
-  assert.equal(res.body.data.markedMisjudge, 1);
-  assert.equal(res.body.data.misjudgeRate, 0.5);
-  assert.ok(res.body.data.note.startsWith('误判率 = 区间标记误判命中数'));
+  assert.equal(res.body.data.markedMisjudge, 2, 'marked=1 含未命中灰色区标记行');
+  assert.equal(res.body.data.misjudgeRate, 1);
+  assert.ok(res.body.data.note.startsWith('误判率 = 区间标记误判数'));
 
   const empty = await get(baseUrl, `/api/v1/cache/misjudge?startAt=${now - 60000}&endAt=${now - 59999}`);
   assert.equal(empty.body.data.hitTotal, 0);
@@ -603,7 +605,9 @@ test('⑬ GET /entries/:id/hits：命中该条目的请求记录 / nearest_query
   const now = Date.now();
 
   // 镜像条目：一条「义释严颜的经过」+ 一条无关条目（命中记录按 nearest_query = 条目 query_text 归属）
+  // 显式 id（§2.1 镜像 id == 内存 id）：1001 / 1002；回归拦截「INSERT 漏 id 致 DB 自增分叉」
   const entryAId = store.insertCacheEntry({
+    id: 1001,
     queryText: '义释严颜的经过',
     embeddingB64: 'AAAA',
     answerJson: '{}',
@@ -613,8 +617,9 @@ test('⑬ GET /entries/:id/hits：命中该条目的请求记录 / nearest_query
     createdAt: now,
     versionTag: 'test',
   });
-  assert.ok(entryAId !== null);
+  assert.equal(entryAId, 1001, '显式 id 插入后镜像行 id 与传入一致');
   const entryBId = store.insertCacheEntry({
+    id: 1002,
     queryText: '无关条目',
     embeddingB64: 'AAAA',
     answerJson: '{}',
@@ -624,7 +629,7 @@ test('⑬ GET /entries/:id/hits：命中该条目的请求记录 / nearest_query
     createdAt: now,
     versionTag: 'test',
   });
-  assert.ok(entryBId !== null);
+  assert.equal(entryBId, 1002);
 
   // 命中该条目的请求 ×3；另 seed hit=0 同行异 query / hit=1 异 query 均应排除
   const TRACE_C = '9f7c0000-0000-4000-8000-0000000000e1';
@@ -668,8 +673,8 @@ test('⑬ GET /entries/:id/hits：命中该条目的请求记录 / nearest_query
   assert.equal(page2.body.data.total, 3);
   assert.deepEqual(page2.body.data.list.map((i: { traceId: string }) => i.traceId), [TRACE_A]);
 
-  // 条目不存在 → 404；id 非法 / 分页非法 → 400
-  const missing = await get(baseUrl, '/api/v1/cache/entries/999999/hits');
+  // 条目不存在 → 404（N+1 = 未插入的 id）；id 非法 / 分页非法 → 400
+  const missing = await get(baseUrl, '/api/v1/cache/entries/1003/hits');
   assert.equal(missing.status, 404);
   assert.equal(missing.body.message, '缓存条目不存在');
   const badId = await get(baseUrl, '/api/v1/cache/entries/abc/hits');
