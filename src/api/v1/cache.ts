@@ -87,6 +87,19 @@ function parseQueryString(raw: unknown): string | undefined {
   return typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : undefined;
 }
 
+/** §3.8 灰色区区间过滤：similarityMin / similarityMax（可选、可单传）。合法数字且 0~1 → number；缺失 / 空串 → undefined；非法 → null（400 点名参数） */
+function parseSimilarityValue(raw: unknown): number | undefined | null {
+  const text = parseQueryString(raw);
+  if (text === undefined) {
+    return undefined;
+  }
+  if (!/^\d+(\.\d+)?$/.test(text)) {
+    return null;
+  }
+  const num = Number(text);
+  return num >= 0 && num <= 1 ? num : null;
+}
+
 /** §3.7 / §3.8 / §3.9 / §3.11：startAt / endAt 必填毫秒时间戳且 startAt ≤ endAt（校验同 token-stats）；否则 null（400） */
 function parseRange(query: Request['query']): { startAt: number; endAt: number } | null {
   const startAt = parseQueryInteger(query.startAt);
@@ -183,6 +196,40 @@ export function createCacheApi(cacheManager: CacheManager, logStore?: LogStore):
     } catch (error) {
       console.error('Failed to delete cache entry:', error);
       sendError(response, 500, OPERATE_ERROR_MESSAGE);
+    }
+  });
+
+  // GET /api/v1/cache/entries/:id/hits —— 缓存条目命中记录（§3.12；命中该条目的请求 = hit=1 且 nearest_query = 条目 query_text）
+  router.get('/entries/:id/hits', (request: Request, response: Response) => {
+    try {
+      const id = parseId(request.params.id);
+      if (id === null) {
+        sendError(response, 400, 'id 非法');
+        return;
+      }
+      const paging = parsePaging(request.query);
+      if (paging === null) {
+        sendError(response, 400, '分页参数非法');
+        return;
+      }
+      const result = store.queryEntryHits(id, paging.pageNo, paging.pageSize);
+      if (result === null) {
+        sendError(response, 404, '缓存条目不存在');
+        return;
+      }
+      response.json({
+        code: 200,
+        data: {
+          list: result.list,
+          total: result.total,
+          pageNo: paging.pageNo,
+          pageSize: paging.pageSize,
+        },
+        message: '',
+      });
+    } catch (error) {
+      console.error('Failed to query entry hits:', error);
+      sendError(response, 500, QUERY_ERROR_MESSAGE);
     }
   });
 
@@ -328,10 +375,26 @@ export function createCacheApi(cacheManager: CacheManager, logStore?: LogStore):
         sendError(response, 400, 'marked 只支持 all/marked/unmarked');
         return;
       }
+      const similarityMin = parseSimilarityValue(request.query.similarityMin);
+      if (similarityMin === null) {
+        sendError(response, 400, 'similarityMin 须为 0~1 的数字');
+        return;
+      }
+      const similarityMax = parseSimilarityValue(request.query.similarityMax);
+      if (similarityMax === null) {
+        sendError(response, 400, 'similarityMax 须为 0~1 的数字');
+        return;
+      }
+      if (similarityMin !== undefined && similarityMax !== undefined && similarityMin > similarityMax) {
+        sendError(response, 400, 'similarityMin 不能大于 similarityMax');
+        return;
+      }
       const result = store.queryCacheLogs({
         startAt: range.startAt,
         endAt: range.endAt,
         marked: markedRaw,
+        similarityMin,
+        similarityMax,
         pageNo: paging.pageNo,
         pageSize: paging.pageSize,
       });

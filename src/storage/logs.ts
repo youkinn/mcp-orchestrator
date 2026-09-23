@@ -376,6 +376,15 @@ export interface SimilarityRowsItem {
   marked: boolean;
 }
 
+/** feat-A013：缓存条目命中记录行（§3.12 弹框展示：某请求命中了该条目）。 */
+export interface CacheEntryHitItem {
+  traceId: string;
+  userQuery: string;
+  similarity: number | null;
+  createdAt: number;
+  marked: boolean;
+}
+
 /** feat-A013：相似度分布桶明细过滤（§3.11 参数；bucketIndex 口径同 §3.7）。 */
 export interface CacheLogBucketFilter {
   startAt: number;
@@ -392,6 +401,10 @@ export interface CacheLogsFilter {
   endAt: number;
   /** all（默认）/ marked / unmarked */
   marked?: 'all' | 'marked' | 'unmarked';
+  /** 灰色区区间过滤（可选、可单传）：similarity ≥ min（含）；叠加在灰色区口径之上 */
+  similarityMin?: number;
+  /** 灰色区区间过滤（可选、可单传）：similarity ≤ max（含）；叠加在灰色区口径之上 */
+  similarityMax?: number;
   pageNo?: number;
   pageSize?: number;
 }
@@ -530,6 +543,12 @@ export interface LogStore {
   /** 相似度分布桶明细（§3.11 数据源：按 bucketIndex 过滤 cache_logs，供柱形下钻） */
   querySimilarityRows(filter: CacheLogBucketFilter): { list: SimilarityRowsItem[]; total: number };
   queryMisjudgeStats(startAt: number, endAt: number): CacheMisjudgeStats;
+  /** 缓存条目命中记录（§3.12：cache_logs hit=1 且 nearest_query = 条目 query_text；条目不存在 → null 供 404） */
+  queryEntryHits(
+    entryId: number,
+    pageNo: number,
+    pageSize: number
+  ): { list: CacheEntryHitItem[]; total: number } | null;
   /** 误判标记 / 取消：返回行是否存在（已标记重复标记幂等；不存在 → false 供 404） */
   updateCacheLogMark(id: number, marked: boolean, markedBy: string | null): boolean;
   /** 镜像写入：返回新条目自增 id（写入失败静默降级 null） */
@@ -780,6 +799,7 @@ function createNoopStore(): LogStore {
     }),
     querySimilarityRows: () => ({ list: [], total: 0 }),
     queryMisjudgeStats: () => ({ hitTotal: 0, markedMisjudge: 0, misjudgeRate: null }),
+    queryEntryHits: () => null,
     updateCacheLogMark: () => false,
     insertCacheEntry: () => null,
     updateCacheEntry: () => false,
@@ -943,6 +963,9 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
     WHERE id = ?
   `);
   const deleteCacheEntryStmt = db.prepare(`DELETE FROM cache_entries WHERE id = ?`);
+  const getCacheEntryQueryTextStmt = db.prepare(
+    `SELECT query_text FROM cache_entries WHERE id = ?`
+  );
   const clearCacheEntriesStmt = db.prepare(`DELETE FROM cache_entries`);
   const countCacheEntriesStmt = db.prepare(
     `SELECT COUNT(*) AS total FROM cache_entries`
@@ -1449,6 +1472,14 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
         'created_at <= ?',
       ];
       const params: Array<string | number> = [CACHE_LOW_SIM_LINE, filter.startAt, filter.endAt];
+      if (filter.similarityMin !== undefined) {
+        conditions.push('similarity >= ?');
+        params.push(filter.similarityMin);
+      }
+      if (filter.similarityMax !== undefined) {
+        conditions.push('similarity <= ?');
+        params.push(filter.similarityMax);
+      }
       if (filter.marked === 'marked') {
         conditions.push('marked = 1');
       } else if (filter.marked === 'unmarked') {
@@ -1714,6 +1745,42 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
       };
     },
 
+    queryEntryHits(entryId, pageNo, pageSize): { list: CacheEntryHitItem[]; total: number } | null {
+      // §3.12 口径：cache_logs 中 hit=1 且 nearest_query = 条目 query_text（命中该条目的请求）；条目不存在 → null（404）
+      const entry = getCacheEntryQueryTextStmt.get(entryId) as { query_text: string } | undefined;
+      if (entry === undefined) {
+        return null;
+      }
+      const pageNoSafe = Math.max(1, pageNo);
+      const pageSizeSafe = Math.min(100, Math.max(1, pageSize));
+      const whereSql = 'WHERE hit = 1 AND nearest_query = ?';
+      const countRow = db
+        .prepare(`SELECT COUNT(*) AS total FROM cache_logs ${whereSql}`)
+        .get(entry.query_text) as { total: number };
+      const rows = db
+        .prepare(
+          `SELECT trace_id, user_query, similarity, created_at, marked
+           FROM cache_logs ${whereSql} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+        )
+        .all(entry.query_text, pageSizeSafe, (pageNoSafe - 1) * pageSizeSafe) as Array<{
+        trace_id: string;
+        user_query: string;
+        similarity: number | null;
+        created_at: number;
+        marked: number;
+      }>;
+      return {
+        total: countRow.total,
+        list: rows.map((row) => ({
+          traceId: row.trace_id,
+          userQuery: row.user_query,
+          similarity: row.similarity,
+          createdAt: row.created_at,
+          marked: row.marked === 1,
+        })),
+      };
+    },
+
     clearCacheEntries(): number {
       try {
         return clearCacheEntriesStmt.run().changes;
@@ -1846,6 +1913,15 @@ export function querySimilarityRows(
 
 export function queryMisjudgeStats(startAt: number, endAt: number): CacheMisjudgeStats {
   return getLogStore().queryMisjudgeStats(startAt, endAt);
+}
+
+/** feat-A013：缓存条目命中记录（§3.12 数据源，条目不存在 → null） */
+export function queryEntryHits(
+  entryId: number,
+  pageNo: number,
+  pageSize: number
+): { list: CacheEntryHitItem[]; total: number } | null {
+  return getLogStore().queryEntryHits(entryId, pageNo, pageSize);
 }
 
 /** feat-A013：误判标记 / 取消；返回行是否存在（不存在 → false 供 404） */

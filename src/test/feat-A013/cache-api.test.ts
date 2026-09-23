@@ -310,7 +310,7 @@ test('⑦ GET /stats/similarity-distribution：聚合形状与时间参数校验
   }
 });
 
-test('⑧ GET /grayzone：灰色区 query 对明细 / marked 过滤 / 分页（§3.8）', async (t) => {
+test('⑧ GET /grayzone：灰色区 query 对明细 / marked 过滤 / 分页 / 相似度区间过滤（§3.8）', async (t) => {
   const store = createLogStore({ dbPath: ':memory:' });
   t.after(() => store.close());
   const manager = new FakeCacheManager();
@@ -349,6 +349,68 @@ test('⑧ GET /grayzone：灰色区 query 对明细 / marked 过滤 / 分页（�
   // 分页参数非法 → 400
   const badPage = await get(baseUrl, `/api/v1/cache/grayzone?${range}&pageNo=0`);
   assert.equal(badPage.status, 400);
+
+  // 区间过滤（叠加在灰色区口径之上；新增种子放在 marked 断言之后，避免影响上面 marked 计数）
+  const TRACE_C = '9f7c0000-0000-4000-8000-0000000000d1';
+  const TRACE_D = '9f7c0000-0000-4000-8000-0000000000d2';
+  const TRACE_E = '9f7c0000-0000-4000-8000-0000000000d3';
+  seedCacheLog(store, TRACE_C, { hit: false, similarity: 0.8 } as never);
+  seedCacheLog(store, TRACE_D, { hit: false, similarity: 0.91 } as never);
+  seedCacheLog(store, TRACE_E, { hit: false, similarity: 0.95 } as never); // sim ≥ hit_line → 仍被灰色区口径排除
+
+  // 区间内命中：min=0.85 & max=0.90 → 仅 0.8512（TRACE_B）
+  const inRange = await get(baseUrl, `/api/v1/cache/grayzone?${range}&similarityMin=0.85&similarityMax=0.90`);
+  assert.equal(inRange.status, 200);
+  assert.equal(inRange.body.data.total, 1);
+  assert.deepEqual(inRange.body.data.list.map((i: { traceId: string }) => i.traceId), [TRACE_B]);
+
+  // 边界按包含（>=min / <=max）：min=0.80 & max=0.91 → 0.80 / 0.8512 / 0.91 三条
+  const bounds = await get(baseUrl, `/api/v1/cache/grayzone?${range}&similarityMin=0.80&similarityMax=0.91`);
+  assert.equal(bounds.body.data.total, 3);
+  assert.deepEqual(
+    bounds.body.data.list.map((i: { traceId: string }) => i.traceId).sort(),
+    [TRACE_B, TRACE_C, TRACE_D]
+  );
+  // 分页 count 与 list 同条件：pageSize=1 时 total 仍为 3
+  const boundsPage = await get(baseUrl, `/api/v1/cache/grayzone?${range}&similarityMin=0.80&similarityMax=0.91&pageSize=1`);
+  assert.equal(boundsPage.body.data.total, 3);
+  assert.equal(boundsPage.body.data.list.length, 1);
+
+  // 区间外排除：min=0.93 & max=0.99 → 灰色区内无行（0.95 已被灰色区口径排除）
+  const noneIn = await get(baseUrl, `/api/v1/cache/grayzone?${range}&similarityMin=0.93&similarityMax=0.99`);
+  assert.equal(noneIn.body.data.total, 0);
+
+  // 单边 min：min=0.90 → 仅 0.91（TRACE_D）
+  const minOnly = await get(baseUrl, `/api/v1/cache/grayzone?${range}&similarityMin=0.90`);
+  assert.equal(minOnly.body.data.total, 1);
+  assert.equal(minOnly.body.data.list[0].traceId, TRACE_D);
+
+  // 单边 max：max=0.86 → 0.80 与 0.8512（TRACE_C / TRACE_B）
+  const maxOnly = await get(baseUrl, `/api/v1/cache/grayzone?${range}&similarityMax=0.86`);
+  assert.equal(maxOnly.body.data.total, 2);
+  assert.deepEqual(maxOnly.body.data.list.map((i: { traceId: string }) => i.traceId).sort(), [TRACE_B, TRACE_C]);
+
+  // 空字符串视为未传：similarityMin= 不设限 → 灰色区全部 3 条
+  const emptyMin = await get(baseUrl, `/api/v1/cache/grayzone?${range}&similarityMin=`);
+  assert.equal(emptyMin.body.data.total, 3);
+
+  // 非法 400：min > max
+  const badOrder = await get(baseUrl, `/api/v1/cache/grayzone?${range}&similarityMin=0.9&similarityMax=0.8`);
+  assert.equal(badOrder.status, 400);
+  assert.equal(badOrder.body.message, 'similarityMin 不能大于 similarityMax');
+
+  // 非法 400：越界（>1 / <0）
+  const badHigh = await get(baseUrl, `/api/v1/cache/grayzone?${range}&similarityMin=1.5`);
+  assert.equal(badHigh.status, 400);
+  assert.equal(badHigh.body.message, 'similarityMin 须为 0~1 的数字');
+  const badLow = await get(baseUrl, `/api/v1/cache/grayzone?${range}&similarityMax=-0.1`);
+  assert.equal(badLow.status, 400);
+  assert.equal(badLow.body.message, 'similarityMax 须为 0~1 的数字');
+
+  // 非法 400：非数字
+  const badText = await get(baseUrl, `/api/v1/cache/grayzone?${range}&similarityMin=abc`);
+  assert.equal(badText.status, 400);
+  assert.equal(badText.body.message, 'similarityMin 须为 0~1 的数字');
 });
 
 test('⑨ POST /records/:id/mark|unmark：默认标记人 / 幂等 200 / 不存在 404 / id 非法 400（§3.9）', async (t) => {
@@ -530,5 +592,88 @@ test('⑫ GET /stats/similarity-rows：桶明细字段 / 三档边界 / 分页 t
   const noRange = await get(baseUrl, '/api/v1/cache/stats/similarity-rows?bucketIndex=0');
   assert.equal(noRange.status, 400);
   const badPage = await get(baseUrl, `/api/v1/cache/stats/similarity-rows?${range}&pageNo=0`);
+  assert.equal(badPage.status, 400);
+});
+
+test('⑬ GET /entries/:id/hits：命中该条目的请求记录 / nearest_query 排除 / marked / 分页 / 404 / 400（§3.12）', async (t) => {
+  const store = createLogStore({ dbPath: ':memory:' });
+  t.after(() => store.close());
+  const manager = new FakeCacheManager();
+  const baseUrl = await startCacheApi(t, manager, store);
+  const now = Date.now();
+
+  // 镜像条目：一条「义释严颜的经过」+ 一条无关条目（命中记录按 nearest_query = 条目 query_text 归属）
+  const entryAId = store.insertCacheEntry({
+    queryText: '义释严颜的经过',
+    embeddingB64: 'AAAA',
+    answerJson: '{}',
+    answerBytes: 128,
+    hitCount: 3,
+    lastAccessAt: now,
+    createdAt: now,
+    versionTag: 'test',
+  });
+  assert.ok(entryAId !== null);
+  const entryBId = store.insertCacheEntry({
+    queryText: '无关条目',
+    embeddingB64: 'AAAA',
+    answerJson: '{}',
+    answerBytes: 128,
+    hitCount: 1,
+    lastAccessAt: now,
+    createdAt: now,
+    versionTag: 'test',
+  });
+  assert.ok(entryBId !== null);
+
+  // 命中该条目的请求 ×3；另 seed hit=0 同行异 query / hit=1 异 query 均应排除
+  const TRACE_C = '9f7c0000-0000-4000-8000-0000000000e1';
+  const TRACE_D = '9f7c0000-0000-4000-8000-0000000000e2';
+  const TRACE_E = '9f7c0000-0000-4000-8000-0000000000e3';
+  seedCacheLog(store, TRACE_A); // 默认 hit=1、nearestQuery='义释严颜的经过'
+  seedCacheLog(store, TRACE_B);
+  seedCacheLog(store, TRACE_C);
+  seedCacheLog(store, TRACE_D, { hit: false } as never); // hit=0 → 排除
+  seedCacheLog(store, TRACE_E, { nearestQuery: '无关条目' } as never); // hit=1 但非该条目 → 排除
+
+  const hits = await get(baseUrl, `/api/v1/cache/entries/${entryAId}/hits`);
+  assert.equal(hits.status, 200);
+  assert.equal(hits.body.data.total, 3, 'hit=0 / 异 query 行均排除');
+  // 排序 created_at DESC、同刻按 id DESC → 后插入在前
+  assert.deepEqual(hits.body.data.list.map((i: { traceId: string }) => i.traceId), [TRACE_C, TRACE_B, TRACE_A]);
+  const item = hits.body.data.list[0];
+  assert.deepEqual(Object.keys(item).sort(), ['createdAt', 'marked', 'similarity', 'traceId', 'userQuery']);
+  assert.equal(item.userQuery, '义释严颜是怎么回事');
+  assert.equal(item.similarity, 0.9821);
+  assert.equal(item.marked, false);
+
+  // marked 布尔化：标记 TRACE_A 命中行后重查
+  const logA = store.queryCacheLogByTrace(TRACE_A);
+  assert.ok(logA !== null);
+  store.updateCacheLogMark(logA.id, true, '控制台');
+  const hitsMarked = await get(baseUrl, `/api/v1/cache/entries/${entryAId}/hits`);
+  const itemA = hitsMarked.body.data.list.find((i: { traceId: string }) => i.traceId === TRACE_A);
+  assert.equal(itemA.marked, true);
+
+  // 异 query 的命中行归到对应条目
+  const otherHits = await get(baseUrl, `/api/v1/cache/entries/${entryBId}/hits`);
+  assert.equal(otherHits.body.data.total, 1);
+  assert.equal(otherHits.body.data.list[0].traceId, TRACE_E);
+
+  // 分页：pageSize=2 → total 仍 3，第 2 页剩 1
+  const page1 = await get(baseUrl, `/api/v1/cache/entries/${entryAId}/hits?pageSize=2`);
+  assert.equal(page1.body.data.total, 3);
+  assert.equal(page1.body.data.list.length, 2);
+  const page2 = await get(baseUrl, `/api/v1/cache/entries/${entryAId}/hits?pageSize=2&pageNo=2`);
+  assert.equal(page2.body.data.total, 3);
+  assert.deepEqual(page2.body.data.list.map((i: { traceId: string }) => i.traceId), [TRACE_A]);
+
+  // 条目不存在 → 404；id 非法 / 分页非法 → 400
+  const missing = await get(baseUrl, '/api/v1/cache/entries/999999/hits');
+  assert.equal(missing.status, 404);
+  assert.equal(missing.body.message, '缓存条目不存在');
+  const badId = await get(baseUrl, '/api/v1/cache/entries/abc/hits');
+  assert.equal(badId.status, 400);
+  const badPage = await get(baseUrl, `/api/v1/cache/entries/${entryAId}/hits?pageNo=0`);
   assert.equal(badPage.status, 400);
 });
