@@ -484,9 +484,11 @@ test('装配回归：index.ts 工具集全部来自 MCP、L3 走 fengyunsanguo_q
     source,
     /fengyunsanguoVectorMatcher: \(query\) => transport\.fengyunsanguo_quiz_route\(query, \{ caller: 'server', stage: 'l3' \}\)/
   );
+  // feat-A013：语义缓存池装配（CacheManager 构造 + createServer options.cacheManager 注入，server.ts 条件挂载 /api/v1/cache*）
+  assert.match(source, /const cacheManager = new CacheManager\(\{/);
   assert.match(
     source,
-    /createServer\(agent, transport, \{ port, allowedOrigin \}\)/
+    /createServer\(agent, transport, \{ port, allowedOrigin, cacheManager \}\)/
   );
   // 总台无本地工具：不再出现 SangoService / localTools 装配
   assert.doesNotMatch(

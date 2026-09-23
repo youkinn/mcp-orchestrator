@@ -2,7 +2,11 @@
 // 信封 { code, data, message }、分页、错误码与路由顺序以 api/feat-A007-log-tracking.md 为准。
 // 本组接口自身不落日志（防递归，server.ts 只在 /api/chat 埋点）。
 import { Router, type Request, type Response } from 'express';
-import type { LogStore } from '../../storage/logs.js';
+import {
+  deriveCacheReason,
+  type CacheLogRecord,
+  type LogStore,
+} from '../../storage/logs.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const QUERY_ERROR_MESSAGE = '查询日志失败，请稍后重试';
@@ -26,6 +30,44 @@ function parseQueryInteger(raw: unknown): number | undefined | null {
 
 function parseQueryString(raw: unknown): string | undefined {
   return typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : undefined;
+}
+
+/** feat-A013 §3.10：命中解释对象（明细 data.cache；cache_logs 无行时为 null）。cacheLogId = cache_logs.id（契约补充，Coco 已批准）。 */
+interface CacheTraceInfo {
+  cacheLogId: number;
+  hit: boolean;
+  hitLine: number;
+  similarity: number | null;
+  tieHits: number | null;
+  userQuery: string;
+  nearestQuery: string | null;
+  reason: 'hit' | 'miss-low' | 'miss-gray' | 'miss-tie' | 'miss-focus';
+  marked: boolean;
+  createdAt: number;
+}
+
+/** cache_logs 行 → §3.10 data.cache（reason 照 deriveCacheReason 派生，单一实现点） */
+function toCacheTrace(record: CacheLogRecord): CacheTraceInfo {
+  return {
+    cacheLogId: record.id,
+    hit: record.hit,
+    hitLine: record.hitLine,
+    similarity: record.similarity,
+    tieHits: record.tieHits,
+    userQuery: record.userQuery,
+    nearestQuery: record.nearestQuery,
+    reason: deriveCacheReason(record),
+    marked: record.marked,
+    createdAt: record.createdAt,
+  };
+}
+
+/** cache_logs 行 → 列表行 cacheHit（1=命中 / 0=未命中；无行 null：非 sango / 开关关 / 降级旁路 / A013 前历史行） */
+function toCacheHit(record: CacheLogRecord | null): 1 | 0 | null {
+  if (record === null) {
+    return null;
+  }
+  return record.hit ? 1 : 0;
 }
 
 export function createLogsApi(logStore: LogStore): Router {
@@ -83,7 +125,18 @@ export function createLogsApi(logStore: LogStore): Router {
 
       response.json({
         code: 200,
-        data: { list: result.list, total: result.total, pageNo, pageSize },
+        data: {
+          list: result.list.map((item) => ({
+            ...item,
+            // feat-A013 §3.10：列表行 cacheHit（1=命中 / 0=未命中 / null=无判定行）。
+            // LEFT JOIN cache_logs 口径：storage.queryList 保持 A007 既有 SELECT 零改动（不含 JOIN 列），
+            // 此处按 trace_id 主键逐行等价位查（pageSize ≤ 100，同步 SQLite 微秒级）。
+            cacheHit: toCacheHit(logStore.queryCacheLogByTrace(item.traceId)),
+          })),
+          total: result.total,
+          pageNo,
+          pageSize,
+        },
         message: '',
       });
     } catch (error) {
@@ -163,7 +216,9 @@ export function createLogsApi(logStore: LogStore): Router {
         sendError(response, 404, '日志不存在');
         return;
       }
-      response.json({ code: 200, data, message: '' });
+      // feat-A013 §3.10：命中解释并入明细（cache_logs 无行 → null；有行 → 派生 reason，见 toCacheTrace）
+      const cacheRecord = logStore.queryCacheLogByTrace(traceId);
+      response.json({ code: 200, data: { ...data, cache: cacheRecord === null ? null : toCacheTrace(cacheRecord) }, message: '' });
     } catch (error) {
       console.error('Failed to query log detail:', error);
       sendError(response, 500, QUERY_ERROR_MESSAGE);
