@@ -1,5 +1,5 @@
-// feat-A013 缓存后台接口（/api/v1/cache*）：开关 / 清除 / 条目明细 / 概览 / 三色分布 / 灰色区 / 误判标记与误判率。
-// 契约：api/feat-A013-query-cache.md §3.1~3.9；统一信封 { code, data, message }，错误码 400 / 404 / 500。
+// feat-A013 缓存后台接口（/api/v1/cache*）：开关 / 清除 / 条目明细 / 概览 / 三色分布 / 分布桶明细 / 灰色区 / 误判标记与误判率。
+// 契约：api/feat-A013-query-cache.md §3.1~3.11；统一信封 { code, data, message }，错误码 400 / 404 / 500。
 // 本组接口自身不落日志（防递归，同 /api/v1/logs*，server.ts 只在 /api/chat 埋点）。
 // cache_logs 读写直走 LogStore（§2.4 落库点：mark 更新 / 分布 / 灰色区 / 误判率数据源）；
 // 池子状态（status / clear / entries / overview）走 CacheManager（小胡 src/cache.ts 实现，本文件只调用）。
@@ -87,7 +87,7 @@ function parseQueryString(raw: unknown): string | undefined {
   return typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : undefined;
 }
 
-/** §3.7 / §3.8 / §3.9：startAt / endAt 必填毫秒时间戳且 startAt ≤ endAt（校验同 token-stats）；否则 null（400） */
+/** §3.7 / §3.8 / §3.9 / §3.11：startAt / endAt 必填毫秒时间戳且 startAt ≤ endAt（校验同 token-stats）；否则 null（400） */
 function parseRange(query: Request['query']): { startAt: number; endAt: number } | null {
   const startAt = parseQueryInteger(query.startAt);
   const endAt = parseQueryInteger(query.endAt);
@@ -261,6 +261,52 @@ export function createCacheApi(cacheManager: CacheManager, logStore?: LogStore):
     } catch (error) {
       console.error('Failed to query cache distribution:', error);
       sendError(response, 500, STATS_ERROR_MESSAGE);
+    }
+  });
+
+  // GET /api/v1/cache/stats/similarity-rows —— 分布桶明细（§3.11；柱形点击下钻数据源，同本组接口不落日志）
+  router.get('/stats/similarity-rows', (request: Request, response: Response) => {
+    try {
+      const range = parseRange(request.query);
+      if (range === null) {
+        sendError(response, 400, 'startAt/endAt 必填且为毫秒时间戳');
+        return;
+      }
+      const paging = parsePaging(request.query);
+      if (paging === null) {
+        sendError(response, 400, '分页参数非法');
+        return;
+      }
+      const bucketIndexRaw = parseQueryInteger(request.query.bucketIndex);
+      if (
+        bucketIndexRaw === null ||
+        (bucketIndexRaw !== undefined &&
+          (bucketIndexRaw < 0 || bucketIndexRaw > CACHE_DISTRIBUTION_BUCKET_COUNT - 1))
+      ) {
+        sendError(response, 400, 'bucketIndex 必须为 0~49 的整数');
+        return;
+      }
+      const bucketIndex = bucketIndexRaw ?? 0;
+      const result = store.querySimilarityRows({
+        startAt: range.startAt,
+        endAt: range.endAt,
+        bucketIndex,
+        pageNo: paging.pageNo,
+        pageSize: paging.pageSize,
+      });
+      response.json({
+        code: 200,
+        data: {
+          list: result.list,
+          total: result.total,
+          pageNo: paging.pageNo,
+          pageSize: paging.pageSize,
+        },
+        message: '',
+      });
+    } catch (error) {
+      console.error('Failed to query similarity rows:', error);
+      sendError(response, 500, QUERY_ERROR_MESSAGE);
     }
   });
 

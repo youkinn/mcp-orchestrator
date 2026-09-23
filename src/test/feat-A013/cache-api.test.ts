@@ -439,6 +439,7 @@ test('⑪ server.ts 挂载：注入 cacheManager 后 /api/v1/cache* 可用；未
   await send(baseUrl, 'POST', '/api/v1/cache/clear');
   await get(baseUrl, '/api/v1/cache/entries');
   await get(baseUrl, '/api/v1/cache/overview');
+  await get(baseUrl, '/api/v1/cache/stats/similarity-rows?startAt=1&endAt=2&bucketIndex=0');
   assert.equal(store.queryList({}).total, 0, 'cache 接口不产生 request_logs 行');
 
   // 未注入 cacheManager → 不挂载（404）
@@ -450,4 +451,84 @@ test('⑪ server.ts 挂载：注入 cacheManager 后 /api/v1/cache* 可用；未
   const baseUrl2 = await listen(app2, t);
   const absent = await fetch(`${baseUrl2}/api/v1/cache/status`);
   assert.equal(absent.status, 404, '未注入实例时路由不挂载（Express 默认 404 页为 HTML，不做 JSON 解析）');
+});
+
+test('⑫ GET /stats/similarity-rows：桶明细字段 / 三档边界 / 分页 total / 对账与参数校验（§3.11）', async (t) => {
+  const store = createLogStore({ dbPath: ':memory:' });
+  t.after(() => store.close());
+  const manager = new FakeCacheManager();
+  const baseUrl = await startCacheApi(t, manager, store);
+  const now = Date.now();
+  // 边界用例（桶口径与 §3.7 bucketIndex(sim) 同源）：sim=null 池空 / 0.0199 落桶 0；0.02 恰入桶 1；0.98 与 1.0 落桶 49
+  seedCacheLog(store, TRACE_A, { similarity: null, userQuery: '池空无候选' } as never);
+  seedCacheLog(store, TRACE_B, { similarity: 0.0199, userQuery: '低相似下沿' } as never);
+  seedCacheLog(store, '9f7c0000-0000-4000-8000-0000000000c3', { similarity: 0.02, userQuery: '桶边界 0.02' } as never);
+  seedCacheLog(store, '9f7c0000-0000-4000-8000-0000000000c4', { similarity: 0.98, userQuery: '高置信下沿' } as never);
+  seedCacheLog(store, '9f7c0000-0000-4000-8000-0000000000c5', { similarity: 1, userQuery: '相似度顶点' } as never);
+  const range = `startAt=${now - 60000}&endAt=${now + 60000}`;
+
+  // 正常查询：桶 49 两行，返回字段形状符合契约
+  const rows = await get(baseUrl, `/api/v1/cache/stats/similarity-rows?${range}&bucketIndex=49`);
+  assert.equal(rows.status, 200);
+  assert.equal(rows.body.data.total, 2);
+  assert.deepEqual(
+    rows.body.data.list.map((r: { userQuery: string }) => r.userQuery).sort(),
+    ['高置信下沿', '相似度顶点'].sort(),
+    '桶 49 只含 0.98 与 1.0 两行'
+  );
+  const item = rows.body.data.list[0];
+  assert.deepEqual(Object.keys(item).sort(), [
+    'cacheLogId',
+    'createdAt',
+    'hit',
+    'hitLine',
+    'marked',
+    'nearestQuery',
+    'similarity',
+    'tieHits',
+    'traceId',
+    'userQuery',
+  ]);
+  assert.equal(typeof item.cacheLogId, 'number');
+  assert.equal(typeof item.traceId, 'string');
+  assert.equal(typeof item.hit, 'boolean');
+  assert.deepEqual(
+    rows.body.data.list.map((r: { traceId: string }) => r.traceId).sort(),
+    ['9f7c0000-0000-4000-8000-0000000000c4', '9f7c0000-0000-4000-8000-0000000000c5'],
+    '桶 49 行为 0.98 / 1.0 两行'
+  );
+
+  // 三档边界：sim=null 与 0.0199 落桶 0；0.02 恰入桶 1（下界含、上界不含）
+  const bucket0 = await get(baseUrl, `/api/v1/cache/stats/similarity-rows?${range}&bucketIndex=0`);
+  assert.equal(bucket0.status, 200);
+  assert.equal(bucket0.body.data.total, 2, 'sim=null + 0.0199 落桶 0');
+  const bucket1 = await get(baseUrl, `/api/v1/cache/stats/similarity-rows?${range}&bucketIndex=1`);
+  assert.equal(bucket1.body.data.total, 1, '0.02 恰入桶 1');
+  assert.equal(bucket1.body.data.list[0].similarity, 0.02);
+
+  // 分页：桶 49 共 2 行，pageSize=1 翻到第 2 页 total 仍为 2
+  const paged = await get(baseUrl, `/api/v1/cache/stats/similarity-rows?${range}&bucketIndex=49&pageNo=2&pageSize=1`);
+  assert.equal(paged.status, 200);
+  assert.equal(paged.body.data.total, 2);
+  assert.equal(paged.body.data.list.length, 1);
+  assert.equal(paged.body.data.pageNo, 2);
+  assert.equal(paged.body.data.pageSize, 1);
+
+  // 对账：同时间窗无筛选时，每桶 total === 分布图该柱 count（新增验收第 18 行）
+  const dist = await get(baseUrl, `/api/v1/cache/stats/similarity-distribution?${range}`);
+  assert.equal(dist.body.data.totals.totalCount, 5);
+  for (let i = 0; i < 50; i += 1) {
+    const res = await get(baseUrl, `/api/v1/cache/stats/similarity-rows?${range}&bucketIndex=${i}`);
+    assert.equal(res.body.data.total, dist.body.data.buckets[i].count, `桶 ${i} total === 分布图 count`);
+  }
+
+  // 非法 bucketIndex / 缺 startAt → 400
+  for (const bad of ['-1', '50', 'abc', '1.5']) {
+    const res = await get(baseUrl, `/api/v1/cache/stats/similarity-rows?${range}&bucketIndex=${bad}`);
+    assert.equal(res.status, 400, `bucketIndex=${bad} 应 400`);
+  }
+  const noRange = await get(baseUrl, '/api/v1/cache/stats/similarity-rows?bucketIndex=0');
+  assert.equal(noRange.status, 400);
+  const badPage = await get(baseUrl, `/api/v1/cache/stats/similarity-rows?${range}&pageNo=0`);
+  assert.equal(badPage.status, 400);
 });
