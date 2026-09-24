@@ -440,12 +440,21 @@ export function validateQuotePointers(
   return { ok: pointers.length > 0 && invalid.length === 0, pointers, invalid };
 }
 
-/** 长引语安全网（spec §6.4）：丢弃模型违规抄写的超长「…」（其原文由指针 + 字段渲染提供） */
+/** 长引语安全网（spec §6.4）：丢弃模型违规抄写的超长「…」/“…”（其原文由指针 + 字段渲染提供）；
+ * 弯引号 “…” 与语料引号记号一致（bug-00025：只匹配「…」时漏网） */
 export function stripOverlongModelQuotes(answer: string): string {
-  return answer.replace(/「([^」]*)」/g, (whole, inner: string) =>
-    inner.length > MAX_MODEL_QUOTE_LENGTH ? "" : whole
+  return answer.replace(
+    /「([^」]*)」|“([^”]*)”/g,
+    (whole, bracketInner: string, curlyInner: string) => {
+      const inner = bracketInner ?? curlyInner;
+      return inner.length > MAX_MODEL_QUOTE_LENGTH ? "" : whole;
+    }
   );
 }
+
+/** bug-00025：剥离模型抄写残留的服务端内部编号 ⟨Qn⟩（保留引语正文），citations 不受影响 */
+const stripInternalQuoteMarkers = (answer: string): string =>
+  answer.replace(/⟨Q\d+⟩/g, "");
 
 /** 上标角标字符（feat-A006）：¹²³⁴⁵⁶⁷⁸⁹⁰，下标按出现顺序从 1 起 */
 const SUPERSCRIPT_DIGITS = "⁰¹²³⁴⁵⁶⁷⁸⁹";
@@ -478,7 +487,8 @@ function resolvePointerRef(
 /** 服务端渲染引用与出处（feat-A006）：`[Qn]` 引语指针 → 「引文」+ 全局上标角标，
  * `[片段N]` 叙述段指针 → 指针后有正文时仅全局上标角标（不内联原文，正文保留）；裸指针
  * （跳过空白后遇另一指针 `[` 或字符串末尾）→ 「片段原文」+ 角标（bug-00024，与 [Qn] 同形态，
- * answer 自洽可独立成读）；不再内联出处；citations 按引用出现顺序、片段粒度合并（同片段多引语合并为一条，
+ * answer 自洽可独立成读）；渲染后全局剥离模型抄写残留的 ⟨Qn⟩ 内部编号（bug-00025）；
+ * 不再内联出处；citations 按引用出现顺序、片段粒度合并（同片段多引语合并为一条，
  * 角标数量 = 片段数量），只收被引用片段；未注册的指针原样保留。 */
 export function renderAnswerWithCitations(
   answer: string,
@@ -514,7 +524,7 @@ export function renderAnswerWithCitations(
       return toSuperscript(index);
     }
   );
-  return { answer: rendered, citations };
+  return { answer: stripInternalQuoteMarkers(rendered), citations };
 }
 
 /** query 锚点稀有度：命中最稀有 key 的 [key 长度, -段内出现次数, -首次位置]；无命中为 null。
@@ -605,9 +615,10 @@ export function buildFallback(
   conclusion: string,
   query = ""
 ): ChatData {
-  const conclusionLine = conclusion.startsWith("按原文")
-    ? conclusion
-    : `按原文，${conclusion}`;
+  // bug-00025：兜底结论由模型归纳（结论归纳轮同样能看到注入视图的 ⟨Qn⟩ 标记），一并剥离
+  const conclusionLine = stripInternalQuoteMarkers(
+    conclusion.startsWith("按原文") ? conclusion : `按原文，${conclusion}`
+  );
   if (fragments.length === 0) {
     return { answer: conclusionLine, citations: [] };
   }

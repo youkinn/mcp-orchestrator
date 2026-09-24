@@ -132,6 +132,19 @@ test("⑪ 兜底输出（A006 结构化）：answer 结论句带角标 ¹，cita
   assert.equal(out.citations.length, 1, "兜底恰一条，禁止多段拼刷");
   assert.doesNotMatch(out.answer, /段\d/, "answer 不展示段号");
   assert.doesNotMatch(out.answer, /（出处/, "answer 不再内联出处");
+  assert.equal(
+    buildFallback(
+      [
+        {
+          text: "云长提刀出阵，斩华雄于帐前。",
+          source: "sanguo-yanyi",
+        },
+      ],
+      "斩华雄者系关羽，原文⟨Q1⟩见下"
+    ).answer,
+    "按原文，斩华雄者系关羽，原文见下¹",
+    "bug-00025：兜底结论（由模型归纳，可见注入视图的 ⟨Qn⟩）同样剥离内部编号"
+  );
 });
 
 test("⑫ 检索无命中固定话术", () => {
@@ -690,6 +703,49 @@ test("⑯.7 裸指针补全（bug-00024 实况）：相邻裸指针 `[片段N] [
   );
 });
 
+test("⑯.8 内部编号剥离（bug-00025）：模型抄写残留 ⟨Qn⟩ → 最终 answer 全局剥离、引语正文保留，citations 不受影响", () => {
+  const view: InjectionView = {
+    text: "",
+    quotes: new Map([
+      [
+        "Q2",
+        {
+          text: "吾虎女安肯嫁犬子乎！",
+          chapter: 73,
+          title: "玄德进位汉中王　云长攻拔襄阳郡",
+        },
+      ],
+    ]),
+    fragments: new Map([
+      [
+        "片段1",
+        {
+          text: "云长勃然大怒曰：“吾虎女安肯嫁犬子乎！”",
+          chapter: 73,
+          title: "玄德进位汉中王　云长攻拔襄阳郡",
+        },
+      ],
+    ]),
+    quoteFragments: new Map([["Q2", "片段1"]]),
+  };
+  const out = renderAnswerWithCitations(
+    "关羽怒拒联姻，曰⟨Q2⟩“吾虎女安肯嫁犬子乎！”[Q2]",
+    view
+  );
+  assert.doesNotMatch(out.answer, /⟨Q\d+⟩/, "内部编号不得出现在最终 answer");
+  assert.equal(
+    out.answer,
+    "关羽怒拒联姻，曰“吾虎女安肯嫁犬子乎！”「吾虎女安肯嫁犬子乎！」¹"
+  );
+  assert.deepEqual(out.citations, [
+    {
+      text: "云长勃然大怒曰：“吾虎女安肯嫁犬子乎！”",
+      chapter: 73,
+      title: "玄德进位汉中王　云长攻拔襄阳郡",
+    },
+  ]);
+});
+
 test("⑰ 长引语安全网：超 30 字的「…」视为违规抄写被丢弃，短引语原样保留", () => {
   const long = "吾虎女安肯嫁犬子乎！不看汝弟之面，立斩汝首！再休多言！汝可速回。";
   assert.ok(long.length > MAX_MODEL_QUOTE_LENGTH);
@@ -701,6 +757,27 @@ test("⑰ 长引语安全网：超 30 字的「…」视为违规抄写被丢弃
     stripOverlongModelQuotes("关羽回以「虎女安肯嫁犬子乎」[Q2]。"),
     "关羽回以「虎女安肯嫁犬子乎」[Q2]。",
     "短引语不属于违规抄写"
+  );
+});
+
+test("⑰.1 长引语安全网覆盖弯引号（bug-00025）：超长 “…” 整段丢弃、正常长度保留、直引号原行为不变", () => {
+  const long =
+    "你直如此将我看承得如无物！但国太年高，孙权心忧，实欲借此结好刘备，共拒曹操之强，此乃国策而非私情也！刘备汉室宗亲，仁德素著，堪为良配，兄当速作决断，吾为妹主婚！";
+  assert.ok(long.length > MAX_MODEL_QUOTE_LENGTH);
+  const stripped = stripOverlongModelQuotes(
+    `国太曰：⟨Q2⟩“${long}”二人正议间，孙权至。`
+  );
+  assert.ok(!stripped.includes(long), "超长弯引号抄写应被整段丢弃");
+  assert.equal(stripped, "国太曰：⟨Q2⟩二人正议间，孙权至。", "除超长引用段外其余原样保留");
+  assert.equal(
+    stripOverlongModelQuotes("关羽曰：“吾虎女安肯嫁犬子乎！”[Q2]"),
+    "关羽曰：“吾虎女安肯嫁犬子乎！”[Q2]",
+    "正常长度弯引号原样保留"
+  );
+  assert.equal(
+    stripOverlongModelQuotes("关羽回以「虎女安肯嫁犬子乎」[Q2]。"),
+    "关羽回以「虎女安肯嫁犬子乎」[Q2]。",
+    "直引号原行为不变"
   );
 });
 

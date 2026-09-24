@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Agent } from "../../agent.js";
 import { MCPTransport } from "../../transport.js";
-import { loadAliasTable } from "../../citation.js";
+import { loadAliasTable, MAX_MODEL_QUOTE_LENGTH } from "../../citation.js";
 import type {
   LLMConfig,
   LLMProvider,
@@ -587,4 +587,62 @@ test("⑧ bug-00024 三英战吕布裸指针 trace：模型输出「结论\\n\\n
   assert.equal(data.citations.length, 2, "两条裸指针各收录一条 citation（按出现顺序）");
   assert.deepEqual(data.citations.map((item) => item.text), [frag3, frag4]);
   assert.equal(modelCallCount, 2, "渲染兜底是确定性回收，不额外调模型");
+});
+
+test("⑨ bug-00025 孙尚香 trace：模型抄写注入片段（含 ⟨Qn⟩ + 75 字弯引号超长段）→ H4 丢弃超长段、⟨Qn⟩ 全剥离，answer 可独立成读", async () => {
+  const fragmentText =
+    "权曰：“母亲何故烦恼？”国太曰：“你直如此将我看承得如无物！为今之计，可将妹尚香嫁与刘备。”孙权闻言，遂从其议。";
+  const longQuote =
+    "你直如此将我看承得如无物！为今之计，可将妹尚香嫁与刘备。汝妹尚香，年方二八，刘备乃帝室之胄，仁德著于四海，堪为良配；此乃国策，非私情也，兄当速决，迟则生变。";
+  assert.ok(longQuote.length > MAX_MODEL_QUOTE_LENGTH, "构造的超长抄写应超过 H4 阈值");
+  const entries = [
+    {
+      id: "sanguo-yanyi:0054:c0003",
+      text: fragmentText,
+      chapter: 54,
+      title: "吴国太佛寺看新郎　刘皇叔洞房续佳偶",
+      type: "narration",
+      quotes: [
+        { offset: 4, len: 7 },
+        { offset: 17, len: 28 },
+      ],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return modelCallCount === 1
+      ? textResponse("1")
+      : textResponse(
+          `孙尚香后来许配刘备，孙权与国太定下亲事。\n[片段1] 权曰：⟨Q1⟩“母亲何故烦恼？”国太曰：⟨Q2⟩“${longQuote}”孙权闻言，遂从其议。`
+        );
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "孙尚香许配了刘备",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("孙尚香后来怎么样了");
+  assert.doesNotMatch(data.answer, /⟨Q\d+⟩/, "内部编号不得出现在最终 answer");
+  assert.ok(!data.answer.includes(longQuote), "75 字弯引号超长抄写被 H4 整段丢弃");
+  assert.ok(
+    data.answer.includes("权曰：“母亲何故烦恼？”"),
+    "正常长度弯引号引语保留"
+  );
+  assert.ok(data.answer.startsWith("孙尚香后来许配刘备"), "结论保留，answer 可独立成读");
+  assert.doesNotMatch(data.answer, /\[片段\d+\]/, "指针已渲染替换");
+  assert.ok(data.answer.includes("¹"), "引语出处以角标呈现");
+  assert.equal(data.citations.length, 1);
+  assert.deepEqual(data.citations[0], {
+    text: fragmentText,
+    chapter: 54,
+    title: "吴国太佛寺看新郎　刘皇叔洞房续佳偶",
+  });
+  assert.equal(modelCallCount, 2, "确定性回收，不额外调模型");
 });
