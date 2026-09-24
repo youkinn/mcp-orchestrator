@@ -531,9 +531,13 @@ test("⑦ 注入上限放宽到 10 + 叙述段指针（bug-00009 张飞题）：
   assert.ok(data.answer.startsWith("张飞被范疆、张达刺死。"), "叙述句指针渲染后保留结论");
   assert.ok(
     data.answer.endsWith(
-      "「范、张二贼，探知消息，初更时分，各藏短刀，密入帐中，直至床前。原来张飞每睡不合眼；当夜寝于帐中，二贼以短刀刺入飞腹。飞大叫一声而亡。时年五十五。」¹"
+      "「范、张二贼，探知消息，初更时分，各藏短刀，密入帐中，直至床前。」¹"
     ),
-    "bug-00024：裸指针（后无正文）自动内联该片段原文 + 角标，answer 可独立成读"
+    "bug-00024：裸指针（后无正文）自动内联片段开头短摘 + 角标，answer 短而自洽"
+  );
+  assert.ok(
+    !data.answer.includes("飞大叫一声而亡"),
+    "短摘不内联全文：停在首句句界（31 字），后续句由 citation 卡片承载"
   );
   assert.equal(data.citations.length, 1, "只收被引用片段：仅 [片段5] 所在片段");
   assert.equal(data.citations[0].chapter, 81);
@@ -547,10 +551,12 @@ test("⑦ 注入上限放宽到 10 + 叙述段指针（bug-00009 张飞题）：
   assert.equal(modelCallCount, 2, "校验通过不触发兜底结论归纳");
 });
 
-test("⑧ bug-00024 三英战吕布裸指针 trace：模型输出「结论\\n\\n[片段3] [片段4]」→ answer 内联两段「原文」+ 角标，形态与 5018ace0 好样本一致", async () => {
+test("⑧ bug-00024 三英战吕布裸指针 trace：模型输出「结论\\n\\n[片段3] [片段4]」→ answer 内联两段开头「短摘」+ 角标（全文由 citations 承载），形态对齐 5018ace0 好样本「结论 + ¹短摘 + ²短摘」", async () => {
   const frag2 = "张飞挺丈八蛇矛，直取吕布，二将大战五十余合，不分胜负。";
-  const frag3 = "云长拍马舞刀，与张飞夹攻吕布，三匹马丁字儿厮杀。";
-  const frag4 = "玄德掣双股剑，骤黄鬃马，刺斜里助战；吕布见三人围攻，架隔遮拦不定，拨马回阵而走。";
+  const frag3 = "云长拍马舞刀，与张飞夹攻吕布，三匹马丁字儿厮杀。战到三十合，战不倒吕布。";
+  const frag4Head = "玄德掣双股剑，骤黄鬃马，刺斜里助战；吕布见三人围攻，架隔遮拦不定，拨马回阵而走。";
+  const frag4Poem = "后人有诗赞曰：温侯神射世间稀，曾向辕门独解危；落日果然欺后羿，号猿直欲胜由基。";
+  const frag4 = frag4Head + frag4Poem;
   const entries = [
     { id: "sanguo-yanyi:0005:c0014", text: "吕布纵赤兔马，往来驰骋，众诸侯莫敢近前。", chapter: 5, title: RECALL_TITLE, type: "narration", quotes: [] },
     { id: "sanguo-yanyi:0005:c0015", text: frag2, chapter: 5, title: RECALL_TITLE, type: "narration", quotes: [] },
@@ -578,12 +584,13 @@ test("⑧ bug-00024 三英战吕布裸指针 trace：模型输出「结论\\n\\n
   const data = await agent.processQueryData("三英战吕布，结局如何");
   assert.equal(
     data.answer,
-    `三英战吕布，吕布力敌三人，先战张飞，又敌关羽、刘备。\n\n「${frag3}」¹ 「${frag4}」²`,
-    "裸指针以片段原文补全（与 5018ace0 好样本同为「结论 + ¹引语正文 + ²引语正文」形态；指针间空白随模型输出保留）"
+    `三英战吕布，吕布力敌三人，先战张飞，又敌关羽、刘备。\n\n「云长拍马舞刀，与张飞夹攻吕布，三匹马丁字儿厮杀。」¹ 「${frag4Head}」²`,
+    "裸指针内联片段开头短摘 + 角标（与 5018ace0 好样本同为「结论 + ¹短摘 + ²短摘」形态；指针间空白随模型输出保留）"
   );
   assert.doesNotMatch(data.answer, /\[片段\d+\]/, "裸指针全部渲染，无残留");
   assert.doesNotMatch(data.answer, /⟨Q\d+⟩/, "无内部编号");
-  assert.doesNotMatch(data.answer, /(?<!」)[¹²³⁴⁵⁶⁷⁸⁹⁰]/, "角标均附着「原文」，无裸角标");
+  assert.doesNotMatch(data.answer, /(?<!」)[¹²³⁴⁵⁶⁷⁸⁹⁰]/, "角标均附着「短摘」，无裸角标");
+  assert.ok(!data.answer.includes("温侯神射"), "短摘不含古诗段落，全文由 citation 卡片承载");
   assert.equal(data.citations.length, 2, "两条裸指针各收录一条 citation（按出现顺序）");
   assert.deepEqual(data.citations.map((item) => item.text), [frag3, frag4]);
   assert.equal(modelCallCount, 2, "渲染兜底是确定性回收，不额外调模型");

@@ -467,7 +467,7 @@ test("⑯.1 上标角标：¹²³⁴⁵⁶⁷⁸⁹⁰ 字符集，>9 用多字�
   assert.equal(toSuperscript(100), "¹⁰⁰");
 });
 
-test("⑯.2 叙述段指针（bug-00024）：指针后有正文 → 仅角标、正文保留；裸指针（后无正文）→ 「片段原文」+ 角标，citations 收录该片段", () => {
+test("⑯.2 叙述段指针（bug-00024）：指针后有正文 → 仅角标、正文保留；裸指针（后无正文）→ 「片段开头短摘」+ 角标（不内联全文），citations 收录该片段", () => {
   const view: InjectionView = {
     text: "",
     quotes: new Map(),
@@ -475,7 +475,7 @@ test("⑯.2 叙述段指针（bug-00024）：指针后有正文 → 仅角标、
       [
         "片段5",
         {
-          text: "范、张二贼，密入帐中，以短刀刺入飞腹。飞大叫一声而亡。",
+          text: "范、张二贼，密入帐中，以短刀刺入飞腹。飞大叫一声而亡。时年五十五。后人有诗叹曰：长坂桥边怒气腾，一声虎啸退曹兵。",
           chapter: 81,
           title: "急兄仇张飞遇害　雪弟恨先主兴兵",
         },
@@ -487,8 +487,9 @@ test("⑯.2 叙述段指针（bug-00024）：指针后有正文 → 仅角标、
   assert.equal(
     naked.answer,
     "张飞被范疆、张达刺死。「范、张二贼，密入帐中，以短刀刺入飞腹。飞大叫一声而亡。」¹",
-    "裸指针（后无正文）以片段原文补全，answer 可独立成读"
+    "裸指针（后无正文）以片段开头短摘补全，answer 短而自洽"
   );
+  assert.ok(!naked.answer.includes("时年五十五"), "短摘不内联全文：停在第二个整句句界，全文由 citation 卡片承载");
   const withBody = renderAnswerWithCitations("张飞被范疆、张达刺死。[片段5]凶器为短刀。", view);
   assert.equal(
     withBody.answer,
@@ -498,7 +499,7 @@ test("⑯.2 叙述段指针（bug-00024）：指针后有正文 → 仅角标、
   assert.doesNotMatch(withBody.answer, /密入帐中/, "有正文时不内联片段原文");
   assert.deepEqual(naked.citations, [
     {
-      text: "范、张二贼，密入帐中，以短刀刺入飞腹。飞大叫一声而亡。",
+      text: "范、张二贼，密入帐中，以短刀刺入飞腹。飞大叫一声而亡。时年五十五。后人有诗叹曰：长坂桥边怒气腾，一声虎啸退曹兵。",
       chapter: 81,
       title: "急兄仇张飞遇害　雪弟恨先主兴兵",
     },
@@ -658,7 +659,12 @@ test("⑯.6 无引用恒 []：answer 无指针时 citations 为空、answer 原�
   assert.deepEqual(out.citations, []);
 });
 
-test("⑯.7 裸指针补全（bug-00024 实况）：相邻裸指针 `[片段N] [片段M]` → 各补「片段原文」+ 角标，无裸角标、无指针残留", () => {
+test("⑯.7 裸指针兜底短摘（bug-00024 修订）：相邻裸指针 `[片段N] [片段M]` → 各补「片段开头短摘」+ 角标（全文由 citations 承载），无裸角标、无指针残留", () => {
+  const frag3Text =
+    "吕布见了，弃了公孙瓒，便战张飞。八路诸侯齐出，救了公孙瓒，吕布方才收兵。云长见了，舞青龙偃月刀，拍马来夹攻。";
+  const frag4Poem =
+    "后人有诗赞曰：温侯神射世间稀，曾向辕门独解危；落日果然欺后羿，号猿直欲胜由基。";
+  const frag4Text = "飞抖擞精神，酣战吕布。连斗五十余合，不分胜负。" + frag4Poem;
   const view: InjectionView = {
     text: "",
     quotes: new Map(),
@@ -666,7 +672,7 @@ test("⑯.7 裸指针补全（bug-00024 实况）：相邻裸指针 `[片段N] [
       [
         "片段3",
         {
-          text: "吕布见了，弃了公孙瓒，便战张飞。",
+          text: frag3Text,
           chapter: 5,
           title: "发矫诏诸镇应曹公　破关兵三英战吕布",
         },
@@ -674,7 +680,7 @@ test("⑯.7 裸指针补全（bug-00024 实况）：相邻裸指针 `[片段N] [
       [
         "片段4",
         {
-          text: "飞抖擞精神，酣战吕布。连斗五十余合，不分胜负。",
+          text: frag4Text,
           chapter: 5,
           title: "发矫诏诸镇应曹公　破关兵三英战吕布",
         },
@@ -688,19 +694,132 @@ test("⑯.7 裸指针补全（bug-00024 实况）：相邻裸指针 `[片段N] [
   );
   assert.equal(
     out.answer,
-    "三英战吕布，先有张飞出马。\n\n「吕布见了，弃了公孙瓒，便战张飞。」¹ 「飞抖擞精神，酣战吕布。连斗五十余合，不分胜负。」²",
+    "三英战吕布，先有张飞出马。\n\n「吕布见了，弃了公孙瓒，便战张飞。八路诸侯齐出，救了公孙瓒，吕布方才收兵。」¹ 「飞抖擞精神，酣战吕布。连斗五十余合，不分胜负。」²",
     "指针间的空白（模型输出自带）原样保留，渲染只替换指针 token"
   );
   assert.doesNotMatch(out.answer, /\[片段\d+\]/, "裸指针全部补全，无残留");
-  assert.doesNotMatch(out.answer, /(?<!」)[¹²³⁴⁵⁶⁷⁸⁹⁰]/, "角标均附着「原文」，无裸角标");
+  assert.doesNotMatch(out.answer, /(?<!」)[¹²³⁴⁵⁶⁷⁸⁹⁰]/, "角标均附着「短摘」，无裸角标");
+  assert.ok(!out.answer.includes("云长见了，舞青龙偃月刀"), "片段3 短摘停在第二句句界（36 字），后续句由 citation 承载");
+  assert.ok(!out.answer.includes("后人有诗"), "片段4 短摘不含古诗，全文由 citation 承载");
   assert.equal(out.citations.length, 2, "两条裸指针各收录一条 citation");
   assert.deepEqual(
     out.citations.map((item) => item.text),
-    [
-      "吕布见了，弃了公孙瓒，便战张飞。",
-      "飞抖擞精神，酣战吕布。连斗五十余合，不分胜负。",
-    ]
+    [frag3Text, frag4Text]
   );
+});
+
+test("⑯.7a 短摘句内截断（bug-00024 修订）：单句超 40 字 / 累计跨 40 字 → 句内截断到 40 字 + 「…」收尾，全文仍由 citation 承载", () => {
+  const overlongFirstSentence =
+    "关羽提刀上马，直取华雄，手起刀落，华雄尸首坠于马下，提头回营时杯酒尚温，众诸侯骇然，曹操赞曰将军真神人也。";
+  const viewA: InjectionView = {
+    text: "",
+    quotes: new Map(),
+    fragments: new Map([
+      [
+        "片段1",
+        {
+          text: overlongFirstSentence,
+          chapter: 5,
+          title: "破关兵三英战吕布",
+        },
+      ],
+    ]),
+    quoteFragments: new Map(),
+  };
+  const outA = renderAnswerWithCitations("关羽斩华雄。[片段1]", viewA);
+  assert.equal(
+    outA.answer,
+    `关羽斩华雄。「${overlongFirstSentence.slice(0, 40)}…」¹`,
+    "首句即超限 → 句内截断到 40 字 + 「…」"
+  );
+  assert.ok(!outA.answer.includes("赞曰将军"), "截断点后的正文不内联");
+  assert.equal(outA.citations[0].text, overlongFirstSentence, "citation 仍为片段全文");
+
+  const accumulated =
+    "吕布交战。张飞与云长齐出夹攻，三马盘旋厮杀，三十合不分胜败，八路诸侯看得眼花缭乱，鼓声震天，杀声动地。";
+  const viewB: InjectionView = {
+    text: "",
+    quotes: new Map(),
+    fragments: new Map([
+      [
+        "片段1",
+        {
+          text: accumulated,
+          chapter: 5,
+          title: "破关兵三英战吕布",
+        },
+      ],
+    ]),
+    quoteFragments: new Map(),
+  };
+  const outB = renderAnswerWithCitations("吕布与关张交战。[片段1]", viewB);
+  assert.equal(
+    outB.answer,
+    `吕布与关张交战。「${accumulated.slice(0, 40)}…」¹`,
+    "首句不足 20 字继续累积，累计跨 40 字 → 句内截断 + 「…」"
+  );
+  assert.ok(!outB.answer.includes("杀声动地"), "截断点后的正文不内联");
+  assert.equal(outB.citations[0].text, accumulated, "citation 仍为片段全文");
+});
+
+test("⑯.7b 短摘无句读长文截断（bug-00024 修订）：整段无「。！？；」→ 截断到 40 字 + 「…」", () => {
+  const noPunctText = "关羽张飞刘备三人在虎牢关前围住吕布厮杀".repeat(3);
+  const view: InjectionView = {
+    text: "",
+    quotes: new Map(),
+    fragments: new Map([
+      [
+        "片段1",
+        {
+          text: noPunctText,
+          chapter: 5,
+          title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+        },
+      ],
+    ]),
+    quoteFragments: new Map(),
+  };
+  const out = renderAnswerWithCitations("三英围战吕布。[片段1]", view);
+  assert.equal(
+    out.answer,
+    `三英围战吕布。「${noPunctText.slice(0, 40)}…」¹`,
+    "无句读标点 → 整段视作一句，截断到 40 字 + 「…」"
+  );
+  assert.equal(out.citations[0].text, noPunctText, "citation 仍为片段全文");
+});
+
+test("⑯.7c 短摘长度上限（bug-00024 修订）：多段裸指针渲染后，每段短摘 ≤ ~42 字（40 字 + 「…」）", () => {
+  const texts = [
+    "关羽提刀上马，直取华雄，手起刀落，华雄尸首坠于马下，提头回营时杯酒尚温，众诸侯骇然，曹操赞曰将军真神人也。",
+    "吕布交战。张飞与云长齐出夹攻，三马盘旋厮杀，三十合不分胜败，八路诸侯看得眼花缭乱，鼓声震天，杀声动地。",
+    "关羽张飞刘备三人在虎牢关前围住吕布厮杀".repeat(3),
+    "吕布见了，弃了公孙瓒，便战张飞。八路诸侯齐出，救了公孙瓒，吕布方才收兵。",
+  ];
+  const view: InjectionView = {
+    text: "",
+    quotes: new Map(),
+    fragments: new Map([
+      ["片段1", { text: texts[0], chapter: 5, title: "破关兵三英战吕布" }],
+      ["片段2", { text: texts[1], chapter: 5, title: "破关兵三英战吕布" }],
+      ["片段3", { text: texts[2], chapter: 5, title: "破关兵三英战吕布" }],
+      ["片段4", { text: texts[3], chapter: 5, title: "破关兵三英战吕布" }],
+    ]),
+    quoteFragments: new Map(),
+  };
+  const out = renderAnswerWithCitations(
+    "三英战吕布。[片段1] [片段2] [片段3] [片段4]",
+    view
+  );
+  const excerpts = [...out.answer.matchAll(/「([^」]*)」/g)].map((m) => m[1]);
+  assert.equal(excerpts.length, 4, "四条裸指针各渲染一段短摘");
+  for (const excerpt of excerpts) {
+    assert.ok(
+      excerpt.length <= 42,
+      `短摘长度上限：${excerpt.length} 字（40 + 省略号）→ ${excerpt}`
+    );
+  }
+  assert.equal(out.citations.length, 4, "各片段全文仍逐条收录");
+  assert.deepEqual(out.citations.map((item) => item.text), texts);
 });
 
 test("⑯.8 内部编号剥离（bug-00025）：模型抄写残留 ⟨Qn⟩ → 最终 answer 全局剥离、引语正文保留，citations 不受影响", () => {

@@ -484,12 +484,42 @@ function resolvePointerRef(
   return fragmentKey ? { quote, fragmentKey } : null;
 }
 
+/** 裸指针兜底短摘：按整句累积，达到该字数即自然停在句界（不加省略号） */
+const BARE_POINTER_EXCERPT_TARGET = 20;
+
+/** 裸指针兜底短摘硬上限（字，不含省略号）：整段 / 单句超限即句内截断到该长度 */
+const BARE_POINTER_EXCERPT_CAP = 40;
+
+/** 裸指针兜底短摘（bug-00024）：取片段开头按「。！？；」整句累积，达 ≥20 字即停；
+ * 单句超 40 字或累计将超 40 字时句内截断到 40 字并附「…」；无句读标点（整段视作一句）
+ * 同规则截断。短摘与 citations[].text 同源（同为片段开头原文），片段全文由 citations
+ * 卡片承载，answer 短而自洽、不再内联长文。 */
+function excerptForBarePointer(text: string): string {
+  const source = text.trim();
+  if (source.length === 0) {
+    return source;
+  }
+  let excerpt = "";
+  for (const char of source) {
+    excerpt += char;
+    if (/[。！？；]/.test(char)) {
+      if (excerpt.length >= BARE_POINTER_EXCERPT_TARGET) {
+        return excerpt;
+      }
+    } else if (excerpt.length >= BARE_POINTER_EXCERPT_CAP) {
+      return `${excerpt.trimEnd()}…`;
+    }
+  }
+  return excerpt;
+}
+
 /** 服务端渲染引用与出处（feat-A006）：`[Qn]` 引语指针 → 「引文」+ 全局上标角标，
  * `[片段N]` 叙述段指针 → 指针后有正文时仅全局上标角标（不内联原文，正文保留）；裸指针
- * （跳过空白后遇另一指针 `[` 或字符串末尾）→ 「片段原文」+ 角标（bug-00024，与 [Qn] 同形态，
- * answer 自洽可独立成读）；渲染后全局剥离模型抄写残留的 ⟨Qn⟩ 内部编号（bug-00025）；
- * 不再内联出处；citations 按引用出现顺序、片段粒度合并（同片段多引语合并为一条，
- * 角标数量 = 片段数量），只收被引用片段；未注册的指针原样保留。 */
+ * （跳过空白后遇另一指针 `[` 或字符串末尾）→ 「片段开头短摘」+ 角标（bug-00024，与 [Qn]
+ * 同形态，answer 短而自洽；片段全文由 citations 卡片承载，不内联长文）；渲染后全局剥离
+ * 模型抄写残留的 ⟨Qn⟩ 内部编号（bug-00025）；不再内联出处；citations 按引用出现顺序、
+ * 片段粒度合并（同片段多引语合并为一条，角标数量 = 片段数量），只收被引用片段；
+ * 未注册的指针原样保留。 */
 export function renderAnswerWithCitations(
   answer: string,
   view: InjectionView
@@ -517,9 +547,11 @@ export function renderAnswerWithCitations(
       if (ref.startsWith("Q")) {
         return `「${resolved.quote.text}」${toSuperscript(index)}`;
       }
-      // bug-00024：裸指针（跳过空白后遇另一指针或字符串末尾）→ 以片段原文补全
+      // bug-00024：裸指针（跳过空白后遇另一指针或字符串末尾）→ 以片段开头短摘补全，
+      // 不内联全文（片段全文由 citations 卡片承载，answer 短而自洽）
       if (/^\s*(?:\[|$)/.test(answer.slice(offset + whole.length))) {
-        return `「${resolved.quote.text}」${toSuperscript(index)}`;
+        const excerpt = excerptForBarePointer(resolved.quote.text);
+        return excerpt ? `「${excerpt}」${toSuperscript(index)}` : toSuperscript(index);
       }
       return toSuperscript(index);
     }
