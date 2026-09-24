@@ -786,11 +786,12 @@ export class Agent {
   }
 
   /** bug-00028 复核轮（stage=novel_support_check）：语义裁决移交 LLM，规则层只剩结构门。
-   * 输入 = 注入片段全文（同生成轮视图）+ 模型答案 + 引用指针清单；输出仅契约 JSON（supportCheck.ts）。
+   * 输入 = 用户问题 + 注入片段全文（同生成轮视图）+ 模型答案 + 引用指针清单；输出仅契约 JSON（supportCheck.ts）。
    * 复用生成轮同一条 invokeModel 通道（同一模型 / 配置 / 凭据 / llm_call_logs 落库），不新增第二套入口；
    * 解析失败（非 JSON / 字段缺失）→ 同一输入重试 1 次 → 仍失败返回 null（调用方按 unsupported 拒答，
    * 宁拒勿猜）；解析失败另行落 failed 标记行（复用 llm_call_logs 现有字段，观测解析率）。 */
   private async runNovelSupportCheck(
+    query: string,
     answer: string,
     view: InjectionView,
     pointerTexts: string[]
@@ -800,6 +801,8 @@ export class Agent {
       {
         role: "user",
         content: [
+          "【用户问题】",
+          query,
           "【注入片段】",
           view.text,
           "【模型答案】",
@@ -913,6 +916,7 @@ export class Agent {
       // 「演义中未涉及」+ 清空引用（A004 红线，拒答类不写缓存规则不变，见 cache.ts record）；
       // 部分支撑 → 只留 supported 引用、指针重编号、citations 与 funnel.cited 回填；无支撑引用留存 → 同样拒答。
       const verdict = await this.runNovelSupportCheck(
+        query,
         cleaned,
         view,
         pointer.pointers

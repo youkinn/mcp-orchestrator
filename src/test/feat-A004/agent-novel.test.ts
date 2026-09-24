@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { Agent } from "../../agent.js";
 import { MCPTransport } from "../../transport.js";
 import { loadAliasTable } from "../../citation.js";
+import { SUPPORT_CHECK_SYSTEM_PROMPT } from "../../supportCheck.js";
 import { runWithTraceId } from "../../trace.js";
 import { getLogStore, type LogStore } from "../../storage/logs.js";
 import type {
@@ -1137,4 +1138,86 @@ test("⑳ 复核轮日志：解析失败 ×2 计数落库（status=failed 标记
     failed.every((call) => call.errorMessage.includes("解析失败")),
     "失败标记行 error_message 落解析失败原因（复用现有字段，不新增列）"
   );
+});
+
+test("㉑ 复核轮·问题-答案对齐（trace 2b12dd5f 复刻）：问投靠后结局、答归降过程——片段支撑答案断言但答非所问 → 复核判 unsupported → 拒答", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0065:c0007",
+      text: "马超与张飞在葭萌关前大战，玄德在城上观战。诸葛亮用计，马超乃降，归顺刘备。",
+      chapter: 65,
+      title: "马超大战葭萌关　刘备自领益州牧",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return modelCallCount === 1
+      ? textResponse("在葭萌关与张飞大战，后经诸葛亮用计归降刘备。[片段1]")
+      : supportCheckResponse("unsupported", [["片段1", "unsupported"]]);
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "马超归降刘备",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("马超投靠刘备后，后来如何了", "sango-novel");
+  assert.equal(data.answer, "演义中未涉及", "引用片段支撑答案断言，但答非所问（要的是投靠后结局，答的是归降过程）→ 复核判 unsupported → 拒答");
+  assert.deepEqual(data.citations, [], "拒答清空引用");
+  assert.equal(modelCallCount, 2, "生成轮 + 复核轮各一次；拒答是复核轮后的确定性动作，不触发兜底结论模型调用");
+});
+
+test("㉒ 复核轮·输入构建：user 消息含【用户问题】与 query 原文（防输入构建回归）", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0005:c0002",
+      text: "夏侯惇字元让，沛国谯人也。",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  const seen: any[] = [];
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    seen.push(messages);
+    return seen.length === 1
+      ? textResponse("夏侯惇字元让。[片段1]")
+      : supportCheckResponse("supported", [["片段1", "supported"]]);
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "夏侯惇字元让",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("夏侯惇字什么", "sango-novel");
+  const checkUser = (seen[1] as any[]).find((message) => message.role === "user");
+  assert.equal(typeof checkUser?.content, "string", "复核轮 user 内容为纯文本（无工具致盲）");
+  assert.ok(checkUser.content.includes("【用户问题】"), "复核输入含【用户问题】段");
+  assert.ok(checkUser.content.includes("夏侯惇字什么"), "复核输入含 query 原文");
+  assert.ok(checkUser.content.includes("【注入片段】"), "复核输入仍含注入片段全文视图");
+  assert.ok(checkUser.content.includes("【模型答案】"), "复核输入仍含模型答案段");
+  assert.ok(checkUser.content.includes("【引用指针清单】"), "复核输入仍含引用指针清单段");
+  assert.ok(data.answer.includes("字元让"), "复核判 supported → 原样返回");
+  assert.equal(seen.length, 2, "生成轮 + 复核轮各一次");
+});
+
+test("㉓ 复核轮·提示词含问题-答案对齐判定指令（正面回答 / 答非所问）", async () => {
+  assert.ok(SUPPORT_CHECK_SYSTEM_PROMPT.includes("用户问题"), "提示词声明输入含用户问题");
+  assert.ok(SUPPORT_CHECK_SYSTEM_PROMPT.includes("正面回答"), "判定对象 = 答案对用户问题的回答，须正面回答");
+  assert.ok(SUPPORT_CHECK_SYSTEM_PROMPT.includes("答非所问"), "含答非所问判定指令（未触及问题 → unsupported）");
 });
