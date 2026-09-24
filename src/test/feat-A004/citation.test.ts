@@ -1,4 +1,4 @@
-﻿import { test } from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -6,12 +6,16 @@ import { join } from "node:path";
 import {
   MAX_MODEL_QUOTE_LENGTH,
   NOVEL_NO_HIT_ANSWER,
+  SENTENCE_OVERLAP_NGRAM,
+  SENTENCE_OVERLAP_THRESHOLD,
   buildFallback,
   buildInjectionView,
   loadAliasTable,
   pickBestFallbackFragment,
   renderAnswerWithCitations,
   scanRecallPersonIds,
+  sentenceFragmentOverlap,
+  stripLowOverlapSentences,
   stripOverlongModelQuotes,
   toRecallFragments,
   toSuperscript,
@@ -19,10 +23,7 @@ import {
   verifyCitation,
   type InjectionView,
 } from "../../citation.js";
-import {
-  parseSupportCheckResult,
-  stripUnsupportedPointers,
-} from "../../supportCheck.js";
+
 
 test("① 别名表加载：路径指向真实 JSON 时读取生效（含 关羽=P002）", () => {
   const dir = mkdtempSync(join(tmpdir(), "a004-alias-"));
@@ -817,133 +818,84 @@ test("⑲.2 非法 / 越界 offset、len：只跳过该条，不崩、不插错�
   );
 });
 
+// ===== bug-00028 单轮方案：结构门第三条「句-片段文本重叠」——纯函数级用例 =====
+// 语义裁决已收进生成轮提示词（零额外 LLM 调用），本组只测结构门的归一化 / 重叠率 / 裁剪边界
+// （sentenceFragmentOverlap / stripLowOverlapSentences，见 citation.ts）。
 
-// ===== bug-00028：复核轮判定契约（novel_support_check）——纯函数级用例 =====
-// 语义裁决移交 LLM 复核轮（supportCheck.ts），词表型信号（死亡 / 数值同值 / 表字值）已删除，
-// 本组只测契约 JSON 的解析（熔断）与按 support 值的裁剪动作，不测任何语义规则。
-
-test("⑳ 复核轮契约：正常 JSON 解析（supported / unsupported 混合 + overall）", () => {
-  const parsed = parseSupportCheckResult(
-    '{"citations":[{"pointer":"片段1","support":"supported"},{"pointer":"Q1","support":"unsupported"}],"overall":"supported"}'
-  );
-  assert.deepEqual(parsed, {
-    citations: [
-      { pointer: "片段1", support: "supported" },
-      { pointer: "Q1", support: "unsupported" },
-    ],
-    overall: "supported",
-  });
-});
-
-test("⑳.1 复核轮契约·uncertain 取值合法：不属于放宽动作，由调用方按 unsupported 拒答", () => {
-  const parsed = parseSupportCheckResult(
-    '{"citations":[{"pointer":"片段1","support":"uncertain"}],"overall":"uncertain"}'
-  );
-  assert.deepEqual(parsed, {
-    citations: [{ pointer: "片段1", support: "uncertain" }],
-    overall: "uncertain",
-  });
-});
-
-test("⑳.2 复核轮契约·解析失败熔断：非 JSON / 空串 / 围栏外多余文字 → null（调用方重试 1 次后按 unsupported 拒答）", () => {
-  assert.equal(parseSupportCheckResult("马超投靠刘备后病逝。"), null, "散文输出非契约 JSON");
-  assert.equal(parseSupportCheckResult(""), null, "空输出");
-  assert.equal(parseSupportCheckResult("   \n  "), null, "纯空白输出");
+test("⑳ 结构门·重叠率：句子 2-gram 命中片段的比例（全文重合 → 1；无关句 → 0）", () => {
   assert.equal(
-    parseSupportCheckResult('解释了半天 {"overall":"supported","citations":[]} 结尾'),
-    null,
-    "JSON 前后夹带解释文字 → 非严格 JSON"
+    sentenceFragmentOverlap("夏侯惇字元让。", "夏侯惇字元让，沛国谯人也。"),
+    1,
+    "句子 2-gram 全部命中片段"
+  );
+  assert.equal(
+    sentenceFragmentOverlap("刘备死的时候六十三岁。", "孙权闻玄德与孙夫人已去，急召周瑜商议。"),
+    0,
+    "答案断言与片段零字面重叠"
   );
 });
 
-test("⑳.3 复核轮契约·```json 围栏容错：围栏包裹的合法 JSON 可解析（模型偶发围栏不判死）", () => {
-  const fenced = [
-    "```json",
-    '{"citations":[{"pointer":"片段1","support":"supported"}],"overall":"supported"}',
-    "```",
-  ].join("\n");
-  const parsed = parseSupportCheckResult(fenced);
-  assert.equal(parsed?.overall, "supported");
-  assert.equal(parsed?.citations[0]?.pointer, "片段1");
-});
-
-test("⑳.4 复核轮契约·字段缺失熔断：overall 缺 / citations 非数组 / pointer 空 / support 非法 → null", () => {
+test("⑳.1 结构门·归一化：全角数字转半角、标点空白剔除、引语剔除（引语沿用服务端渲染，不参与判定）", () => {
+  assert.equal(sentenceFragmentOverlap("５５", "55"), 1, "全角数字转半角后同形");
   assert.equal(
-    parseSupportCheckResult('{"citations":[],"overall":"judged"}'),
-    null,
-    "overall 取值非法"
+    sentenceFragmentOverlap(
+      "关公曰：“酒且斟下，某去便来。”出帐提刀。",
+      "关公曰：“酒且斟下，某去便来。”出帐提刀，飞身上马。"
+    ),
+    1,
+    "引语（“…”）剔除后，叙述部分与片段同形"
   );
-  assert.equal(
-    parseSupportCheckResult('{"citations":[],"overall":null}'),
-    null,
-    "overall 缺失（null）"
-  );
-  assert.equal(
-    parseSupportCheckResult('{"citations":[],"overall":"supported","extra":1}')?.overall,
-    "supported",
-    "多余字段容忍，不影响契约字段校验"
-  );
-  assert.equal(
-    parseSupportCheckResult('[{"pointer":"片段1","support":"supported"}]'),
-    null,
-    "顶层数组（非对象）→ 熔断"
-  );
-  assert.equal(
-    parseSupportCheckResult('{"citations":{},"overall":"supported"}'),
-    null,
-    "citations 非数组 → 熔断"
-  );
-  assert.equal(
-    parseSupportCheckResult('{"citations":[{"pointer":"","support":"supported"}],"overall":"supported"}'),
-    null,
-    "pointer 为空串 → 熔断"
-  );
-  assert.equal(
-    parseSupportCheckResult('{"citations":[{"pointer":"片段1"}],"overall":"supported"}'),
-    null,
-    "support 缺失 → 熔断"
-  );
-  assert.equal(
-    parseSupportCheckResult('{"citations":[{"pointer":"片段1","support":"maybe"}],"overall":"supported"}'),
-    null,
-    "support 取值非法 → 熔断"
-  );
-  assert.equal(
-    parseSupportCheckResult('{"citations":[null],"overall":"supported"}'),
-    null,
-    "citations 条目非对象 → 熔断"
+  assert.ok(
+    sentenceFragmentOverlap("张飞遇害时年55岁。", "时年五十五。") < SENTENCE_OVERLAP_THRESHOLD,
+    "「五十五」与「55」字面不同形 → 低重叠（语义等价不在纯文本结构门职责，由生成轮指令约束）"
   );
 });
 
-test("⑳.5 裁剪·部分支撑：只留 supported 引用、摘除 unsupported / uncertain / 未覆盖指针，正文不动", () => {
-  const { answer, kept } = stripUnsupportedPointers(
-    "夏侯渊随曹操讨吕布，大破之。[片段1][片段2]",
-    [
-      { pointer: "片段1", support: "supported" },
-      { pointer: "片段2", support: "unsupported" },
-    ]
+test("⑳.2 结构门·裁剪边界：重叠 ≥ 阈值保留、< 阈值整句裁剪、全裁空串（调用方拒答）", () => {
+  const view = buildInjectionView([
+    {
+      text: "马超与张飞在葭萌关前大战，玄德在城上观战。自白日战至夜，不分胜负。",
+      source: "s",
+      chapter: 65,
+      title: "马超大战葭萌关　刘备自领益州牧",
+    },
+    {
+      text: "袁绍聚众官于帐中，商议起兵。",
+      source: "s",
+      chapter: 9,
+      title: "除暴凶吕布助司徒　犯长安李傕听贾诩",
+    },
+  ]);
+  // 高于阈值放行：原样保留
+  assert.equal(
+    stripLowOverlapSentences("马超与张飞在葭萌关前大战百余合，不分胜负。[片段1]", view),
+    "马超与张飞在葭萌关前大战百余合，不分胜负。[片段1]",
+    "重叠 ≥ 阈值 → 完整保留"
   );
-  assert.deepEqual(kept, ["片段1"]);
-  assert.equal(answer, "夏侯渊随曹操讨吕布，大破之。[片段1]", "被摘除指针只去掉标记，正文原样保留");
+  // 低于阈值裁剪：整句连同指针移除
+  assert.equal(
+    stripLowOverlapSentences("马超后来投靠了袁绍。[片段2]", view),
+    "",
+    "重叠 < 阈值 → 整句裁剪，返回空串（调用方据此拒答）"
+  );
+  // 混合：高低各一句 → 只留高重叠句
+  assert.equal(
+    stripLowOverlapSentences(
+      "马超与张飞在葭萌关前大战百余合，不分胜负。[片段1] 马超后来投靠了袁绍。[片段2]",
+      view
+    ),
+    "马超与张飞在葭萌关前大战百余合，不分胜负。[片段1]",
+    "低重叠句被裁、高重叠句保留"
+  );
+  // 引语句 [Qn] 与无指针句不受本门约束
+  assert.equal(
+    stripLowOverlapSentences("斩华雄者系关羽，原文见[Q1]。", view),
+    "斩华雄者系关羽，原文见[Q1]。",
+    "引语句不受句-片段重叠门约束（沿用服务端渲染）"
+  );
 });
 
-test("⑳.6 裁剪·uncertain 与未覆盖指针同样摘除（宁缺毋滥）；复核轮漏判的指针不保留", () => {
-  const { answer, kept } = stripUnsupportedPointers(
-    "斩华雄者系关羽，原文见[Q1]，另有[片段3]。",
-    [
-      { pointer: "Q1", support: "uncertain" },
-      { pointer: "片段3", support: "supported" },
-    ]
-  );
-  assert.deepEqual(kept, ["片段3"]);
-  assert.equal(answer, "斩华雄者系关羽，原文见，另有[片段3]。", "uncertain 指针摘除、未覆盖指针摘除");
-});
-
-test("⑳.7 裁剪·全不支撑 → kept 空（调用方据此拒答「演义中未涉及」）；重复出现一并摘除", () => {
-  const { answer, kept } = stripUnsupportedPointers(
-    "马超投靠刘备后，最终病逝。[片段2][片段2]",
-    [{ pointer: "片段2", support: "unsupported" }]
-  );
-  assert.deepEqual(kept, []);
-  assert.equal(answer, "马超投靠刘备后，最终病逝。", "指针全部摘除、重复出现一并摘除");
+test("⑳.3 结构门·阈值常量：0.5 默认从严（低于裁剪 / 高于放行的分界），n-gram 取 2", () => {
+  assert.equal(SENTENCE_OVERLAP_THRESHOLD, 0.5, "阈值常量默认 0.5（Coco 定稿，先从严测边界）");
+  assert.equal(SENTENCE_OVERLAP_NGRAM, 2, "n-gram 长度默认 2（可对比 3-gram 调参）");
 });
