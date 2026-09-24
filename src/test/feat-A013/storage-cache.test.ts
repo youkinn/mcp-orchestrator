@@ -77,7 +77,7 @@ test('① 新库建两表且全列齐（§2.1 / §2.2，列名按 DDL 照抄）�
     );
     assert.deepEqual(
       logsCols.map((c) => c.name),
-      ['id', 'trace_id', 'user_query', 'nearest_query', 'similarity', 'hit_line', 'hit', 'tie_hits', 'marked', 'marked_by', 'marked_at', 'created_at']
+      ['id', 'trace_id', 'user_query', 'nearest_query', 'similarity', 'hit_line', 'hit', 'tie_hits', 'marked', 'marked_by', 'marked_at', 'created_at', 'lookup_ms']
     );
     const indexes = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_cache%' ORDER BY name`).all() as Array<{ name: string }>;
     assert.deepEqual(
@@ -133,12 +133,20 @@ test('③ appendCacheLog + queryCacheLogByTrace：全字段读写 / 池空 null 
   assert.equal(record.markedBy, null);
   assert.equal(record.markedAt, null);
   assert.equal(typeof record.createdAt, 'number');
+  assert.equal(record.lookupMs, null, '未传 lookupMs（未采集）→ null');
 
   // 同 trace 二次落库：trace_id 唯一，OR IGNORE 幂等（一个请求至多一行）
   store.appendCacheLog(TRACE_A, cacheLogPayload({ similarity: 0.9911 }));
   const dist = store.queryCacheDistribution(0, Date.now() + 1000);
   assert.equal(dist.totals.totalCount, 1, '重复 trace 不产生第二行');
   assert.equal(store.queryCacheLogByTrace(TRACE_A)!.similarity, 0.9821, '首行保留');
+
+  // lookupMs 落库回读（验收第七批：缓存判定耗时，含 embedding 冷启动）
+  ensureSkeleton(store, TRACE_C, 3000);
+  store.appendCacheLog(TRACE_C, cacheLogPayload({ lookupMs: 3427 }));
+  const timed = store.queryCacheLogByTrace(TRACE_C)!;
+  assert.equal(timed.lookupMs, 3427, 'lookupMs 落库后按行回读');
+  assert.equal(timed.tieHits, 1, 'lookupMs 不影响其余字段');
 
   // 池空形态：similarity / nearestQuery / tieHits = null
   ensureSkeleton(store, TRACE_B, 2000);
@@ -414,6 +422,42 @@ test('⑫ deriveCacheReason 区间归类（§2.2 / §3.10 枚举：hit / miss-lo
   assert.equal(deriveCacheReason({ ...base, similarity: 0.8512 }), 'miss-gray', '灰色区');
   assert.equal(deriveCacheReason({ ...base, similarity: 0.955, tieHits: 2 }), 'miss-tie', '歧义');
   assert.equal(deriveCacheReason({ ...base, similarity: 0.955, tieHits: 1 }), 'miss-focus', '焦点拒判');
+});
+
+test('⑬ 旧库迁移：cache_logs 缺 lookup_ms 打开补列 / 重复打开幂等（验收第七批，旧 A013 库历史行不丢）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'a013-lookup-migrate-'));
+  const dbPath = join(dir, 'logs.db');
+  const db = new Database(dbPath);
+  // 旧 A013 库 schema：cache_logs 建表无 lookup_ms（第七批之前的版本）
+  db.exec(`
+    CREATE TABLE request_logs (
+      trace_id TEXT PRIMARY KEY, log_type TEXT NOT NULL, user_input TEXT, domain TEXT,
+      status TEXT NOT NULL, response_code INTEGER NOT NULL, error_message TEXT NOT NULL DEFAULT '',
+      client_sent_at INTEGER, server_received_at INTEGER NOT NULL, handle_started_at INTEGER,
+      server_responded_at INTEGER, client_received_at INTEGER, answer TEXT, citations TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE cache_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      trace_id TEXT NOT NULL UNIQUE REFERENCES request_logs(trace_id) ON DELETE CASCADE,
+      user_query TEXT NOT NULL, nearest_query TEXT, similarity REAL, hit_line REAL NOT NULL,
+      hit INTEGER NOT NULL, tie_hits INTEGER, marked INTEGER NOT NULL DEFAULT 0,
+      marked_by TEXT, marked_at INTEGER, created_at INTEGER NOT NULL
+    );
+  `);
+  db.close();
+
+  const store = createLogStore({ dbPath }); // 打开即迁移补 lookup_ms
+  ensureSkeleton(store, TRACE_A, Date.now());
+  store.appendCacheLog(TRACE_A, cacheLogPayload({ lookupMs: 3427 }));
+  assert.equal(store.queryCacheLogByTrace(TRACE_A)!.lookupMs, 3427, '旧库补列后可写可读');
+  store.close();
+
+  // 再次打开：ALTER duplicate column 旁路忽略，幂等
+  const reopen = createLogStore({ dbPath });
+  assert.equal(reopen.queryCacheLogByTrace(TRACE_A)!.lookupMs, 3427, '重复打开不报错且数据保留');
+  reopen.close();
+  rmSync(dir, { recursive: true, force: true });
 });
 
 function t_after(store: LogStore): void {

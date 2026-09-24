@@ -44,6 +44,8 @@ interface CacheTraceInfo {
   reason: 'hit' | 'miss-low' | 'miss-gray' | 'miss-tie' | 'miss-focus';
   marked: boolean;
   createdAt: number;
+  /** feat-A013 验收修正：缓存判定耗时（毫秒，含 embedding 冷启动）；历史行 / 未采集 = null */
+  lookupMs: number | null;
 }
 
 /** cache_logs 行 → §3.10 data.cache（reason 照 deriveCacheReason 派生，单一实现点） */
@@ -59,6 +61,7 @@ function toCacheTrace(record: CacheLogRecord): CacheTraceInfo {
     reason: deriveCacheReason(record),
     marked: record.marked,
     createdAt: record.createdAt,
+    lookupMs: record.lookupMs,
   };
 }
 
@@ -129,8 +132,9 @@ export function createLogsApi(logStore: LogStore): Router {
           list: result.list.map((item) => ({
             ...item,
             // feat-A013 §3.10：列表行 cacheHit（1=命中 / 0=未命中 / null=无判定行）。
-            // LEFT JOIN cache_logs 口径：storage.queryList 保持 A007 既有 SELECT 零改动（不含 JOIN 列），
-            // 此处按 trace_id 主键逐行等价位查（pageSize ≤ 100，同步 SQLite 微秒级）。
+            // 口径：storage.queryList 保持 A007 既有 SELECT 字段零改动（列表 durations.cacheLookupMs
+            // 已在查询 SQL LEFT JOIN cache_logs 落列，见验收第七批）；cacheHit 按 trace_id 主键逐行位查
+            // （pageSize ≤ 100，同步 SQLite 微秒级）。
             cacheHit: toCacheHit(logStore.queryCacheLogByTrace(item.traceId)),
           })),
           total: result.total,

@@ -125,7 +125,8 @@ CREATE TABLE IF NOT EXISTS cache_logs (
   marked        INTEGER NOT NULL DEFAULT 0,
   marked_by     TEXT,
   marked_at     INTEGER,
-  created_at    INTEGER NOT NULL
+  created_at    INTEGER NOT NULL,
+  lookup_ms     INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_cache_logs_created ON cache_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_cache_logs_hit_created ON cache_logs(hit, created_at);
@@ -233,6 +234,8 @@ export interface LogListItem {
     server: number | null;
     llm: number | null;
     tool: number | null;
+    /** feat-A013 验收修正：语义缓存判定耗时（毫秒，含 embedding 冷启动）；历史行 / 未采集 = null */
+    cacheLookupMs: number | null;
     total: number | null;
   };
   tokens: { input: number | null; output: number | null } | null;
@@ -343,6 +346,8 @@ export interface CacheLogPayload {
   hit: boolean;
   /** ≥ 命中线的候选条数：唯一候选=1；无候选=0；池空=null */
   tieHits: number | null;
+  /** 本次请求缓存判定耗时（毫秒，含 embedding 冷启动）；undefined/null=未采集 */
+  lookupMs?: number | null;
 }
 
 /** feat-A013：cache_logs 行（查询返回；hit / marked 布尔化）。 */
@@ -359,6 +364,8 @@ export interface CacheLogRecord {
   markedBy: string | null;
   markedAt: number | null;
   createdAt: number;
+  /** 本次请求缓存判定耗时（毫秒，含 embedding 冷启动）；历史行 / 未采集 = null */
+  lookupMs: number | null;
 }
 
 /** feat-A013：灰色区 query 对明细行（§3.8 清单项）。 */
@@ -671,6 +678,7 @@ interface CacheLogRow {
   marked_by: string | null;
   marked_at: number | null;
   created_at: number;
+  lookup_ms: number | null;
 }
 
 /** feat-A013：cache_entries 列表查询 DB 行（不含 embedding / 答案全文，载荷纪律 §3.5）。 */
@@ -698,6 +706,7 @@ function mapCacheLogRow(row: CacheLogRow): CacheLogRecord {
     markedBy: row.marked_by,
     markedAt: row.marked_at,
     createdAt: row.created_at,
+    lookupMs: row.lookup_ms,
   };
 }
 
@@ -709,6 +718,8 @@ interface ListRow extends RequestLogRow {
   tool_duration: number | null;
   /** feat-A012：该 trace 内最大 attempt（NULL 计 0）；=2 即存在重试 */
   max_attempt: number | null;
+  /** feat-A013 验收修正：缓存判定耗时（cache_logs.lookup_ms LEFT JOIN 落列；历史行 / 未采集 null） */
+  cache_lookup_ms: number | null;
 }
 
 /** feat-A012：input_breakdown 列（JSON 串）解析为对象；缺失 / 非法 / 解析失败 → null（不炸前端） */
@@ -905,6 +916,13 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
         // 旁路：duplicate column 等忽略（新库 / 已迁移库）
       }
     }
+    // feat-A013 验收修正：旧库 cache_logs 缺 lookup_ms（缓存判定耗时）补列；
+    // 历史行保持 NULL 不回填（未采集无法事后推断）。新库建表已含该列，重复执行忽略，幂等。
+    try {
+      db.exec(`ALTER TABLE cache_logs ADD COLUMN lookup_ms INTEGER`);
+    } catch {
+      // 旁路：duplicate column 等忽略（新库 / 已迁移库）
+    }
   } catch (error) {
     console.error('Failed to initialize log store (logging disabled):', error);
     return createNoopStore();
@@ -968,8 +986,8 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   const insertCacheLogStmt = db.prepare(`
     INSERT OR IGNORE INTO cache_logs
       (trace_id, user_query, nearest_query, similarity, hit_line, hit, tie_hits,
-       marked, marked_by, marked_at, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?)
+       marked, marked_by, marked_at, created_at, lookup_ms)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?)
   `);
   const queryCacheLogByTraceStmt = db.prepare(
     `SELECT * FROM cache_logs WHERE trace_id = ?`
@@ -1063,8 +1081,10 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
       (SELECT SUM(l.prompt_tokens) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS input_tokens,
       (SELECT SUM(l.completion_tokens) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS output_tokens,
       (SELECT SUM(t.call_returned_at - t.call_sent_at) FROM tool_call_logs t WHERE t.trace_id = r.trace_id) AS tool_duration,
-      (SELECT MAX(l.attempt) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS max_attempt
+      (SELECT MAX(l.attempt) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS max_attempt,
+      cl.lookup_ms AS cache_lookup_ms
     FROM request_logs r
+    LEFT JOIN cache_logs cl ON cl.trace_id = r.trace_id
   `;
   const queryDetailStmt = db.prepare(`SELECT * FROM request_logs WHERE trace_id = ?`);
   const queryLlmCallsStmt = db.prepare(
@@ -1325,6 +1345,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
                 : null,
             llm: row.llm_duration,
             tool: row.tool_duration,
+            cacheLookupMs: row.cache_lookup_ms,
             total:
               isNumber(row.client_received_at) && isNumber(row.client_sent_at)
                 ? row.client_received_at - row.client_sent_at
@@ -1492,7 +1513,8 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           payload.hitLine,
           payload.hit ? 1 : 0,
           payload.tieHits ?? null,
-          Date.now()
+          Date.now(),
+          payload.lookupMs ?? null
         );
       } catch (error) {
         console.error('Failed to write cache_logs (bypass):', error);

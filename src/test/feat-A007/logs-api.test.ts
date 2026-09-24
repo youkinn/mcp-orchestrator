@@ -101,7 +101,7 @@ function seedTraceA(logStore: LogStore, traceId: string = TRACE_A): void {
   logStore.flush();
 }
 
-test('GET /api/v1/logs：成功信封 + 列表项字段 + durations/tokens 派生（与接口文档示例一致）', async (t) => {
+test('GET /api/v1/logs：成功信封 + 列表项字段 + durations/tokens 派生（A007 公式项 + feat-A013 cacheLookupMs=null）', async (t) => {
   const logStore = createLogStore({ dbPath: ':memory:' });
   t.after(() => logStore.close());
   seedTraceA(logStore);
@@ -127,7 +127,7 @@ test('GET /api/v1/logs：成功信封 + 列表项字段 + durations/tokens 派�
   assert.equal(item.responseCode, 200);
   assert.equal(item.errorMessage, '');
   assert.equal(item.serverReceivedAt, 1789884000000);
-  assert.deepEqual(item.durations, { frontend: 7550, queueWait: 12, server: 3450, llm: 2800, tool: 600, total: 11000 });
+  assert.deepEqual(item.durations, { frontend: 7550, queueWait: 12, server: 3450, llm: 2800, tool: 600, cacheLookupMs: null, total: 11000 });
   assert.deepEqual(item.tokens, { input: 1234, output: 860 });
 });
 

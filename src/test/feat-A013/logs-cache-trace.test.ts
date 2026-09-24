@@ -26,6 +26,8 @@ function cachePayload(overrides: Partial<CacheLogPayload> = {}): CacheLogPayload
     hitLine: HIT_LINE,
     hit: true,
     tieHits: 1,
+    // 验收第七批：缓存判定耗时默认采集值（权重就绪后 ~175ms，参考 trace 2631c162）
+    lookupMs: 175,
     ...overrides,
   };
 }
@@ -90,6 +92,7 @@ test('② 详情 data.cache：命中行全字段形状 + reason=hit + cacheLogId
     reason: 'hit',
     marked: false,
     createdAt: cache.createdAt,
+    lookupMs: 175,
   });
   assert.equal(typeof cache.cacheLogId, 'number', 'cacheLogId = cache_logs.id');
   assert.equal(typeof cache.createdAt, 'number');
@@ -132,12 +135,15 @@ test('④ 列表 cacheHit：1=命中 / 0=未命中 / null=无行（LEFT JOIN 派
   const { body } = await get(baseUrl, '/api/v1/logs');
   assert.equal(body.data.total, 3);
   // TS7 下 Map 推断收窄为 unknown，显式类型实参（列表行含 cacheHit + 原列表字段）
-  const byTrace = new Map<string, { traceId: string; cacheHit: 1 | 0 | null; domain?: string }>(
-    body.data.list.map((row: { traceId: string; cacheHit: 1 | 0 | null; domain?: string }) => [row.traceId, row])
+  const byTrace = new Map<string, { traceId: string; cacheHit: 1 | 0 | null; domain?: string; durations: { cacheLookupMs: number | null } }>(
+    body.data.list.map((row: { traceId: string; cacheHit: 1 | 0 | null; domain?: string; durations: { cacheLookupMs: number | null } }) => [row.traceId, row])
   );
   assert.equal(byTrace.get(TRACE_HIT)?.cacheHit, 1, '命中行 → 1');
   assert.equal(byTrace.get(TRACE_GRAY)?.cacheHit, 0, '未命中行 → 0');
   assert.equal(byTrace.get(TRACE_NO_CACHE)?.cacheHit, null, '无判定行 → null');
+  assert.equal(byTrace.get(TRACE_HIT)?.durations.cacheLookupMs, 175, '命中行 cacheLookupMs 透出（验收第七批）');
+  assert.equal(byTrace.get(TRACE_GRAY)?.durations.cacheLookupMs, 175, '未命中行 cacheLookupMs 同样透出');
+  assert.equal(byTrace.get(TRACE_NO_CACHE)?.durations.cacheLookupMs, null, '无 cache_logs 行的历史请求 → null');
   assert.equal(byTrace.get(TRACE_HIT)?.domain, 'sango-novel', '列表原字段保留');
 });
 
@@ -152,4 +158,21 @@ test('⑤ 详情 data.cache.marked：标记后 true（误判标记在命中解�
   const { body } = await get(baseUrl, `/api/v1/logs/${TRACE_HIT}`);
   assert.equal(body.data.cache.marked, true, '命中解释带误判标记位');
   assert.equal(body.data.cache.reason, 'hit');
+});
+
+test('⑥ 详情 data.cache.lookupMs：落库值透出 / null（未采集）→ null（验收第七批：耗时归因拆「缓存判定」）', async (t) => {
+  const store = createLogStore({ dbPath: ':memory:' });
+  t.after(() => store.close());
+  seedTrace(store, TRACE_HIT, cachePayload({ lookupMs: 3427 }));
+  seedTrace(store, TRACE_GRAY, cachePayload({ hit: false, similarity: 0.8512, lookupMs: null }));
+  store.flush();
+  const baseUrl = await startLogsApi(t, store);
+
+  const hit = await get(baseUrl, `/api/v1/logs/${TRACE_HIT}`);
+  assert.equal(hit.status, 200);
+  assert.equal(hit.body.data.cache.lookupMs, 3427, '落库 lookupMs 原样透出');
+
+  const noLookup = await get(baseUrl, `/api/v1/logs/${TRACE_GRAY}`);
+  assert.equal(noLookup.body.data.cache.lookupMs, null, 'null（未采集）→ null');
+  assert.equal(noLookup.body.data.cache.reason, 'miss-gray', '原有字段不受影响');
 });
