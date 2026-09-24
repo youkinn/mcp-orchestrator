@@ -35,6 +35,8 @@ export interface CacheEntryDetail {
   hitCount: number;
   lastAccessAt: number;
   createdAt: number;
+  /** feat-A013 验收修正：最近一条同 queryText 的 cache_logs.traceId（user_query = 条目 query_text，按 id DESC 取最新；无关联行 null）。路由层从 LogStore 补充，Manager 不感知。 */
+  traceId: string | null;
 }
 
 /** feat-A013 验收修正：命中线修改记录（§2.5 / §3.2 / §3.6 overview.lastHitLineChange）。 */
@@ -72,12 +74,13 @@ export interface CacheManager {
   setHitLine(value: number): number;
   clearAll(): { cleared: number };
   deleteEntry(id: number): boolean;
+  /** 条目明细（§3.5；traceId 关联由路由层从 LogStore 补充，Manager 不感知——同 getOverview 口径） */
   listEntries(options: {
     pageNo: number;
     pageSize: number;
     sortBy: 'lastAccessAt' | 'hitCount';
     order: 'asc' | 'desc';
-  }): { list: CacheEntryDetail[]; total: number };
+  }): { list: Omit<CacheEntryDetail, 'traceId'>[]; total: number };
   /** 概览基础字段（lastHitLineChange 由路由侧从 logStore 补充，Manager 不感知；见 GET /overview） */
   getOverview(): Omit<CacheOverview, 'lastHitLineChange'>;
 }
@@ -297,10 +300,15 @@ export function createCacheApi(cacheManager: CacheManager, logStore?: LogStore):
         sortBy: sortByRaw,
         order: orderRaw,
       });
+      // 验收修正：条目点击跳转日志明细（同灰色区清单 traceId 精确跳转）——关联查询 cache_logs，不落 cache_entries 镜像列
+      const list = result.list.map((entry) => ({
+        ...entry,
+        traceId: store.queryLatestCacheLogTraceIdByUserQuery(entry.queryText),
+      }));
       response.json({
         code: 200,
         data: {
-          list: result.list,
+          list,
           total: result.total,
           pageNo: paging.pageNo,
           pageSize: paging.pageSize,

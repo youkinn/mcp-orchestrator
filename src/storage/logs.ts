@@ -550,6 +550,8 @@ export interface LogStore {
   /** 判定审计落库：命中 / 未命中一律一行（旁路静默；trace_id 唯一，重复调用 OR IGNORE 跳过） */
   appendCacheLog(traceId: string, payload: CacheLogPayload): void;
   queryCacheLogByTrace(traceId: string): CacheLogRecord | null;
+  /** feat-A013 验收修正：最近一条同 user_query 的 cache_logs.trace_id（ORDER BY id DESC LIMIT 1；无关联行 → null，条目列表跳转日志明细用） */
+  queryLatestCacheLogTraceIdByUserQuery(userQuery: string): string | null;
   /** 灰色区 query 对清单（§3.8 数据源：hit=0 AND 0.80 ≤ similarity < hit_line） */
   queryCacheLogs(filter: CacheLogsFilter): { list: GrayZoneLogItem[]; total: number };
   queryCacheDistribution(startAt: number, endAt: number): CacheDistributionResult;
@@ -810,6 +812,7 @@ function createNoopStore(): LogStore {
     reportFrontendEnd: noopWrite,
     appendCacheLog: noopWrite,
     queryCacheLogByTrace: () => null,
+    queryLatestCacheLogTraceIdByUserQuery: () => null,
     queryCacheLogs: () => ({ list: [], total: 0 }),
     queryCacheDistribution: () => ({
       buckets: [],
@@ -970,6 +973,10 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   `);
   const queryCacheLogByTraceStmt = db.prepare(
     `SELECT * FROM cache_logs WHERE trace_id = ?`
+  );
+  /** feat-A013 验收修正：条目跳转关联——user_query 最近一行（id 单调自增 = 落库次序）的 trace_id */
+  const queryLatestCacheLogTraceIdByUserQueryStmt = db.prepare(
+    `SELECT trace_id FROM cache_logs WHERE user_query = ? ORDER BY id DESC LIMIT 1`
   );
   /** feat-A013：cache_logs 父行（request_logs 骨架）存在性探针；缺失时先 flush 写缓冲再直写（见 appendCacheLog） */
   const cacheLogParentExistsStmt = db.prepare(
@@ -1497,6 +1504,13 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
       return row === undefined ? null : mapCacheLogRow(row);
     },
 
+    queryLatestCacheLogTraceIdByUserQuery(userQuery): string | null {
+      const row = queryLatestCacheLogTraceIdByUserQueryStmt.get(userQuery) as
+        | { trace_id: string }
+        | undefined;
+      return row === undefined ? null : row.trace_id;
+    },
+
     appendHitLineChange(previous, current): void {
       // 同步直写 + 失败旁路静默：修改记录是审计数据源，写入失败绝不影响 PUT 成功语义
       try {
@@ -1954,6 +1968,11 @@ export function appendCacheLog(traceId: string, payload: CacheLogPayload): void 
 
 export function queryCacheLogByTrace(traceId: string): CacheLogRecord | null {
   return getLogStore().queryCacheLogByTrace(traceId);
+}
+
+/** feat-A013 验收修正：最近一条同 user_query 的 cache_logs.trace_id（无关联行 → null，缓存条目列表跳转日志明细） */
+export function queryLatestCacheLogTraceIdByUserQuery(userQuery: string): string | null {
+  return getLogStore().queryLatestCacheLogTraceIdByUserQuery(userQuery);
 }
 
 /** feat-A013：灰色区 query 对清单（§3.8 数据源） */

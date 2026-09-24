@@ -42,6 +42,7 @@ class FakeCacheManager implements CacheManager {
         hitCount: 0,
         lastAccessAt: id * 1000,
         createdAt: id * 1000,
+        traceId: null,
         ...item,
       });
     }
@@ -239,7 +240,7 @@ test('④ DELETE /entries/:id：成功 / 不存在 404 / id 非法 400（§3.4�
   }
 });
 
-test('⑤ GET /entries：分页 / 排序 / 载荷纪律 / 参数校验（§3.5）', async (t) => {
+test('⑤ GET /entries：分页 / 排序 / 载荷纪律 / traceId 关联 / 参数校验（§3.5）', async (t) => {
   const store = createLogStore({ dbPath: ':memory:' });
   t.after(() => store.close());
   const manager = new FakeCacheManager([
@@ -248,6 +249,10 @@ test('⑤ GET /entries：分页 / 排序 / 载荷纪律 / 参数校验（§3.5�
     { queryText: 'Q3', hitCount: 3, lastAccessAt: 200 },
   ]);
   const baseUrl = await startCacheApi(t, manager, store);
+  // traceId 关联（验收修正）：Q2 预埋两条同 user_query 的 cache_logs（后落一条 id 更大 → 取最近）；Q1 一条；Q3 无关联
+  seedCacheLog(store, TRACE_A, { userQuery: 'Q1' } as never);
+  seedCacheLog(store, '9f7c0000-0000-4000-8000-0000000000b1', { userQuery: 'Q2' } as never);
+  seedCacheLog(store, '9f7c0000-0000-4000-8000-0000000000b2', { userQuery: 'Q2' } as never);
 
   // 默认：pageNo=1 / pageSize=20 / lastAccessAt desc
   const all = await get(baseUrl, '/api/v1/cache/entries');
@@ -257,7 +262,14 @@ test('⑤ GET /entries：分页 / 排序 / 载荷纪律 / 参数校验（§3.5�
   assert.equal(all.body.data.pageNo, 1);
   assert.equal(all.body.data.pageSize, 20);
   // 载荷纪律：不含 embedding / 答案全文
-  assert.deepEqual(Object.keys(all.body.data.list[0]).sort(), ['answerBytes', 'createdAt', 'embeddingBytes', 'hitCount', 'id', 'lastAccessAt', 'queryText']);
+  assert.deepEqual(Object.keys(all.body.data.list[0]).sort(), ['answerBytes', 'createdAt', 'embeddingBytes', 'hitCount', 'id', 'lastAccessAt', 'queryText', 'traceId']);
+  // traceId 关联：有同 user_query 的 cache_logs 行 → 最近一条的 traceId；无 → null
+  const byText = new Map<string, { queryText: string; traceId: string | null }>(
+    all.body.data.list.map((e: { queryText: string; traceId: string | null }) => [e.queryText, e])
+  );
+  assert.equal(byText.get('Q1')!.traceId, TRACE_A, '有同 user_query 的 cache_logs → 返回其 traceId');
+  assert.equal(byText.get('Q2')!.traceId, '9f7c0000-0000-4000-8000-0000000000b2', '多条关联行 → 取最近一条（id 更大）');
+  assert.equal(byText.get('Q3')!.traceId, null, '无关联行 → null');
 
   const sorted = await get(baseUrl, '/api/v1/cache/entries?sortBy=hitCount&order=asc&pageSize=2&pageNo=2');
   assert.deepEqual(sorted.body.data.list.map((e: { queryText: string }) => e.queryText), ['Q2'], 'hitCount asc = Q1(1)/Q3(3)/Q2(5)，第 2 页取 Q2');
