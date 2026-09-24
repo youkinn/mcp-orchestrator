@@ -88,7 +88,7 @@ class FakeCacheManager implements CacheManager {
     return { list: all.slice(start, start + options.pageSize), total: all.length };
   }
 
-  getOverview(): CacheOverview {
+  getOverview(): Omit<CacheOverview, 'lastHitLineChange'> {
     const entryCount = this.entries.size;
     const answerBytesTotal = Array.from(this.entries.values()).reduce((sum, e) => sum + e.answerBytes, 0);
     const embeddingBytesTotal = entryCount * 4096;
@@ -286,7 +286,8 @@ test('⑥ GET /overview：概览形状（§3.6 口径由 CacheManager 产出，�
     embeddingBytesTotal: 8192,
     approximateBytes: 300 + 8192 + 2 * 256,
     avgAnswerBytes: 150,
-  });
+    lastHitLineChange: null,
+  }, '无修改记录 → lastHitLineChange null');
 });
 
 test('⑦ GET /stats/similarity-distribution：聚合形状与时间参数校验（§3.7）', async (t) => {
@@ -691,7 +692,7 @@ test('⑬ GET /entries/:id/hits：命中该条目的请求记录 / nearest_query
   assert.equal(badPage.status, 400);
 });
 
-test('⑭ PUT /hit-line：命中线运行时调整 200 / 非法 400 / 值不变（§1.3 / §3.2）', async (t) => {
+test('⑭ PUT /hit-line：命中线运行时调整 200 / 非法 400 / 值不变；每次调整留修改记录，overview 返回最近一条（§1.3 / §3.2 / §2.5）', async (t) => {
   const store = createLogStore({ dbPath: ':memory:' });
   t.after(() => store.close());
   const manager = new FakeCacheManager();
@@ -702,6 +703,10 @@ test('⑭ PUT /hit-line：命中线运行时调整 200 / 非法 400 / 值不变�
   assert.deepEqual(ok.body.data, { hitLine: 0.85 });
   const status = await get(baseUrl, '/api/v1/cache/status');
   assert.equal(status.body.data.hitLine, 0.85, '调整立即生效并反映于状态');
+  // 修改留记录：0.92 → 0.85
+  const first = store.getLastHitLineChange()!;
+  assert.deepEqual({ previous: first.previous, current: first.current }, { previous: HIT_LINE, current: 0.85 }, '记录调整前 / 调整后命中线');
+  assert.ok(Number.isInteger(first.at) && first.at > 0, '记录修改时刻（毫秒时间戳）');
 
   // 非法 400：≤0 / >1 / 非数字 / 缺 body
   const badValues = [0, -0.1, 1.5, 'abc', null];
@@ -713,4 +718,14 @@ test('⑭ PUT /hit-line：命中线运行时调整 200 / 非法 400 / 值不变�
   assert.equal(noBody.status, 400);
   const still = await get(baseUrl, '/api/v1/cache/status');
   assert.equal(still.body.data.hitLine, 0.85, '非法调整后命中线不变');
+  const unchanged = store.getLastHitLineChange()!;
+  assert.deepEqual({ previous: unchanged.previous, current: unchanged.current }, { previous: HIT_LINE, current: 0.85 }, '非法调整不新增修改记录');
+
+  // 重复 PUT：每次成功调整各落一行，读取恒为最近一条（ORDER BY id DESC LIMIT 1）
+  await send(baseUrl, 'PUT', '/api/v1/cache/hit-line', { hitLine: 0.9 });
+  const second = store.getLastHitLineChange()!;
+  assert.deepEqual({ previous: second.previous, current: second.current }, { previous: 0.85, current: 0.9 }, '重复 PUT 多行，读取为最近一条');
+  assert.ok(second.at >= first.at, '记录按修改时序递增');
+  const overview = await get(baseUrl, '/api/v1/cache/overview');
+  assert.deepEqual(overview.body.data.lastHitLineChange, { previous: 0.85, current: 0.9, at: second.at }, 'overview 返回最近一条修改记录');
 });

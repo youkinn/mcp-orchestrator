@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS llm_call_logs (
   attempt            INTEGER,
   input_breakdown    TEXT,
   max_tokens         INTEGER,
+  temperature        REAL,
   finish_reason      TEXT,
   status             TEXT NOT NULL,
   error_message      TEXT NOT NULL DEFAULT '',
@@ -128,6 +129,12 @@ CREATE TABLE IF NOT EXISTS cache_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_cache_logs_created ON cache_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_cache_logs_hit_created ON cache_logs(hit, created_at);
+CREATE TABLE IF NOT EXISTS cache_hit_line_changes (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  previous   REAL NOT NULL,
+  current    REAL NOT NULL,
+  changed_at INTEGER NOT NULL
+);
 `;
 
 /** feat-A012：输入分段 token 估算（本地启发式，见接口文档 §2.3）；history/tools 为保留字段当前恒 0 */
@@ -166,6 +173,8 @@ export interface LlmCallPayload {
   inputBreakdown?: InputBreakdown | null;
   /** feat-A012：本次调用输出上限（取调用点 params.max_tokens 原值）；历史行 / 缺省为 null */
   maxTokens?: number | null;
+  /** feat-A013：本次调用温度实参（调用点 callOptions.temperature ?? 0.7 原值）；历史行 / 采集未接入为 null，前端不推断（参照 attempt 先例） */
+  temperature?: number | null;
   finishReason?: string | null;
   status: 'success' | 'failed';
   errorMessage?: string;
@@ -273,6 +282,8 @@ export interface LlmCallLog {
   inputBreakdown: InputBreakdown | null;
   /** feat-A012：本次调用输出上限（调用点参数原值）；历史行为 null */
   maxTokens: number | null;
+  /** feat-A013：本次调用温度实参；历史行 / 采集未接入为 null（前端不推断） */
+  temperature: number | null;
   finishReason: string | null;
   status: 'success' | 'failed';
   errorMessage: string;
@@ -561,6 +572,10 @@ export interface LogStore {
   /** 全量清除：返回删除行数（§3.3 cleared = 清除前条目数） */
   clearCacheEntries(): number;
   countCacheEntries(): number;
+  /** feat-A013：命中线修改记录（同步直写，失败旁路静默不抛；§3.2 PUT hit-line 调用，表结构见接口文档 §2.5） */
+  appendHitLineChange(previous: number, current: number): void;
+  /** feat-A013：最近一条命中线修改记录（ORDER BY id DESC LIMIT 1）；无记录 / 读取失败 → null */
+  getLastHitLineChange(): { previous: number; current: number; at: number } | null;
   /** 立即把写缓冲批量落盘（测试 / 优雅退出用；生产由 1s 或 50 条自动触发） */
   flush(): void;
   /** 立即执行一次过期数据清理（每日定时器之外，供测试） */
@@ -620,6 +635,7 @@ interface LlmLogRow {
   attempt: number | null;
   input_breakdown: string | null;
   max_tokens: number | null;
+  temperature: number | null;
   finish_reason: string | null;
   status: string;
   error_message: string;
@@ -809,6 +825,8 @@ function createNoopStore(): LogStore {
     listCacheEntries: () => ({ list: [], total: 0 }),
     clearCacheEntries: () => 0,
     countCacheEntries: () => 0,
+    appendHitLineChange: noopWrite,
+    getLastHitLineChange: () => null,
     flush: noopWrite,
     runRetentionCleanup: noopWrite,
     close: noopWrite,
@@ -863,6 +881,13 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
     } catch {
       // 旁路：duplicate column 等忽略
     }
+    // feat-A013 验收修正：llm_call_logs 增 temperature（调用温度实参，agent 侧采集随后接入）；
+    // 历史行保持 NULL 不回填（前端不推断，参照 attempt 先例）。新库建表已含该列，重复执行忽略，幂等。
+    try {
+      db.exec(`ALTER TABLE llm_call_logs ADD COLUMN temperature REAL`);
+    } catch {
+      // 旁路：duplicate column 等忽略（新库 / 已迁移库）
+    }
     try {
       db.exec(`ALTER TABLE request_logs ADD COLUMN route_source TEXT`);
     } catch {
@@ -907,18 +932,18 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
     INSERT INTO llm_call_logs
       (trace_id, seq, stage, model, request_at, response_at, request_summary,
        response_summary, tool_calls, prompt_tokens, completion_tokens, cached_tokens,
-       reasoning_tokens, attempt, input_breakdown, max_tokens,
+       reasoning_tokens, attempt, input_breakdown, max_tokens, temperature,
        finish_reason, status, error_message)
     VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM llm_call_logs WHERE trace_id = ?),
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertLlmCallWithSeqStmt = db.prepare(`
     INSERT OR IGNORE INTO llm_call_logs
       (trace_id, seq, stage, model, request_at, response_at, request_summary,
        response_summary, tool_calls, prompt_tokens, completion_tokens, cached_tokens,
-       reasoning_tokens, attempt, input_breakdown, max_tokens,
+       reasoning_tokens, attempt, input_breakdown, max_tokens, temperature,
        finish_reason, status, error_message)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertToolCallWithSeqStmt = db.prepare(`
     INSERT OR IGNORE INTO tool_call_logs
@@ -971,6 +996,13 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   const clearCacheEntriesStmt = db.prepare(`DELETE FROM cache_entries`);
   const countCacheEntriesStmt = db.prepare(
     `SELECT COUNT(*) AS total FROM cache_entries`
+  );
+  /** feat-A013：命中线修改记录（§2.5；同步直写，不参与 A007 写缓冲） */
+  const insertHitLineChangeStmt = db.prepare(`
+    INSERT INTO cache_hit_line_changes (previous, current, changed_at) VALUES (?, ?, ?)
+  `);
+  const queryLastHitLineChangeStmt = db.prepare(
+    `SELECT previous, current, changed_at FROM cache_hit_line_changes ORDER BY id DESC LIMIT 1`
   );
   const pendingOps: Array<() => void> = [];
 
@@ -1110,6 +1142,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           payload.attempt ?? null,
           payload.inputBreakdown ? JSON.stringify(payload.inputBreakdown) : null,
           payload.maxTokens ?? null,
+          payload.temperature ?? null,
           payload.finishReason ?? null,
           payload.status,
           payload.errorMessage ?? '',
@@ -1334,6 +1367,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           attempt: llm.attempt,
           inputBreakdown: parseInputBreakdown(llm.input_breakdown),
           maxTokens: llm.max_tokens,
+          temperature: llm.temperature,
           finishReason: llm.finish_reason,
           status: llm.status as 'success' | 'failed',
           errorMessage: llm.error_message,
@@ -1461,6 +1495,29 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
     queryCacheLogByTrace(traceId): CacheLogRecord | null {
       const row = queryCacheLogByTraceStmt.get(traceId) as CacheLogRow | undefined;
       return row === undefined ? null : mapCacheLogRow(row);
+    },
+
+    appendHitLineChange(previous, current): void {
+      // 同步直写 + 失败旁路静默：修改记录是审计数据源，写入失败绝不影响 PUT 成功语义
+      try {
+        insertHitLineChangeStmt.run(previous, current, Date.now());
+      } catch (error) {
+        console.error('Failed to write cache hit line change (bypass):', error);
+      }
+    },
+
+    getLastHitLineChange() {
+      try {
+        const row = queryLastHitLineChangeStmt.get() as
+          | { previous: number; current: number; changed_at: number }
+          | undefined;
+        return row === undefined
+          ? null
+          : { previous: row.previous, current: row.current, at: row.changed_at };
+      } catch (error) {
+        console.error('Failed to read last hit line change:', error);
+        return null;
+      }
     },
 
     queryCacheLogs(filter): { list: GrayZoneLogItem[]; total: number } {
@@ -1957,4 +2014,14 @@ export function clearCacheEntries(): number {
 
 export function countCacheEntries(): number {
   return getLogStore().countCacheEntries();
+}
+
+/** feat-A013：命中线修改记录（§3.2 PUT hit-line 同步直写；失败旁路静默，不影响主流程） */
+export function appendHitLineChange(previous: number, current: number): void {
+  getLogStore().appendHitLineChange(previous, current);
+}
+
+/** feat-A013：最近一条命中线修改记录（§3.6 overview.lastHitLineChange 数据源；无记录 → null） */
+export function getLastHitLineChange(): { previous: number; current: number; at: number } | null {
+  return getLogStore().getLastHitLineChange();
 }

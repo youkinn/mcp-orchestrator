@@ -1,7 +1,7 @@
 // feat-A012 可观测字段 存储层与接口测试（测试即文档）：
 // 覆盖：新库全字段落库与读取 / attempt 两轮各自成行 / reportRouteSource 回填与明细 routeSource /
 // 明细接口新字段 / 列表 routeSource + hasRetry / token-stats cachedTokens 桶聚合（历史 null 计 0）/
-// 旧库（无新 5 列）迁移后新字段 null + hasRetry false / 迁移幂等（再次打开不报错）。
+// 旧库（无新 6 列）迁移后新字段 null + hasRetry false / 迁移幂等（再次打开不报错）。
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
@@ -57,7 +57,7 @@ async function get(baseUrl: string, path: string): Promise<{ status: number; bod
   return { status: response.status, body: await response.json() };
 }
 
-/** 旧库建表 SQL（feat-A012 之前：llm_call_logs 无 reasoning_tokens / attempt / input_breakdown / max_tokens，request_logs 无 route_source） */
+/** 旧库建表 SQL（feat-A012 之前：llm_call_logs 无 reasoning_tokens / attempt / input_breakdown / max_tokens / temperature，request_logs 无 route_source） */
 const LEGACY_SCHEMA_SQL = `
 CREATE TABLE request_logs (
   trace_id             TEXT PRIMARY KEY,
@@ -134,13 +134,14 @@ function appendFullCall(
     attempt: 1,
     inputBreakdown: { system: 230, user: 45, injected: 180, history: 0, tools: 0 },
     maxTokens: 1000,
+    temperature: 0.7,
     finishReason: 'stop',
     status: 'success',
     ...overrides,
   });
 }
 
-test('① 新库全字段落库与读取：reasoningTokens / attempt / inputBreakdown / maxTokens 逐字段读回；缺省不传 → null', (t) => {
+test('① 新库全字段落库与读取：reasoningTokens / attempt / inputBreakdown / maxTokens / temperature 逐字段读回；缺省不传 → null', (t) => {
   const store = createLogStore({ dbPath: ':memory:' });
   t.after(() => store.close());
   store.ensureSkeleton('chat', TRACE_A, '问题一', 'sango-novel', 1789884000000);
@@ -152,6 +153,7 @@ test('① 新库全字段落库与读取：reasoningTokens / attempt / inputBrea
   assert.equal(call.attempt, 1, 'attempt=1 首轮');
   assert.deepEqual(call.inputBreakdown, { system: 230, user: 45, injected: 180, history: 0, tools: 0 }, 'inputBreakdown JSON 解析为对象');
   assert.equal(call.maxTokens, 1000, 'maxTokens = 调用点参数原值');
+  assert.equal(call.temperature, 0.7, 'temperature = 调用点温度实参');
 
   // 缺省不传 → null（老调用方 / 历史语义）
   store.ensureSkeleton('chat', TRACE_B, '问题二', 'sango-novel', 1789884005000);
@@ -170,6 +172,7 @@ test('① 新库全字段落库与读取：reasoningTokens / attempt / inputBrea
   assert.equal(plain.attempt, null);
   assert.equal(plain.inputBreakdown, null);
   assert.equal(plain.maxTokens, null);
+  assert.equal(plain.temperature, null, '缺省不传 → null（前端不推断）');
 });
 
 test('② attempt 两轮各自成行：空答案变参重试 → attempt=1 failed + attempt=2 success 两条', (t) => {
@@ -250,6 +253,7 @@ test('④ 明细接口：log.routeSource + llmCalls[] 四新字段 camelCase 下
   assert.equal(llmCall.attempt, 1);
   assert.deepEqual(llmCall.inputBreakdown, { system: 230, user: 45, injected: 180, history: 0, tools: 0 }, 'inputBreakdown 解析为对象');
   assert.equal(llmCall.maxTokens, 1000);
+  assert.equal(llmCall.temperature, 0.7, '明细 llmCalls[] temperature camelCase 下发');
 });
 
 test('⑤ 列表接口：routeSource 透传 + hasRetry 按 attempt=2 聚合（历史行 false）', async (t) => {
@@ -308,7 +312,7 @@ test('⑥ token-stats：cachedTokens 桶聚合；历史 null 计 0；cached_toke
   assert.ok(dataBucket!.cachedTokens > dataBucket!.inputTokens, '异常数据 cached>prompt 原样聚合，负值段由前端兜底 0');
 });
 
-test('⑦ 旧库迁移：无新 5 列的存量库打开自动补列，旧明细新字段 null、列表 routeSource null + hasRetry false，接口 200', async (t) => {
+test('⑦ 旧库迁移：无新 6 列的存量库打开自动补列，旧明细新字段 null、列表 routeSource null + hasRetry false，接口 200', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'a012-legacy-'));
   const dbPath = join(dir, 'logs.db');
   t.after(() => {
@@ -330,6 +334,7 @@ test('⑦ 旧库迁移：无新 5 列的存量库打开自动补列，旧明细�
   assert.equal(detail.llmCalls[0].attempt, null);
   assert.equal(detail.llmCalls[0].inputBreakdown, null);
   assert.equal(detail.llmCalls[0].maxTokens, null);
+  assert.equal(detail.llmCalls[0].temperature, null, '旧明细无 temperature（迁移补列 NULL，不回填）');
   assert.equal(detail.log.routeSource, null, '旧主表无 route_source → null');
 
   const list = logStore.queryList({ pageNo: 1, pageSize: 20 });
@@ -340,9 +345,10 @@ test('⑦ 旧库迁移：无新 5 列的存量库打开自动补列，旧明细�
   const res = await get(baseUrl, `/api/v1/logs/${TRACE_A}`);
   assert.equal(res.status, 200, '旧库明细接口 200 不报错');
   assert.equal(res.body.data.llmCalls[0].reasoningTokens, null);
+  assert.equal(res.body.data.llmCalls[0].temperature, null, '旧库明细接口 temperature null 不炸');
 });
 
-test('⑧ 迁移幂等：已迁移库再次打开（重复 ALTER duplicate column）不报错、数据仍在', (t) => {
+test('⑧ 迁移幂等：已迁移库再次打开（重复 ALTER duplicate column，含 temperature 列）不报错、数据仍在', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'a012-legacy2-'));
   const dbPath = join(dir, 'logs.db');
   t.after(() => {
@@ -363,5 +369,6 @@ test('⑧ 迁移幂等：已迁移库再次打开（重复 ALTER duplicate colum
   const detail = second.queryDetail(TRACE_A)!;
   assert.equal(detail.llmCalls.length, 1);
   assert.equal(detail.llmCalls[0].reasoningTokens, null, '重复打开不因 duplicate column 报错');
+  assert.equal(detail.llmCalls[0].temperature, null, 'temperature 列重复 ALTER 幂等，旧行保持 NULL');
   assert.equal(detail.log.routeSource, null);
 });

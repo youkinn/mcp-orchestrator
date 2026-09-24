@@ -37,7 +37,17 @@ export interface CacheEntryDetail {
   createdAt: number;
 }
 
-/** feat-A013：缓存概览（§3.6 口径可复算）。 */
+/** feat-A013 验收修正：命中线修改记录（§2.5 / §3.2 / §3.6 overview.lastHitLineChange）。 */
+export interface CacheHitLineChange {
+  /** 调整前命中线。 */
+  previous: number;
+  /** 调整后命中线。 */
+  current: number;
+  /** 修改时刻（毫秒时间戳）。 */
+  at: number;
+}
+
+/** feat-A013：缓存概览（§3.6 口径可复算）。返回对象含 lastHitLineChange（来自 logStore，无记录 null）。 */
 export interface CacheOverview {
   enabled: boolean;
   hitLine: number;
@@ -47,6 +57,8 @@ export interface CacheOverview {
   embeddingBytesTotal: number;
   approximateBytes: number;
   avgAnswerBytes: number;
+  /** 最近一条命中线修改记录（logStore 侧补充；无记录 null）。 */
+  lastHitLineChange: CacheHitLineChange | null;
 }
 
 /**
@@ -66,7 +78,8 @@ export interface CacheManager {
     sortBy: 'lastAccessAt' | 'hitCount';
     order: 'asc' | 'desc';
   }): { list: CacheEntryDetail[]; total: number };
-  getOverview(): CacheOverview;
+  /** 概览基础字段（lastHitLineChange 由路由侧从 logStore 补充，Manager 不感知；见 GET /overview） */
+  getOverview(): Omit<CacheOverview, 'lastHitLineChange'>;
 }
 
 function sendError(response: Response, code: number, message: string): void {
@@ -181,11 +194,15 @@ export function createCacheApi(cacheManager: CacheManager, logStore?: LogStore):
         sendError(response, 400, 'hitLine 必须为 0~1 的数字（0 < hitLine ≤ 1）');
         return;
       }
+      const before = cacheManager.getStatus().hitLine;
       const updated = cacheManager.setHitLine(value);
       if (Number.isNaN(updated)) {
         sendError(response, 400, 'hitLine 必须为 0~1 的数字（0 < hitLine ≤ 1）');
         return;
       }
+      // 命中线修改留记录（§2.5 / §3.2）：每次成功调整同步落一条，供 overview.lastHitLineChange 追溯；
+      // 写入失败旁路静默，不影响 PUT 成功语义
+      store.appendHitLineChange(before, updated);
       response.json({ code: 200, data: { hitLine: updated }, message: '' });
     } catch (error) {
       console.error('Failed to set cache hit line:', error);
@@ -299,7 +316,7 @@ export function createCacheApi(cacheManager: CacheManager, logStore?: LogStore):
   // GET /api/v1/cache/overview —— 缓存概览（§3.6；口径可复算）
   router.get('/overview', (_request: Request, response: Response) => {
     try {
-      response.json({ code: 200, data: cacheManager.getOverview(), message: '' });
+      response.json({ code: 200, data: { ...cacheManager.getOverview(), lastHitLineChange: store.getLastHitLineChange() }, message: '' });
     } catch (error) {
       console.error('Failed to get cache overview:', error);
       sendError(response, 500, QUERY_ERROR_MESSAGE);
