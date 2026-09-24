@@ -12,8 +12,9 @@ src/
 ├── agent.ts       LLM 编排（主入口 processQueryData）
 ├── citation.ts    引用校验与兜底（注入视图 / verify / fallback）
 ├── recallDiagnostics.ts  召回诊断（检索元信息、picked 下标、落库）
+├── cache.ts      语义缓存（feat-A013：CacheManager 命中判定 / LRU / 写缓存，编排侧）
 ├── server.ts      Express HTTP 层（路由、校验、队列、埋点）
-├── api/v1/        日志查询接口（logs.ts / sango.ts）
+├── api/v1/        日志查询接口（logs.ts / sango.ts / cache.ts）
 ├── storage/logs.ts  SQLite 日志落库与查询
 ├── index.ts       Web 服务入口
 ├── cli.ts         CLI 入口

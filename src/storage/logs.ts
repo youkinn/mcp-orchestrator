@@ -17,6 +17,17 @@ const HOUR_GRANULARITY_MAX_RANGE_MS = 7 * DAY_MS;
 const SHANGHAI_TZ = 'Asia/Shanghai';
 const SHANGHAI_OFFSET_MS = 8 * 3600 * 1000;
 
+// ===== feat-A013：三国演义问答缓存（query→answer 语义缓存）存储层 =====
+// 契约：api/feat-A013-query-cache.md §2（两张新表全列照抄）、§2.4（落库点）、§3.7（分布桶）、§3.5（embeddingBytes）。
+
+/** 相似度分区下沿：低相似 < 0.80 / 灰色区 [0.80, hit_line)。本期固定写死、不对外配置（接口文档核心口径）。 */
+export const CACHE_LOW_SIM_LINE = 0.8;
+/** 分布图表桶宽与桶数（§3.7：桶宽 0.02 = 50 桶，0.80 / 0.92 恰为桶边界，着色不跨桶）。 */
+export const CACHE_DISTRIBUTION_BUCKET_WIDTH = 0.02;
+export const CACHE_DISTRIBUTION_BUCKET_COUNT = 50;
+/** embeddingBytes 常量口径：1024 维 × 4B（§3.5）。 */
+export const CACHE_EMBEDDING_BYTES = 1024 * 4;
+
 /** 主表骨架初值：请求进入即落库（status=failed + 中断标注），回填后覆盖 */
 const SKELETON_STATUS = 'failed';
 const SKELETON_ERROR_MESSAGE = '请求中断未完成回填';
@@ -60,6 +71,7 @@ CREATE TABLE IF NOT EXISTS llm_call_logs (
   attempt            INTEGER,
   input_breakdown    TEXT,
   max_tokens         INTEGER,
+  temperature        REAL,
   finish_reason      TEXT,
   status             TEXT NOT NULL,
   error_message      TEXT NOT NULL DEFAULT '',
@@ -89,6 +101,41 @@ CREATE TABLE IF NOT EXISTS tool_retrieval_logs (
   FOREIGN KEY (trace_id, seq) REFERENCES tool_call_logs(trace_id, seq) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_tool_retrieval_logs_created ON tool_retrieval_logs(created_at);
+CREATE TABLE IF NOT EXISTS cache_entries (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  query_text     TEXT NOT NULL,
+  embedding_b64  TEXT NOT NULL,
+  answer_json    TEXT NOT NULL,
+  answer_bytes   INTEGER NOT NULL,
+  hit_count      INTEGER NOT NULL DEFAULT 0,
+  last_access_at INTEGER NOT NULL,
+  created_at     INTEGER NOT NULL,
+  version_tag    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cache_entries_last_access ON cache_entries(last_access_at);
+CREATE TABLE IF NOT EXISTS cache_logs (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  trace_id      TEXT NOT NULL UNIQUE REFERENCES request_logs(trace_id) ON DELETE CASCADE,
+  user_query    TEXT NOT NULL,
+  nearest_query TEXT,
+  similarity    REAL,
+  hit_line      REAL NOT NULL,
+  hit           INTEGER NOT NULL,
+  tie_hits      INTEGER,
+  marked        INTEGER NOT NULL DEFAULT 0,
+  marked_by     TEXT,
+  marked_at     INTEGER,
+  created_at    INTEGER NOT NULL,
+  lookup_ms     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_cache_logs_created ON cache_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_cache_logs_hit_created ON cache_logs(hit, created_at);
+CREATE TABLE IF NOT EXISTS cache_hit_line_changes (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  previous   REAL NOT NULL,
+  current    REAL NOT NULL,
+  changed_at INTEGER NOT NULL
+);
 `;
 
 /** feat-A012：输入分段 token 估算（本地启发式，见接口文档 §2.3）；history/tools 为保留字段当前恒 0 */
@@ -127,6 +174,8 @@ export interface LlmCallPayload {
   inputBreakdown?: InputBreakdown | null;
   /** feat-A012：本次调用输出上限（取调用点 params.max_tokens 原值）；历史行 / 缺省为 null */
   maxTokens?: number | null;
+  /** feat-A013：本次调用温度实参（调用点 callOptions.temperature ?? 0.7 原值）；历史行 / 采集未接入为 null，前端不推断（参照 attempt 先例） */
+  temperature?: number | null;
   finishReason?: string | null;
   status: 'success' | 'failed';
   errorMessage?: string;
@@ -185,6 +234,8 @@ export interface LogListItem {
     server: number | null;
     llm: number | null;
     tool: number | null;
+    /** feat-A013 验收修正：语义缓存判定耗时（毫秒，含 embedding 冷启动）；历史行 / 未采集 = null */
+    cacheLookupMs: number | null;
     total: number | null;
   };
   tokens: { input: number | null; output: number | null } | null;
@@ -234,6 +285,8 @@ export interface LlmCallLog {
   inputBreakdown: InputBreakdown | null;
   /** feat-A012：本次调用输出上限（调用点参数原值）；历史行为 null */
   maxTokens: number | null;
+  /** feat-A013：本次调用温度实参；历史行 / 采集未接入为 null（前端不推断） */
+  temperature: number | null;
   finishReason: string | null;
   status: 'success' | 'failed';
   errorMessage: string;
@@ -279,6 +332,186 @@ export interface TokenStatsResult {
   buckets: TokenBucket[];
 }
 
+/** feat-A013：cache_logs 判定审计行入参（appendCacheLog；hit 布尔入参，落库转 1/0）。 */
+export interface CacheLogPayload {
+  /** 用户输入原文（trim 后） */
+  userQuery: string;
+  /** 最相近缓存条目原文（命中 = 命中条目；未命中 = 差点命中谁；池空 = null） */
+  nearestQuery: string | null;
+  /** 最高相似度（4 位小数由调用方按契约折算）；池空 = null */
+  similarity: number | null;
+  /** 本次请求生效命中线（历史行复算解释不随配置漂移） */
+  hitLine: number;
+  /** true = 命中 / false = 未命中 */
+  hit: boolean;
+  /** ≥ 命中线的候选条数：唯一候选=1；无候选=0；池空=null */
+  tieHits: number | null;
+  /** 本次请求缓存判定耗时（毫秒，含 embedding 冷启动）；undefined/null=未采集 */
+  lookupMs?: number | null;
+}
+
+/** feat-A013：cache_logs 行（查询返回；hit / marked 布尔化）。 */
+export interface CacheLogRecord {
+  id: number;
+  traceId: string;
+  userQuery: string;
+  nearestQuery: string | null;
+  similarity: number | null;
+  hitLine: number;
+  hit: boolean;
+  tieHits: number | null;
+  marked: boolean;
+  markedBy: string | null;
+  markedAt: number | null;
+  createdAt: number;
+  /** 本次请求缓存判定耗时（毫秒，含 embedding 冷启动）；历史行 / 未采集 = null */
+  lookupMs: number | null;
+}
+
+/** feat-A013：灰色区 query 对明细行（§3.8 清单项）。 */
+export interface GrayZoneLogItem {
+  cacheLogId: number;
+  traceId: string;
+  createdAt: number;
+  userQuery: string;
+  nearestQuery: string | null;
+  similarity: number | null;
+  hitLine: number;
+  marked: boolean;
+}
+
+/** feat-A013：相似度分布桶明细行（§3.11 下钻清单项；cacheLogId 对齐灰色区命名）。 */
+export interface SimilarityRowsItem {
+  cacheLogId: number;
+  traceId: string;
+  createdAt: number;
+  userQuery: string;
+  nearestQuery: string | null;
+  similarity: number | null;
+  hit: boolean;
+  tieHits: number | null;
+  hitLine: number;
+  marked: boolean;
+}
+
+/** feat-A013：缓存条目命中记录行（§3.12 弹框展示：某请求命中了该条目）。 */
+export interface CacheEntryHitItem {
+  traceId: string;
+  userQuery: string;
+  similarity: number | null;
+  createdAt: number;
+  marked: boolean;
+}
+
+/** feat-A013：相似度分布桶明细过滤（§3.11 参数；bucketIndex 口径同 §3.7）。 */
+export interface CacheLogBucketFilter {
+  startAt: number;
+  endAt: number;
+  /** 0~49（§3.7 bucketIndex(sim) 同源） */
+  bucketIndex: number;
+  pageNo?: number;
+  pageSize?: number;
+}
+
+/** feat-A013：灰色区清单过滤（§3.8 参数）。 */
+export interface CacheLogsFilter {
+  startAt: number;
+  endAt: number;
+  /** all（默认）/ marked / unmarked */
+  marked?: 'all' | 'marked' | 'unmarked';
+  /** 灰色区区间过滤（可选、可单传）：similarity ≥ min（含）；叠加在灰色区口径之上 */
+  similarityMin?: number;
+  /** 灰色区区间过滤（可选、可单传）：similarity ≤ max（含）；叠加在灰色区口径之上 */
+  similarityMax?: number;
+  pageNo?: number;
+  pageSize?: number;
+}
+
+/** feat-A013：三色分布桶（§3.7：第 0~48 桶 [i×0.02, (i+1)×0.02)，第 49 桶 [0.98, 1.00] 含 1.0）。 */
+export interface CacheDistributionBucket {
+  lower: number;
+  upper: number;
+  count: number;
+}
+
+export interface CacheDistributionTotals {
+  lowSimilar: number;
+  grayZone: number;
+  highConfidence: number;
+  totalCount: number;
+}
+
+export interface CacheDistributionResult {
+  buckets: CacheDistributionBucket[];
+  totals: CacheDistributionTotals;
+}
+
+export interface CacheMisjudgeStats {
+  hitTotal: number;
+  markedMisjudge: number;
+  /** 4 位小数；hitTotal=0 → null（页面显示「—」） */
+  misjudgeRate: number | null;
+}
+
+/** feat-A013：cache_entries 写入入参（answerJson 由调用方序列化，answerBytes 与 §1.1 口径一致）。 */
+export interface CacheEntryPayload {
+  /** 与内存 LRU 条目同值（§2.1；显式插 id，禁止 DB 自增导致分叉） */
+  id: number;
+  queryText: string;
+  embeddingB64: string;
+  answerJson: string;
+  answerBytes: number;
+  hitCount: number;
+  lastAccessAt: number;
+  createdAt: number;
+  versionTag: string;
+}
+
+/** feat-A013：cache_entries 局部更新（命中计数 / 最后访问刷新；缺省字段保持不变）。 */
+export interface CacheEntryUpdate {
+  hitCount?: number;
+  lastAccessAt?: number;
+}
+
+/** feat-A013：条目明细行（§3.5 载荷纪律：不含 embedding 与答案全文；embeddingBytes 为常量）。 */
+export interface CacheEntryListItem {
+  id: number;
+  queryText: string;
+  answerBytes: number;
+  embeddingBytes: number;
+  hitCount: number;
+  lastAccessAt: number;
+  createdAt: number;
+}
+
+export interface CacheEntryListOptions {
+  pageNo: number;
+  pageSize: number;
+  sortBy: 'lastAccessAt' | 'hitCount';
+  order: 'asc' | 'desc';
+}
+
+/**
+ * feat-A013：cache_logs 命中解释 reason 派生（§2.2 区间归类 / §3.10 枚举，纯函数、单一实现点）：
+ * hit → hit；sim=null 或 < 0.80 → miss-low；0.80 ≤ sim < hit_line → miss-gray；
+ * sim ≥ hit_line 且 tie_hits ≥ 2 → miss-tie（歧义）；否则 miss-focus（焦点拒判）。
+ */
+export function deriveCacheReason(
+  record: Pick<CacheLogRecord, 'hit' | 'similarity' | 'hitLine' | 'tieHits'>
+): 'hit' | 'miss-low' | 'miss-gray' | 'miss-tie' | 'miss-focus' {
+  if (record.hit) {
+    return 'hit';
+  }
+  const similarity = record.similarity;
+  if (similarity === null || similarity < CACHE_LOW_SIM_LINE) {
+    return 'miss-low';
+  }
+  if (similarity < record.hitLine) {
+    return 'miss-gray';
+  }
+  return record.tieHits !== null && record.tieHits >= 2 ? 'miss-tie' : 'miss-focus';
+}
+
 export interface LogStoreOptions {
   /** 数据库文件路径；默认 <cwd>/data/logs.db（目录不存在自动建） */
   dbPath?: string;
@@ -320,6 +553,40 @@ export interface LogStore {
     endAt: number;
     granularity: 'day' | 'hour';
   }): TokenStatsResult;
+  // ===== feat-A013：缓存存储（cache_logs / cache_entries；均同步直写，不经 A007 写缓冲） =====
+  /** 判定审计落库：命中 / 未命中一律一行（旁路静默；trace_id 唯一，重复调用 OR IGNORE 跳过） */
+  appendCacheLog(traceId: string, payload: CacheLogPayload): void;
+  queryCacheLogByTrace(traceId: string): CacheLogRecord | null;
+  /** feat-A013 验收修正：最近一条同 user_query 的 cache_logs.trace_id（ORDER BY id DESC LIMIT 1；无关联行 → null，条目列表跳转日志明细用） */
+  queryLatestCacheLogTraceIdByUserQuery(userQuery: string): string | null;
+  /** 灰色区 query 对清单（§3.8 数据源：hit=0 AND 0.80 ≤ similarity < hit_line） */
+  queryCacheLogs(filter: CacheLogsFilter): { list: GrayZoneLogItem[]; total: number };
+  queryCacheDistribution(startAt: number, endAt: number): CacheDistributionResult;
+  /** 相似度分布桶明细（§3.11 数据源：按 bucketIndex 过滤 cache_logs，供柱形下钻） */
+  querySimilarityRows(filter: CacheLogBucketFilter): { list: SimilarityRowsItem[]; total: number };
+  queryMisjudgeStats(startAt: number, endAt: number): CacheMisjudgeStats;
+  /** 缓存条目命中记录（§3.12：cache_logs hit=1 且 nearest_query = 条目 query_text；条目不存在 → null 供 404） */
+  queryEntryHits(
+    entryId: number,
+    pageNo: number,
+    pageSize: number
+  ): { list: CacheEntryHitItem[]; total: number } | null;
+  /** feat-A013 验收修正：全池条目累计命中次数（条目 id → 累计命中数；口径同 queryEntryHits；无命中条目 → 0；noop store 返回空 Map） */
+  queryEntryHitCounts(): Map<number, number>;
+  /** 误判标记 / 取消：返回行是否存在（已标记重复标记幂等；不存在 → false 供 404） */
+  updateCacheLogMark(id: number, marked: boolean, markedBy: string | null): boolean;
+  /** 镜像写入：返回新条目自增 id（写入失败静默降级 null） */
+  insertCacheEntry(payload: CacheEntryPayload): number | null;
+  updateCacheEntry(id: number, update: CacheEntryUpdate): boolean;
+  deleteCacheEntry(id: number): boolean;
+  listCacheEntries(options: CacheEntryListOptions): { list: CacheEntryListItem[]; total: number };
+  /** 全量清除：返回删除行数（§3.3 cleared = 清除前条目数） */
+  clearCacheEntries(): number;
+  countCacheEntries(): number;
+  /** feat-A013：命中线修改记录（同步直写，失败旁路静默不抛；§3.2 PUT hit-line 调用，表结构见接口文档 §2.5） */
+  appendHitLineChange(previous: number, current: number): void;
+  /** feat-A013：最近一条命中线修改记录（ORDER BY id DESC LIMIT 1）；无记录 / 读取失败 → null */
+  getLastHitLineChange(): { previous: number; current: number; at: number } | null;
   /** 立即把写缓冲批量落盘（测试 / 优雅退出用；生产由 1s 或 50 条自动触发） */
   flush(): void;
   /** 立即执行一次过期数据清理（每日定时器之外，供测试） */
@@ -379,6 +646,7 @@ interface LlmLogRow {
   attempt: number | null;
   input_breakdown: string | null;
   max_tokens: number | null;
+  temperature: number | null;
   finish_reason: string | null;
   status: string;
   error_message: string;
@@ -398,6 +666,52 @@ interface ToolLogRow {
   stage: string | null;
 }
 
+/** feat-A013：cache_logs DB 行（snake_case，映射见 mapCacheLogRow）。 */
+interface CacheLogRow {
+  id: number;
+  trace_id: string;
+  user_query: string;
+  nearest_query: string | null;
+  similarity: number | null;
+  hit_line: number;
+  hit: number;
+  tie_hits: number | null;
+  marked: number;
+  marked_by: string | null;
+  marked_at: number | null;
+  created_at: number;
+  lookup_ms: number | null;
+}
+
+/** feat-A013：cache_entries 列表查询 DB 行（不含 embedding / 答案全文，载荷纪律 §3.5）。 */
+interface CacheEntryListRow {
+  id: number;
+  query_text: string;
+  answer_bytes: number;
+  hit_count: number;
+  last_access_at: number;
+  created_at: number;
+}
+
+/** feat-A013：cache_logs DB 行 → 布尔化记录对象（hit / marked 1/0 → boolean）。 */
+function mapCacheLogRow(row: CacheLogRow): CacheLogRecord {
+  return {
+    id: row.id,
+    traceId: row.trace_id,
+    userQuery: row.user_query,
+    nearestQuery: row.nearest_query,
+    similarity: row.similarity,
+    hitLine: row.hit_line,
+    hit: row.hit === 1,
+    tieHits: row.tie_hits,
+    marked: row.marked === 1,
+    markedBy: row.marked_by,
+    markedAt: row.marked_at,
+    createdAt: row.created_at,
+    lookupMs: row.lookup_ms,
+  };
+}
+
 interface ListRow extends RequestLogRow {
   llm_count: number;
   llm_duration: number | null;
@@ -406,6 +720,8 @@ interface ListRow extends RequestLogRow {
   tool_duration: number | null;
   /** feat-A012：该 trace 内最大 attempt（NULL 计 0）；=2 即存在重试 */
   max_attempt: number | null;
+  /** feat-A013 验收修正：缓存判定耗时（cache_logs.lookup_ms LEFT JOIN 落列；历史行 / 未采集 null） */
+  cache_lookup_ms: number | null;
 }
 
 /** feat-A012：input_breakdown 列（JSON 串）解析为对象；缺失 / 非法 / 解析失败 → null（不炸前端） */
@@ -507,6 +823,27 @@ function createNoopStore(): LogStore {
     appendRetrievalLog: noopWrite,
     reportRouteSource: noopWrite,
     reportFrontendEnd: noopWrite,
+    appendCacheLog: noopWrite,
+    queryCacheLogByTrace: () => null,
+    queryLatestCacheLogTraceIdByUserQuery: () => null,
+    queryCacheLogs: () => ({ list: [], total: 0 }),
+    queryCacheDistribution: () => ({
+      buckets: [],
+      totals: { lowSimilar: 0, grayZone: 0, highConfidence: 0, totalCount: 0 },
+    }),
+    querySimilarityRows: () => ({ list: [], total: 0 }),
+    queryMisjudgeStats: () => ({ hitTotal: 0, markedMisjudge: 0, misjudgeRate: null }),
+    queryEntryHits: () => null,
+    queryEntryHitCounts: () => new Map(),
+    updateCacheLogMark: () => false,
+    insertCacheEntry: () => null,
+    updateCacheEntry: () => false,
+    deleteCacheEntry: () => false,
+    listCacheEntries: () => ({ list: [], total: 0 }),
+    clearCacheEntries: () => 0,
+    countCacheEntries: () => 0,
+    appendHitLineChange: noopWrite,
+    getLastHitLineChange: () => null,
     flush: noopWrite,
     runRetentionCleanup: noopWrite,
     close: noopWrite,
@@ -537,6 +874,9 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
     db = new Database(dbPath);
     db.pragma('foreign_keys = ON');
     db.exec(SCHEMA_SQL);
+    // feat-A013 启动清镜像：每次启动 DELETE FROM cache_entries（防镜像残留展示陈旧数据，§1.1 / §2.3；
+    // 幂等，残留即清）。cache_logs 是历史审计数据源，清除缓存不动它（§1.6 全量清除口径）。
+    db.exec(`DELETE FROM cache_entries`);
     // feat-A011 旧库迁移：既有 llm_call_logs 缺 cached_tokens 列，补列（SQLite 缺省 NULL）；
     // 新库建表已含该列，重复执行（duplicate column）忽略，幂等。
     try {
@@ -558,6 +898,13 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
     } catch {
       // 旁路：duplicate column 等忽略
     }
+    // feat-A013 验收修正：llm_call_logs 增 temperature（调用温度实参，agent 侧采集随后接入）；
+    // 历史行保持 NULL 不回填（前端不推断，参照 attempt 先例）。新库建表已含该列，重复执行忽略，幂等。
+    try {
+      db.exec(`ALTER TABLE llm_call_logs ADD COLUMN temperature REAL`);
+    } catch {
+      // 旁路：duplicate column 等忽略（新库 / 已迁移库）
+    }
     try {
       db.exec(`ALTER TABLE request_logs ADD COLUMN route_source TEXT`);
     } catch {
@@ -571,6 +918,13 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
       } catch {
         // 旁路：duplicate column 等忽略（新库 / 已迁移库）
       }
+    }
+    // feat-A013 验收修正：旧库 cache_logs 缺 lookup_ms（缓存判定耗时）补列；
+    // 历史行保持 NULL 不回填（未采集无法事后推断）。新库建表已含该列，重复执行忽略，幂等。
+    try {
+      db.exec(`ALTER TABLE cache_logs ADD COLUMN lookup_ms INTEGER`);
+    } catch {
+      // 旁路：duplicate column 等忽略（新库 / 已迁移库）
     }
   } catch (error) {
     console.error('Failed to initialize log store (logging disabled):', error);
@@ -602,18 +956,18 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
     INSERT INTO llm_call_logs
       (trace_id, seq, stage, model, request_at, response_at, request_summary,
        response_summary, tool_calls, prompt_tokens, completion_tokens, cached_tokens,
-       reasoning_tokens, attempt, input_breakdown, max_tokens,
+       reasoning_tokens, attempt, input_breakdown, max_tokens, temperature,
        finish_reason, status, error_message)
     VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM llm_call_logs WHERE trace_id = ?),
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertLlmCallWithSeqStmt = db.prepare(`
     INSERT OR IGNORE INTO llm_call_logs
       (trace_id, seq, stage, model, request_at, response_at, request_summary,
        response_summary, tool_calls, prompt_tokens, completion_tokens, cached_tokens,
-       reasoning_tokens, attempt, input_breakdown, max_tokens,
+       reasoning_tokens, attempt, input_breakdown, max_tokens, temperature,
        finish_reason, status, error_message)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertToolCallWithSeqStmt = db.prepare(`
     INSERT OR IGNORE INTO tool_call_logs
@@ -630,6 +984,53 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   `);
   const deleteExpiredStmt = db.prepare(
     `DELETE FROM request_logs WHERE created_at < ?`
+  );
+  // ===== feat-A013：缓存存储准备语句（全部同步直写，不经 pendingOps 写缓冲） =====
+  const insertCacheLogStmt = db.prepare(`
+    INSERT OR IGNORE INTO cache_logs
+      (trace_id, user_query, nearest_query, similarity, hit_line, hit, tie_hits,
+       marked, marked_by, marked_at, created_at, lookup_ms)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?)
+  `);
+  const queryCacheLogByTraceStmt = db.prepare(
+    `SELECT * FROM cache_logs WHERE trace_id = ?`
+  );
+  /** feat-A013 验收修正：条目跳转关联——user_query 最近一行（id 单调自增 = 落库次序）的 trace_id */
+  const queryLatestCacheLogTraceIdByUserQueryStmt = db.prepare(
+    `SELECT trace_id FROM cache_logs WHERE user_query = ? ORDER BY id DESC LIMIT 1`
+  );
+  /** feat-A013：cache_logs 父行（request_logs 骨架）存在性探针；缺失时先 flush 写缓冲再直写（见 appendCacheLog） */
+  const cacheLogParentExistsStmt = db.prepare(
+    `SELECT 1 FROM request_logs WHERE trace_id = ?`
+  );
+  const queryCacheLogExistsStmt = db.prepare(`SELECT id FROM cache_logs WHERE id = ?`);
+  const updateCacheLogMarkStmt = db.prepare(
+    `UPDATE cache_logs SET marked = ?, marked_by = ?, marked_at = ? WHERE id = ?`
+  );
+  const insertCacheEntryStmt = db.prepare(`
+    INSERT INTO cache_entries
+      (id, query_text, embedding_b64, answer_json, answer_bytes, hit_count, last_access_at, created_at, version_tag)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const updateCacheEntryStmt = db.prepare(`
+    UPDATE cache_entries
+    SET hit_count = COALESCE(?, hit_count), last_access_at = COALESCE(?, last_access_at)
+    WHERE id = ?
+  `);
+  const deleteCacheEntryStmt = db.prepare(`DELETE FROM cache_entries WHERE id = ?`);
+  const getCacheEntryQueryTextStmt = db.prepare(
+    `SELECT query_text FROM cache_entries WHERE id = ?`
+  );
+  const clearCacheEntriesStmt = db.prepare(`DELETE FROM cache_entries`);
+  const countCacheEntriesStmt = db.prepare(
+    `SELECT COUNT(*) AS total FROM cache_entries`
+  );
+  /** feat-A013：命中线修改记录（§2.5；同步直写，不参与 A007 写缓冲） */
+  const insertHitLineChangeStmt = db.prepare(`
+    INSERT INTO cache_hit_line_changes (previous, current, changed_at) VALUES (?, ?, ?)
+  `);
+  const queryLastHitLineChangeStmt = db.prepare(
+    `SELECT previous, current, changed_at FROM cache_hit_line_changes ORDER BY id DESC LIMIT 1`
   );
   const pendingOps: Array<() => void> = [];
 
@@ -683,8 +1084,10 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
       (SELECT SUM(l.prompt_tokens) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS input_tokens,
       (SELECT SUM(l.completion_tokens) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS output_tokens,
       (SELECT SUM(t.call_returned_at - t.call_sent_at) FROM tool_call_logs t WHERE t.trace_id = r.trace_id) AS tool_duration,
-      (SELECT MAX(l.attempt) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS max_attempt
+      (SELECT MAX(l.attempt) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS max_attempt,
+      cl.lookup_ms AS cache_lookup_ms
     FROM request_logs r
+    LEFT JOIN cache_logs cl ON cl.trace_id = r.trace_id
   `;
   const queryDetailStmt = db.prepare(`SELECT * FROM request_logs WHERE trace_id = ?`);
   const queryLlmCallsStmt = db.prepare(
@@ -769,6 +1172,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           payload.attempt ?? null,
           payload.inputBreakdown ? JSON.stringify(payload.inputBreakdown) : null,
           payload.maxTokens ?? null,
+          payload.temperature ?? null,
           payload.finishReason ?? null,
           payload.status,
           payload.errorMessage ?? '',
@@ -944,6 +1348,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
                 : null,
             llm: row.llm_duration,
             tool: row.tool_duration,
+            cacheLookupMs: row.cache_lookup_ms,
             total:
               isNumber(row.client_received_at) && isNumber(row.client_sent_at)
                 ? row.client_received_at - row.client_sent_at
@@ -993,6 +1398,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           attempt: llm.attempt,
           inputBreakdown: parseInputBreakdown(llm.input_breakdown),
           maxTokens: llm.max_tokens,
+          temperature: llm.temperature,
           finishReason: llm.finish_reason,
           status: llm.status as 'success' | 'failed',
           errorMessage: llm.error_message,
@@ -1091,6 +1497,421 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
       };
     },
 
+    // ===== feat-A013：缓存存储实现（cache_logs / cache_entries；均同步直写，不经 pendingOps 写缓冲；
+    // 写入旁路静默——失败 console.error 告警，绝不影响判定主流程） =====
+
+    appendCacheLog(traceId, payload): void {
+      // request_logs 骨架行走 A007 写缓冲（1s / 50 条），判定时刻父行可能未落盘；先探父行，
+      // 缺失则 flush 把骨架补齐再直写——cache_logs 是图表 / 误判率唯一数据源，不允许因缓冲时序空窗丢行
+      // （§2.4 强一致对账口径）。父行真实缺失（骨架未建）→ 单条 try/catch 静默告警，绝不影响判定主流程。
+      try {
+        if (cacheLogParentExistsStmt.get(traceId) === undefined) {
+          flush();
+        }
+        insertCacheLogStmt.run(
+          traceId,
+          payload.userQuery,
+          payload.nearestQuery ?? null,
+          payload.similarity ?? null,
+          payload.hitLine,
+          payload.hit ? 1 : 0,
+          payload.tieHits ?? null,
+          Date.now(),
+          payload.lookupMs ?? null
+        );
+      } catch (error) {
+        console.error('Failed to write cache_logs (bypass):', error);
+      }
+    },
+
+    queryCacheLogByTrace(traceId): CacheLogRecord | null {
+      const row = queryCacheLogByTraceStmt.get(traceId) as CacheLogRow | undefined;
+      return row === undefined ? null : mapCacheLogRow(row);
+    },
+
+    queryLatestCacheLogTraceIdByUserQuery(userQuery): string | null {
+      const row = queryLatestCacheLogTraceIdByUserQueryStmt.get(userQuery) as
+        | { trace_id: string }
+        | undefined;
+      return row === undefined ? null : row.trace_id;
+    },
+
+    appendHitLineChange(previous, current): void {
+      // 同步直写 + 失败旁路静默：修改记录是审计数据源，写入失败绝不影响 PUT 成功语义
+      try {
+        insertHitLineChangeStmt.run(previous, current, Date.now());
+      } catch (error) {
+        console.error('Failed to write cache hit line change (bypass):', error);
+      }
+    },
+
+    getLastHitLineChange() {
+      try {
+        const row = queryLastHitLineChangeStmt.get() as
+          | { previous: number; current: number; changed_at: number }
+          | undefined;
+        return row === undefined
+          ? null
+          : { previous: row.previous, current: row.current, at: row.changed_at };
+      } catch (error) {
+        console.error('Failed to read last hit line change:', error);
+        return null;
+      }
+    },
+
+    queryCacheLogs(filter): { list: GrayZoneLogItem[]; total: number } {
+      // §3.8 口径：hit=0 AND 0.80 ≤ similarity < hit_line（hit_line 取各行生效值，历史行不随配置漂移）；
+      // marked 过滤：all（默认）/ marked / unmarked
+      const conditions = [
+        'hit = 0',
+        'similarity >= ?',
+        'similarity < hit_line',
+        'created_at >= ?',
+        'created_at <= ?',
+      ];
+      const params: Array<string | number> = [CACHE_LOW_SIM_LINE, filter.startAt, filter.endAt];
+      if (filter.similarityMin !== undefined) {
+        conditions.push('similarity >= ?');
+        params.push(filter.similarityMin);
+      }
+      if (filter.similarityMax !== undefined) {
+        conditions.push('similarity <= ?');
+        params.push(filter.similarityMax);
+      }
+      if (filter.marked === 'marked') {
+        conditions.push('marked = 1');
+      } else if (filter.marked === 'unmarked') {
+        conditions.push('marked = 0');
+      }
+      const whereSql = `WHERE ${conditions.join(' AND ')}`;
+      const countRow = db
+        .prepare(`SELECT COUNT(*) AS total FROM cache_logs ${whereSql}`)
+        .get(...params) as { total: number };
+      const total = countRow.total;
+      const pageNo = Math.max(1, filter.pageNo ?? 1);
+      const pageSizeRaw = filter.pageSize ?? 20;
+      const pageSize = Math.min(100, Math.max(1, pageSizeRaw));
+      const rows = db
+        .prepare(
+          `SELECT id, trace_id, created_at, user_query, nearest_query, similarity, hit_line, marked
+           FROM cache_logs ${whereSql} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+        )
+        .all(...params, pageSize, (pageNo - 1) * pageSize) as Array<{
+        id: number;
+        trace_id: string;
+        created_at: number;
+        user_query: string;
+        nearest_query: string | null;
+        similarity: number | null;
+        hit_line: number;
+        marked: number;
+      }>;
+      return {
+        total,
+        list: rows.map((row) => ({
+          cacheLogId: row.id,
+          traceId: row.trace_id,
+          createdAt: row.created_at,
+          userQuery: row.user_query,
+          nearestQuery: row.nearest_query,
+          similarity: row.similarity,
+          hitLine: row.hit_line,
+          marked: row.marked === 1,
+        })),
+      };
+    },
+
+    queryCacheDistribution(startAt, endAt): CacheDistributionResult {
+      const rows = db
+        .prepare(
+          `SELECT similarity, hit_line FROM cache_logs WHERE created_at >= ? AND created_at <= ?`
+        )
+        .all(startAt, endAt) as Array<{ similarity: number | null; hit_line: number }>;
+      // §3.7：50 桶，第 0~48 桶 [i×0.02, (i+1)×0.02)，第 49 桶 [0.98, 1.00]（含 1.0）；
+      // 上下界四舍五入到 2 位小数（0.80 / 0.92 恰为桶边界，防 0.02 浮点误差破坏着色分界）
+      const buckets: CacheDistributionBucket[] = [];
+      for (let i = 0; i < CACHE_DISTRIBUTION_BUCKET_COUNT; i += 1) {
+        const lower = Math.round(i * CACHE_DISTRIBUTION_BUCKET_WIDTH * 100) / 100;
+        const upper =
+          i === CACHE_DISTRIBUTION_BUCKET_COUNT - 1
+            ? 1
+            : Math.round((i + 1) * CACHE_DISTRIBUTION_BUCKET_WIDTH * 100) / 100;
+        buckets.push({ lower, upper, count: 0 });
+      }
+      let lowSimilar = 0;
+      let grayZone = 0;
+      let highConfidence = 0;
+      for (const row of rows) {
+        const similarity = row.similarity;
+        // bucketIndex(sim)：sim=null → 0（池空行落桶 0）；sim=1.0 → min(floor(50), 49) = 49
+        const index =
+          similarity === null
+            ? 0
+            : Math.min(
+                Math.floor(similarity / CACHE_DISTRIBUTION_BUCKET_WIDTH),
+                CACHE_DISTRIBUTION_BUCKET_COUNT - 1
+              );
+        buckets[index].count += 1;
+        // 三档派生（§3.7 区间着色口径）：低相似（含池空 sim=null）/ 灰色区 [0.80, hit_line) / 高置信 ≥ hit_line
+        if (similarity === null || similarity < CACHE_LOW_SIM_LINE) {
+          lowSimilar += 1;
+        } else if (similarity < row.hit_line) {
+          grayZone += 1;
+        } else {
+          highConfidence += 1;
+        }
+      }
+      return {
+        buckets,
+        totals: { lowSimilar, grayZone, highConfidence, totalCount: rows.length },
+      };
+    },
+
+    querySimilarityRows(filter): { list: SimilarityRowsItem[]; total: number } {
+      // §3.11 桶过滤口径（与 §3.7 bucketIndex(sim) 同源，桶边界含下不含上）：
+      // 0 → sim IS NULL OR sim < 0.02；1≤i≤48 → i×0.02 ≤ sim < (i+1)×0.02；49 → 0.98 ≤ sim ≤ 1.00
+      let similarityCondition: string;
+      let similarityParams: number[];
+      if (filter.bucketIndex === 0) {
+        similarityCondition = '(similarity IS NULL OR similarity < ?)';
+        similarityParams = [CACHE_DISTRIBUTION_BUCKET_WIDTH];
+      } else if (filter.bucketIndex >= CACHE_DISTRIBUTION_BUCKET_COUNT - 1) {
+        similarityCondition = '(similarity >= ? AND similarity <= ?)';
+        similarityParams = [
+          (CACHE_DISTRIBUTION_BUCKET_COUNT - 1) * CACHE_DISTRIBUTION_BUCKET_WIDTH,
+          1,
+        ];
+      } else {
+        similarityCondition = '(similarity >= ? AND similarity < ?)';
+        similarityParams = [
+          filter.bucketIndex * CACHE_DISTRIBUTION_BUCKET_WIDTH,
+          (filter.bucketIndex + 1) * CACHE_DISTRIBUTION_BUCKET_WIDTH,
+        ];
+      }
+      const conditions = ['created_at >= ?', 'created_at <= ?', similarityCondition];
+      const params: Array<string | number> = [filter.startAt, filter.endAt, ...similarityParams];
+      const whereSql = `WHERE ${conditions.join(' AND ')}`;
+      const countRow = db
+        .prepare(`SELECT COUNT(*) AS total FROM cache_logs ${whereSql}`)
+        .get(...params) as { total: number };
+      const total = countRow.total;
+      const pageNo = Math.max(1, filter.pageNo ?? 1);
+      const pageSizeRaw = filter.pageSize ?? 20;
+      const pageSize = Math.min(100, Math.max(1, pageSizeRaw));
+      const rows = db
+        .prepare(
+          `SELECT id, trace_id, created_at, user_query, nearest_query, similarity, hit, tie_hits, hit_line, marked
+           FROM cache_logs ${whereSql} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+        )
+        .all(...params, pageSize, (pageNo - 1) * pageSize) as Array<{
+        id: number;
+        trace_id: string;
+        created_at: number;
+        user_query: string;
+        nearest_query: string | null;
+        similarity: number | null;
+        hit: number;
+        tie_hits: number | null;
+        hit_line: number;
+        marked: number;
+      }>;
+      return {
+        total,
+        list: rows.map((row) => ({
+          cacheLogId: row.id,
+          traceId: row.trace_id,
+          createdAt: row.created_at,
+          userQuery: row.user_query,
+          nearestQuery: row.nearest_query,
+          similarity: row.similarity,
+          hit: row.hit === 1,
+          tieHits: row.tie_hits,
+          hitLine: row.hit_line,
+          marked: row.marked === 1,
+        })),
+      };
+    },
+
+    queryMisjudgeStats(startAt, endAt): CacheMisjudgeStats {
+      const hitRow = db
+        .prepare(
+          `SELECT COUNT(*) AS total FROM cache_logs WHERE hit = 1 AND created_at >= ? AND created_at <= ?`
+        )
+        .get(startAt, endAt) as { total: number };
+      const markedRow = db
+        .prepare(
+          `SELECT COUNT(*) AS total FROM cache_logs WHERE marked = 1 AND created_at >= ? AND created_at <= ?`
+        )
+        .get(startAt, endAt) as { total: number };
+      const hitTotal = hitRow.total;
+      const markedMisjudge = markedRow.total;
+      // §3.9：markedMisjudge = 区间内 marked=1 行数（含未命中灰色区标记）；误判率 4 位小数；hitTotal=0 → null（页面显示「—」）
+      return {
+        hitTotal,
+        markedMisjudge,
+        misjudgeRate:
+          hitTotal === 0 ? null : Math.round((markedMisjudge / hitTotal) * 10000) / 10000,
+      };
+    },
+
+    updateCacheLogMark(id, marked, markedBy): boolean {
+      try {
+        const result = updateCacheLogMarkStmt.run(
+          marked ? 1 : 0,
+          marked ? (markedBy ?? null) : null,
+          marked ? Date.now() : null,
+          id
+        );
+        if (result.changes > 0) {
+          return true;
+        }
+        // 幂等：行已存在但值未变（重复标记 / 重复取消）→ 按存在性返回 true；id 不存在 → false（404）
+        return queryCacheLogExistsStmt.get(id) !== undefined;
+      } catch (error) {
+        console.error('Failed to update cache_logs mark (bypass):', error);
+        return false;
+      }
+    },
+
+    insertCacheEntry(payload): number | null {
+      try {
+        const info = insertCacheEntryStmt.run(
+          payload.id,
+          payload.queryText,
+          payload.embeddingB64,
+          payload.answerJson,
+          payload.answerBytes,
+          payload.hitCount,
+          payload.lastAccessAt,
+          payload.createdAt,
+          payload.versionTag
+        );
+        return Number(info.lastInsertRowid);
+      } catch (error) {
+        console.error('Failed to insert cache entry (bypass):', error);
+        return null;
+      }
+    },
+
+    updateCacheEntry(id, update): boolean {
+      try {
+        // COALESCE：缺省字段保持原值（命中计数 / 最后访问刷新二选一或同时）
+        const result = updateCacheEntryStmt.run(
+          update.hitCount ?? null,
+          update.lastAccessAt ?? null,
+          id
+        );
+        return result.changes > 0;
+      } catch (error) {
+        console.error('Failed to update cache entry (bypass):', error);
+        return false;
+      }
+    },
+
+    deleteCacheEntry(id): boolean {
+      try {
+        return deleteCacheEntryStmt.run(id).changes > 0;
+      } catch (error) {
+        console.error('Failed to delete cache entry (bypass):', error);
+        return false;
+      }
+    },
+
+    listCacheEntries(options): { list: CacheEntryListItem[]; total: number } {
+      // §3.5：sortBy / order 白名单（API 已校验，此处防御性兜底默认 lastAccessAt / desc）
+      const sortColumn = options.sortBy === 'hitCount' ? 'hit_count' : 'last_access_at';
+      const orderSql = options.order === 'asc' ? 'ASC' : 'DESC';
+      const pageNo = Math.max(1, options.pageNo);
+      const pageSize = Math.min(100, Math.max(1, options.pageSize));
+      const countRow = countCacheEntriesStmt.get() as { total: number };
+      const rows = db
+        .prepare(
+          `SELECT id, query_text, answer_bytes, hit_count, last_access_at, created_at
+           FROM cache_entries ORDER BY ${sortColumn} ${orderSql}, id ${orderSql} LIMIT ? OFFSET ?`
+        )
+        .all(pageSize, (pageNo - 1) * pageSize) as CacheEntryListRow[];
+      return {
+        total: countRow.total,
+        list: rows.map((row) => ({
+          id: row.id,
+          queryText: row.query_text,
+          answerBytes: row.answer_bytes,
+          embeddingBytes: CACHE_EMBEDDING_BYTES,
+          hitCount: row.hit_count,
+          lastAccessAt: row.last_access_at,
+          createdAt: row.created_at,
+        })),
+      };
+    },
+
+    queryEntryHits(entryId, pageNo, pageSize): { list: CacheEntryHitItem[]; total: number } | null {
+      // §3.12 口径：cache_logs 中 hit=1 且 nearest_query = 条目 query_text（命中该条目的请求）；条目不存在 → null（404）
+      const entry = getCacheEntryQueryTextStmt.get(entryId) as { query_text: string } | undefined;
+      if (entry === undefined) {
+        return null;
+      }
+      const pageNoSafe = Math.max(1, pageNo);
+      const pageSizeSafe = Math.min(100, Math.max(1, pageSize));
+      const whereSql = 'WHERE hit = 1 AND nearest_query = ?';
+      const countRow = db
+        .prepare(`SELECT COUNT(*) AS total FROM cache_logs ${whereSql}`)
+        .get(entry.query_text) as { total: number };
+      const rows = db
+        .prepare(
+          `SELECT trace_id, user_query, similarity, created_at, marked
+           FROM cache_logs ${whereSql} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+        )
+        .all(entry.query_text, pageSizeSafe, (pageNoSafe - 1) * pageSizeSafe) as Array<{
+        trace_id: string;
+        user_query: string;
+        similarity: number | null;
+        created_at: number;
+        marked: number;
+      }>;
+      return {
+        total: countRow.total,
+        list: rows.map((row) => ({
+          traceId: row.trace_id,
+          userQuery: row.user_query,
+          similarity: row.similarity,
+          createdAt: row.created_at,
+          marked: row.marked === 1,
+        })),
+      };
+    },
+
+    queryEntryHitCounts(): Map<number, number> {
+      // 验收问题「缓存概览 4」：全池累计命中数，口径同 §3.12 弹框（cache_logs 中 hit=1 且 nearest_query = 条目 query_text；
+      // 含历史池、重启不归零）；LEFT JOIN 保证无日志 / 未命中条目计数为 0；条目被删则随 LEFT JOIN 不产出
+      const rows = db
+        .prepare(
+          `SELECT e.id AS id, COUNT(c.id) AS hits
+           FROM cache_entries e
+           LEFT JOIN cache_logs c ON c.hit = 1 AND c.nearest_query = e.query_text
+           GROUP BY e.id`
+        )
+        .all() as Array<{ id: number; hits: number }>;
+      const counts = new Map<number, number>();
+      for (const row of rows) {
+        counts.set(row.id, row.hits);
+      }
+      return counts;
+    },
+
+    clearCacheEntries(): number {
+      try {
+        return clearCacheEntriesStmt.run().changes;
+      } catch (error) {
+        console.error('Failed to clear cache entries (bypass):', error);
+        return 0;
+      }
+    },
+
+    countCacheEntries(): number {
+      const row = countCacheEntriesStmt.get() as { total: number };
+      return row.total;
+    },
+
     flush,
     runRetentionCleanup,
 
@@ -1179,4 +2000,95 @@ export function reportRouteSource(traceId: string, routeSource: RouteSource): vo
 
 export function reportFrontendEnd(traceId: string, clientReceivedAt: number): void {
   getLogStore().reportFrontendEnd(traceId, clientReceivedAt);
+}
+
+// ===== feat-A013：缓存存储模块级便捷函数（小胡 cache.ts / 后台 API 直调，与既有埋点函数同模式） =====
+
+/** feat-A013：判定审计落库（命中 / 未命中一律一行；旁路静默，失败不影响主流程） */
+export function appendCacheLog(traceId: string, payload: CacheLogPayload): void {
+  getLogStore().appendCacheLog(traceId, payload);
+}
+
+export function queryCacheLogByTrace(traceId: string): CacheLogRecord | null {
+  return getLogStore().queryCacheLogByTrace(traceId);
+}
+
+/** feat-A013 验收修正：最近一条同 user_query 的 cache_logs.trace_id（无关联行 → null，缓存条目列表跳转日志明细） */
+export function queryLatestCacheLogTraceIdByUserQuery(userQuery: string): string | null {
+  return getLogStore().queryLatestCacheLogTraceIdByUserQuery(userQuery);
+}
+
+/** feat-A013：灰色区 query 对清单（§3.8 数据源） */
+export function queryCacheLogs(filter: CacheLogsFilter): { list: GrayZoneLogItem[]; total: number } {
+  return getLogStore().queryCacheLogs(filter);
+}
+
+export function queryCacheDistribution(startAt: number, endAt: number): CacheDistributionResult {
+  return getLogStore().queryCacheDistribution(startAt, endAt);
+}
+
+export function querySimilarityRows(
+  filter: CacheLogBucketFilter
+): { list: SimilarityRowsItem[]; total: number } {
+  return getLogStore().querySimilarityRows(filter);
+}
+
+export function queryMisjudgeStats(startAt: number, endAt: number): CacheMisjudgeStats {
+  return getLogStore().queryMisjudgeStats(startAt, endAt);
+}
+
+/** feat-A013：缓存条目命中记录（§3.12 数据源，条目不存在 → null） */
+export function queryEntryHits(
+  entryId: number,
+  pageNo: number,
+  pageSize: number
+): { list: CacheEntryHitItem[]; total: number } | null {
+  return getLogStore().queryEntryHits(entryId, pageNo, pageSize);
+}
+
+/** feat-A013 验收修正：全池条目累计命中次数（条目 id → 累计命中数；口径同 queryEntryHits；无命中条目 → 0） */
+export function queryEntryHitCounts(): Map<number, number> {
+  return getLogStore().queryEntryHitCounts();
+}
+
+/** feat-A013：误判标记 / 取消；返回行是否存在（不存在 → false 供 404） */
+export function updateCacheLogMark(id: number, marked: boolean, markedBy: string | null): boolean {
+  return getLogStore().updateCacheLogMark(id, marked, markedBy);
+}
+
+/** feat-A013：缓存条目镜像写入，返回新条目自增 id（写入失败静默降级 null） */
+export function insertCacheEntry(payload: CacheEntryPayload): number | null {
+  return getLogStore().insertCacheEntry(payload);
+}
+
+export function updateCacheEntry(id: number, update: CacheEntryUpdate): boolean {
+  return getLogStore().updateCacheEntry(id, update);
+}
+
+export function deleteCacheEntry(id: number): boolean {
+  return getLogStore().deleteCacheEntry(id);
+}
+
+export function listCacheEntries(
+  options: CacheEntryListOptions
+): { list: CacheEntryListItem[]; total: number } {
+  return getLogStore().listCacheEntries(options);
+}
+
+export function clearCacheEntries(): number {
+  return getLogStore().clearCacheEntries();
+}
+
+export function countCacheEntries(): number {
+  return getLogStore().countCacheEntries();
+}
+
+/** feat-A013：命中线修改记录（§3.2 PUT hit-line 同步直写；失败旁路静默，不影响主流程） */
+export function appendHitLineChange(previous: number, current: number): void {
+  getLogStore().appendHitLineChange(previous, current);
+}
+
+/** feat-A013：最近一条命中线修改记录（§3.6 overview.lastHitLineChange 数据源；无记录 → null） */
+export function getLastHitLineChange(): { previous: number; current: number; at: number } | null {
+  return getLogStore().getLastHitLineChange();
 }

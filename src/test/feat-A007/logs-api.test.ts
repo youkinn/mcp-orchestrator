@@ -83,6 +83,7 @@ function seedTraceA(logStore: LogStore, traceId: string = TRACE_A): void {
     responseSummary: '{"role":"assistant","content":"关羽在曹操军中……"}',
     promptTokens: 1234,
     completionTokens: 860,
+    temperature: 0.7,
     finishReason: 'stop',
     status: 'success',
   });
@@ -100,7 +101,7 @@ function seedTraceA(logStore: LogStore, traceId: string = TRACE_A): void {
   logStore.flush();
 }
 
-test('GET /api/v1/logs：成功信封 + 列表项字段 + durations/tokens 派生（与接口文档示例一致）', async (t) => {
+test('GET /api/v1/logs：成功信封 + 列表项字段 + durations/tokens 派生（A007 公式项 + feat-A013 cacheLookupMs=null）', async (t) => {
   const logStore = createLogStore({ dbPath: ':memory:' });
   t.after(() => logStore.close());
   seedTraceA(logStore);
@@ -114,18 +115,19 @@ test('GET /api/v1/logs：成功信封 + 列表项字段 + durations/tokens 派�
   assert.deepEqual(
     Object.keys(item).sort(),
     [
-      'domain', 'durations', 'errorMessage', 'hasRetry', 'logType', 'responseCode',
+      'cacheHit', 'domain', 'durations', 'errorMessage', 'hasRetry', 'logType', 'responseCode',
       'routeSource', 'serverReceivedAt', 'status', 'tokens', 'traceId', 'userInput',
     ]
   );
   assert.equal(item.traceId, TRACE_A);
   assert.equal(item.logType, 'chat');
   assert.equal(item.domain, 'sango-novel');
+  assert.equal(item.cacheHit, null, 'feat-A013 §3.10：无 cache_logs 行（A013 前历史行）→ null');
   assert.equal(item.status, 'success');
   assert.equal(item.responseCode, 200);
   assert.equal(item.errorMessage, '');
   assert.equal(item.serverReceivedAt, 1789884000000);
-  assert.deepEqual(item.durations, { frontend: 7550, queueWait: 12, server: 3450, llm: 2800, tool: 600, total: 11000 });
+  assert.deepEqual(item.durations, { frontend: 7550, queueWait: 12, server: 3450, llm: 2800, tool: 600, cacheLookupMs: null, total: 11000 });
   assert.deepEqual(item.tokens, { input: 1234, output: 860 });
 });
 
@@ -242,6 +244,7 @@ test('GET /api/v1/logs/:traceId：非 UUID 400 / 不存在 404 / 存在返回主
   assert.equal(llmCalls[0].model, 'qwen-plus');
   assert.equal(llmCalls[0].promptTokens, 1234);
   assert.equal(llmCalls[0].completionTokens, 860);
+  assert.equal(llmCalls[0].temperature, 0.7, '明细 llmCalls[].temperature 原值下发（无此列时历史行为 null）');
   assert.equal(llmCalls[0].finishReason, 'stop');
   assert.equal(toolCalls.length, 1);
   assert.equal(toolCalls[0].toolName, 'sango_novel_search');

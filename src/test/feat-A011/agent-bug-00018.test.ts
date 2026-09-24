@@ -1,6 +1,7 @@
 // bug-00018 空答案兜底与关思考口径测试（测试即文档）：
 // ① 负向——模型返回空 content + finish_reason=length → 变参重试 1 次（temperature=0 且关思考），
-//    仍空则报错（走既有 500 映射），日志不得记 success（空答案轮记 failed + error_message）；
+//    仍空则报错（走既有 500 映射），日志不得记 success（空答案轮记 failed + error_message，
+//    落库温度与请求实参一致：首轮 0.7 / 重试轮 0）；
 // ② 口径——分类轮 / 兜底结论轮 / 有注入生成轮请求体带 thinking:{type:'disabled'}，
 //    自由模式 99 生成轮不带（保留思考）。
 // 走真实 Agent.callModel 代码路径（fake OpenAI 客户端捕获请求体），日志经 runWithTraceId 落临时库。
@@ -150,6 +151,8 @@ test('① 负向：content 空 + finish_reason=length → 变参重试 1 次（t
     detail.llmCalls.every((call) => (call.errorMessage ?? '') !== ''),
     '失败轮带 error_message'
   );
+  assert.equal(detail.llmCalls[0]!.temperature, 0.7, '首轮失败行落库温度与请求一致');
+  assert.equal(detail.llmCalls[1]!.temperature, 0, '变参重试轮失败行落库温度与请求一致');
 });
 
 test('② 口径：分类轮请求体带 thinking disabled，自由模式 99 生成轮不带', async () => {

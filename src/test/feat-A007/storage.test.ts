@@ -226,6 +226,7 @@ test('派生耗时：完整链路 durations 全部按公式计算（含队列等
     server: 1990,
     llm: 1840,
     tool: 100,
+    cacheLookupMs: null,
     total: 8000,
   });
   // tokens：usage 缺失（NULL）行忽略，SUM 有效行
@@ -244,6 +245,7 @@ test('派生耗时：时间点缺失对应项为 null，不估算', (t) => {
     server: null,
     llm: null,
     tool: null,
+    cacheLookupMs: null,
     total: null,
   });
 
