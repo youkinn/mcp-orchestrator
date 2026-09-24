@@ -74,6 +74,8 @@ export interface CacheManager {
   setEnabled(enabled: boolean): CacheStatus;
   /** 命中线（§1.3 / §3.2 PUT hit-line）：0 < value ≤ 1；非法返回 NaN（调用方 400） */
   setHitLine(value: number): number;
+  /** 缓存上限（§1.5 / §3.2 PUT max-entries）：正整数（调用方另限 1~5000）；非法返回 NaN（调用方 400） */
+  setMaxEntries(value: number): number;
   clearAll(): { cleared: number };
   deleteEntry(id: number): boolean;
   /** 条目明细（§3.5；traceId 关联由路由层从 LogStore 补充，Manager 不感知——同 getOverview 口径） */
@@ -211,6 +213,27 @@ export function createCacheApi(cacheManager: CacheManager, logStore?: LogStore):
       response.json({ code: 200, data: { hitLine: updated }, message: '' });
     } catch (error) {
       console.error('Failed to set cache hit line:', error);
+      sendError(response, 500, OPERATE_ERROR_MESSAGE);
+    }
+  });
+
+  // PUT /api/v1/cache/max-entries —— 缓存上限调整（§1.5 / §3.2 同等风格；整数 1~5000，立即生效，重启回 CACHE_MAX_ENTRIES 初始值，调小立即逐出尾部条目）
+  router.put('/max-entries', (request: Request, response: Response) => {
+    try {
+      const body = (request.body ?? {}) as { maxEntries?: unknown };
+      const value = body.maxEntries;
+      if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 5000) {
+        sendError(response, 400, 'maxEntries 必须为 1~5000 的整数');
+        return;
+      }
+      const updated = cacheManager.setMaxEntries(value);
+      if (Number.isNaN(updated)) {
+        sendError(response, 400, 'maxEntries 必须为 1~5000 的整数');
+        return;
+      }
+      response.json({ code: 200, data: { maxEntries: updated }, message: '' });
+    } catch (error) {
+      console.error('Failed to set cache max entries:', error);
       sendError(response, 500, OPERATE_ERROR_MESSAGE);
     }
   });

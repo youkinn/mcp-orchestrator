@@ -738,6 +738,47 @@ test("setHitLine：运行时调整命中线立即生效；越界拒绝（返回 
   assert.equal(stillGray?.hit, true, "拒绝的非法值不打断已生效的命中线");
 });
 
+test("setMaxEntries：调大生效并返回新值；调小立即从队尾逐出至新上限（内存删 + 镜像 DELETE）；非法返回 NaN 且不变", async () => {
+  const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 10));
+  const { manager, logStore, embed } = makeManager({ maxEntries: 2 });
+  embed.vectors.set("上限甲", unitVector(40));
+  embed.vectors.set("上限乙", unitVector(41));
+  embed.vectors.set("上限丙", unitVector(42));
+  await writeEntry(manager, "上限甲", "c1");
+  await tick();
+  await writeEntry(manager, "上限乙", "c2");
+  assert.equal(manager.getStatus().entryCount, 2);
+
+  // 调大：立即生效并返回新值，第三条约 3 不再驱逐
+  assert.equal(manager.setMaxEntries(3), 3);
+  assert.equal(manager.getStatus().maxEntries, 3);
+  await tick();
+  await writeEntry(manager, "上限丙", "c3");
+  assert.equal(manager.getStatus().entryCount, 3, "调大后第三条约 3 不驱逐");
+
+  // 调小：从队尾（最久未用端）立即逐出至新上限，镜像同步 DELETE
+  assert.equal(manager.setMaxEntries(2), 2);
+  assert.equal(manager.getStatus().maxEntries, 2);
+  assert.equal(manager.getStatus().entryCount, 2, "调小立即驱逐尾部条目至新上限");
+  assert.deepEqual(
+    manager.listEntries({ pageSize: 100 }).list.map((item) => item.queryText),
+    ["上限丙", "上限乙"],
+    "驱逐最久未用端（上限甲）"
+  );
+  assert.ok(!logStore.mirrors.find((item) => item.queryText === "上限甲"), "被逐出条目（上限甲）已从镜像删除");
+  assert.ok(logStore.deletes.includes(1), "逐出落镜像 DELETE（上限甲 id=1）");
+  assert.equal(logStore.mirrors.length, 2, "镜像与内存同事务淘汰");
+
+  // 非法：<1 / 非整数 / 非有限 → NaN 且上限与条目数不变
+  assert.equal(manager.setMaxEntries(0), NaN);
+  assert.equal(manager.setMaxEntries(-5), NaN);
+  assert.equal(manager.setMaxEntries(1.5), NaN);
+  assert.equal(manager.setMaxEntries(Number.NaN), NaN);
+  assert.equal(manager.setMaxEntries(Number.POSITIVE_INFINITY), NaN);
+  assert.equal(manager.getStatus().maxEntries, 2, "非法后上限不变");
+  assert.equal(manager.getStatus().entryCount, 2, "非法后条目不变");
+});
+
 test("lookup：人名字号归一化换说法命中（云长→关羽）；落库仍存原始文本", async () => {
   const { manager, logStore, embed } = makeManager();
   embed.vectors.set("关羽过五关斩六将", unitVector(0));

@@ -390,7 +390,7 @@ export class CacheManager {
   /** 命中线（§1.3）：启动读 CACHE_HIT_LINE；支持 setHitLine 运行时调整，重启回初始值 */
   hitLine: number;
   /** 上限（§1.5） */
-  readonly maxEntries: number;
+  maxEntries: number;
 
   private logStore: CacheLogStore;
   private embedClient: CacheEmbeddingClient;
@@ -440,6 +440,17 @@ export class CacheManager {
     }
     this.hitLine = value;
     return this.hitLine;
+  }
+
+  /** 缓存上限（§1.5 / 后台 PUT max-entries）：正整数（<1 或非整数或非有限）；非法返回 NaN（调用方 400，值不变）；
+   * 调整立即生效（调大放开写入限制、调小立即从队尾逐出至新上限，同 evictIfNeeded）；不持久化，重启回 CACHE_MAX_ENTRIES 初始值 */
+  setMaxEntries(value: number): number {
+    if (!Number.isFinite(value) || !Number.isInteger(value) || value < 1) {
+      return NaN;
+    }
+    this.maxEntries = value;
+    this.evictIfNeeded();
+    return this.maxEntries;
   }
 
   /** 全量清除（§1.6 / §3.3）：内存清空 + 镜像清空；cache_logs 不动（历史数据是图表 / 误判率数据源） */

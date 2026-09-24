@@ -65,6 +65,14 @@ class FakeCacheManager implements CacheManager {
     return this.hitLine;
   }
 
+  setMaxEntries(value: number): number {
+    if (!Number.isInteger(value) || value < 1) {
+      return NaN;
+    }
+    this.maxEntries = value;
+    return this.maxEntries;
+  }
+
   clearAll(): { cleared: number } {
     const cleared = this.entries.size;
     this.entries.clear();
@@ -783,4 +791,29 @@ test('⑭ PUT /hit-line：命中线运行时调整 200 / 非法 400 / 值不变�
   assert.ok(second.at >= first.at, '记录按修改时序递增');
   const overview = await get(baseUrl, '/api/v1/cache/overview');
   assert.deepEqual(overview.body.data.lastHitLineChange, { previous: 0.85, current: 0.9, at: second.at }, 'overview 返回最近一条修改记录');
+});
+
+test('⑮ PUT /max-entries：缓存上限运行时调整 200 / 非法 400 / 值不变；立即生效（§1.5 / 契约：立即生效，重启回 CACHE_MAX_ENTRIES 初始值，调小立即逐出尾部条目）', async (t) => {
+  const store = createLogStore({ dbPath: ':memory:' });
+  t.after(() => store.close());
+  const manager = new FakeCacheManager();
+  const baseUrl = await startCacheApi(t, manager, store);
+
+  // 成功：返回新值并立即反映于状态
+  const ok = await send(baseUrl, 'PUT', '/api/v1/cache/max-entries', { maxEntries: 800 });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(ok.body.data, { maxEntries: 800 });
+  const status = await get(baseUrl, '/api/v1/cache/status');
+  assert.equal(status.body.data.maxEntries, 800, '调整立即生效并反映于状态');
+
+  // 非法 400：<1 / 非整数 / 非数字 / 超上限 5000 / 缺 body
+  const badValues = [0, -1, 0.5, 5001, 'abc', null];
+  for (const bad of badValues) {
+    const res = await send(baseUrl, 'PUT', '/api/v1/cache/max-entries', { maxEntries: bad });
+    assert.equal(res.status, 400, `maxEntries=${String(bad)} 应 400`);
+  }
+  const noBody = await send(baseUrl, 'PUT', '/api/v1/cache/max-entries', {});
+  assert.equal(noBody.status, 400);
+  const still = await get(baseUrl, '/api/v1/cache/status');
+  assert.equal(still.body.data.maxEntries, 800, '非法调整后上限不变');
 });
