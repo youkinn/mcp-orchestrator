@@ -450,8 +450,11 @@ export class Agent {
       reasoningContent: string | null;
       finishReason: string | null;
       attempt: 1 | 2;
+      temperature: number;
     }> => {
       const requestAt = Date.now();
+      // feat-A013：本次调用生效温度（params / 返回 / catch 落库同源，仅算一次）
+      const temperature = callOptions.temperature ?? 0.7;
       let response: OpenAI.Chat.Completions.ChatCompletion;
       try {
         const params: Record<string, unknown> = {
@@ -462,7 +465,7 @@ export class Agent {
           // 「思考 + 正文」；思考不收敛时正文恒为空（放大 max_tokens 无效）。各调用点是否关闭思考
           // 的口径见 bug-00018，调用点均有对应备注。
           max_tokens: MAX_TOKENS,
-          temperature: callOptions.temperature ?? 0.7,
+          temperature,
         };
         if (callOptions.disableThinking) {
           // bug-00018：provider 实测生效参数（OpenAI SDK 类型未收录，按扩展字段透传）
@@ -484,6 +487,7 @@ export class Agent {
               attempt,
               inputBreakdown,
               maxTokens: MAX_TOKENS,
+              temperature,
               status: "failed",
               errorMessage: toErrorMessage(error),
             });
@@ -526,6 +530,7 @@ export class Agent {
         reasoningContent,
         finishReason: response.choices?.[0]?.finish_reason ?? null,
         attempt,
+        temperature,
       };
     };
 
@@ -557,6 +562,7 @@ export class Agent {
           attempt: call.attempt,
           inputBreakdown,
           maxTokens: MAX_TOKENS,
+          temperature: call.temperature,
           finishReason: call.finishReason,
           status,
           errorMessage,
