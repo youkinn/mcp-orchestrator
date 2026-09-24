@@ -1,8 +1,13 @@
-import { test } from "node:test";
+import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Agent } from "../../agent.js";
 import { MCPTransport } from "../../transport.js";
 import { loadAliasTable } from "../../citation.js";
+import { runWithTraceId } from "../../trace.js";
+import { getLogStore, type LogStore } from "../../storage/logs.js";
 import type {
   LLMConfig,
   LLMProvider,
@@ -60,6 +65,68 @@ function textResponse(text: string): ModelResponse {
 
 const ALIAS_TABLE = loadAliasTable("a004-not-exist"); // stub 别名表（关羽=P002）
 
+/** bug-00028 复核轮日志用例：文件级把共享日志库重定向到临时目录，不污染工作树 data/logs.db */
+const cwd = process.cwd();
+let store: LogStore;
+let logDir: string;
+
+before(() => {
+  logDir = mkdtempSync(join(tmpdir(), "a004-bug28-novel-"));
+  process.chdir(logDir);
+  store = getLogStore();
+});
+
+after(() => {
+  store.close();
+  process.chdir(cwd);
+  rmSync(logDir, { recursive: true, force: true });
+});
+
+/** 复核轮（novel_support_check）假 LLM 返回：契约 JSON 文本 */
+function supportCheckResponse(
+  overall: string,
+  citations: Array<[string, string]>
+): ModelResponse {
+  return textResponse(
+    JSON.stringify({
+      overall,
+      citations: citations.map(([pointer, support]) => ({ pointer, support })),
+    })
+  );
+}
+
+/** 脚本化 fake OpenAI（走真实 callModel 落库路径，agent-novel 其余用例的 modelCaller 注入旁路日志）：
+ * 按调用顺序返回预设响应；超出脚本长度时重复最后一条。 */
+function scriptedOpenAI(
+  script: Array<{ content: string; finishReason: string }>
+): { openai: unknown; requests: any[] } {
+  const requests: any[] = [];
+  const openai = {
+    chat: {
+      completions: {
+        create: async (request: any) => {
+          requests.push(request);
+          const step = script[requests.length - 1] ?? script[script.length - 1];
+          return {
+            choices: [
+              {
+                message: { role: "assistant", content: step.content },
+                finish_reason: step.finishReason,
+              },
+            ],
+            usage: { prompt_tokens: 10, completion_tokens: 5 },
+          };
+        },
+      },
+    },
+  };
+  return { openai, requests };
+}
+
+function injectOpenAI(agent: Agent, openai: unknown): void {
+  (agent as unknown as { openai: unknown }).openai = openai;
+}
+
 /** 召回出参（C4 定稿：裸 JSON 数组）：正文纯原文，出处逐条走 chapter / title，引语走 quotes[] */
 const RECALL_CHAPTER = 5;
 const RECALL_TITLE = "发矫诏诸镇应曹公　破关兵三英战吕布";
@@ -105,7 +172,9 @@ test("① 指针合法：模型只给结论 + 指针，服务端渲染引文 + �
     modelCallCount += 1;
     return modelCallCount === 1
       ? textResponse("1")
-      : textResponse("斩华雄者系关羽，原文见[Q1]。");
+      : modelCallCount === 2
+        ? textResponse("斩华雄者系关羽，原文见[Q1]。")
+        : supportCheckResponse("supported", [["Q1", "supported"]]);
   };
 
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
@@ -127,7 +196,7 @@ test("① 指针合法：模型只给结论 + 指针，服务端渲染引文 + �
   ]);
   assert.doesNotMatch(data.answer, /\[Q1\]/, "指针应已被服务端渲染替换");
   assert.doesNotMatch(data.answer, /段\d|（出处/, "不再内联出处，任何展示位无段号");
-  assert.equal(modelCallCount, 2, "校验通过不应有额外模型调用");
+  assert.equal(modelCallCount, 3, "生成轮 + 复核轮各一次：复核判 supported 后无兜底模型调用");
 });
 
 test("② 断言人物不在召回原文（曹操）：丢弃模型输出，输出兜底结论句 + 恰一条兜底片段", async () => {
@@ -234,7 +303,9 @@ test("②.3 长引语安全网：模型违规抄写超 30 字引语被丢弃，�
     modelCallCount += 1;
     return modelCallCount === 1
       ? textResponse("1")
-      : textResponse(`斩华雄者系关羽，曰「${longQuote}」[Q1]。`);
+      : modelCallCount === 2
+        ? textResponse(`斩华雄者系关羽，曰「${longQuote}」[Q1]。`)
+        : supportCheckResponse("supported", [["Q1", "supported"]]);
   };
 
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
@@ -259,7 +330,7 @@ test("②.3 长引语安全网：模型违规抄写超 30 字引语被丢弃，�
   assert.deepEqual(data.citations, [
     { text: RECALL_BODY, chapter: RECALL_CHAPTER, title: RECALL_TITLE },
   ]);
-  assert.equal(modelCallCount, 2, "安全网是确定性回收，不额外调模型");
+  assert.equal(modelCallCount, 3, "长引语安全网 + 复核轮均为确定性动作，无兜底模型调用");
 });
 
 test("②.4 注入编号连续（bug-00009）：窗口裁掉证据段引语时并入保底，模型 [Q2] 指针合法，答案不被 Guard 改坏", async () => {
@@ -295,7 +366,9 @@ test("②.4 注入编号连续（bug-00009）：窗口裁掉证据段引语时�
     modelCallCount += 1;
     return modelCallCount === 1
       ? textResponse("1")
-      : textResponse("关羽（云长）温酒斩华雄。[Q2]");
+      : modelCallCount === 2
+        ? textResponse("关羽（云长）温酒斩华雄。[Q2]")
+        : supportCheckResponse("supported", [["Q2", "supported"]]);
   };
 
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
@@ -323,7 +396,7 @@ test("②.4 注入编号连续（bug-00009）：窗口裁掉证据段引语时�
     "citation text 为片段整段原文（工具出参 text）"
   );
   assert.doesNotMatch(data.answer, /【原文片段】/, "指针合法不应走兜底");
-  assert.equal(modelCallCount, 2, "校验通过不触发兜底结论归纳");
+  assert.equal(modelCallCount, 3, "生成轮 + 复核轮各一次，复核判 supported 不触发兜底结论归纳");
 });
 
 test("③ 检索无命中：回答「演义中未涉及」，不做归纳生成", async () => {
@@ -514,7 +587,9 @@ test("⑦ 注入上限放宽到 10 + 叙述段指针（bug-00009 张飞题）：
     modelCallCount += 1;
     return modelCallCount === 1
       ? textResponse("1")
-      : textResponse("张飞被范疆、张达刺死。[片段5]");
+      : modelCallCount === 2
+        ? textResponse("张飞被范疆、张达刺死。[片段5]")
+        : supportCheckResponse("supported", [["片段5", "supported"]]);
   };
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
     tools: [NOVEL_TOOL],
@@ -540,14 +615,16 @@ test("⑦ 注入上限放宽到 10 + 叙述段指针（bug-00009 张飞题）：
   );
   assert.doesNotMatch(data.answer, /\[片段5\]/, "指针已被服务端渲染替换");
   assert.doesNotMatch(data.answer, /【原文片段】/, "指针合法不走兜底");
-  assert.equal(modelCallCount, 2, "校验通过不触发兜底结论归纳");
+  assert.equal(modelCallCount, 3, "生成轮 + 复核轮各一次，复核判 supported 不触发兜底结论归纳");
 });
 
-// ===== bug-00028：生成轮支撑护栏（零 LLM）——三例回归 + 正例控制组 =====
-// 判定动作：无任何支撑引用 → 拒答「演义中未涉及」+ 清空引用；有支撑但引用挂错 → 只去不支撑引用。
-// 全部走 domain=sango-novel 标签锁域快路径：模型仅 1 次生成轮调用（拒答/裁剪均不触发兜底模型调用）。
 
-test("⑧ 支撑护栏·例2 夏侯渊字什么（演义原文本无夏侯渊的字）：表字值不在注入片段 → 拒答", async () => {
+// ===== bug-00028：复核轮（novel_support_check）——三例回归 + 问法变体 + 正例控制组 + 熔断 =====
+// 语义裁决移交 LLM 复核轮（定稿设计 novel-answer-support-check.md）：两条结构门（指针合法 / 人物⊆召回）
+// 之外不再有词表规则。全部走 domain=sango-novel 标签锁域快路径：模型调用 = 生成轮 1 次 + 复核轮 1~2 次，
+// 拒答 / 裁剪均为复核轮后的确定性动作（不触发兜底结论模型调用）；复核轮用注入的假 LLM（契约 JSON）返回。
+
+test("⑧ 复核轮·例2 夏侯渊字什么：复核判 unsupported（片段无夏侯渊的字）→ 拒答", async () => {
   const entries = [
     {
       id: "sanguo-yanyi:0005:c0002",
@@ -561,7 +638,9 @@ test("⑧ 支撑护栏·例2 夏侯渊字什么（演义原文本无夏侯渊的
   let modelCallCount = 0;
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
-    return textResponse("夏侯渊字妙才。[片段1]");
+    return modelCallCount === 1
+      ? textResponse("夏侯渊字妙才。[片段1]")
+      : supportCheckResponse("unsupported", [["片段1", "unsupported"]]);
   };
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
     tools: [NOVEL_TOOL],
@@ -575,12 +654,12 @@ test("⑧ 支撑护栏·例2 夏侯渊字什么（演义原文本无夏侯渊的
     modelCaller,
   });
   const data = await agent.processQueryData("夏侯渊字什么", "sango-novel");
-  assert.equal(data.answer, "演义中未涉及", "演义原文无该信息：凭先验作答应被护栏改写为拒答");
+  assert.equal(data.answer, "演义中未涉及", "演义原文无该信息：复核判不支撑 → 拒答");
   assert.deepEqual(data.citations, [], "拒答清空引用");
-  assert.equal(modelCallCount, 1, "拒答是后置确定性动作，不触发兜底结论模型调用");
+  assert.equal(modelCallCount, 2, "生成轮 + 复核轮各一次；拒答是后置确定性动作，不触发兜底结论模型调用");
 });
 
-test("⑨ 支撑护栏·例3 刘备死的时候多少岁：答案数值六十三不在注入片段 → 拒答", async () => {
+test("⑨ 复核轮·例3 刘备死的时候多少岁：复核判 unsupported（片段无年龄事实）→ 拒答", async () => {
   const entries = [
     {
       id: "sanguo-yanyi:0055:c0009",
@@ -594,7 +673,9 @@ test("⑨ 支撑护栏·例3 刘备死的时候多少岁：答案数值六十三
   let modelCallCount = 0;
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
-    return textResponse("刘备死的时候六十三岁。[片段1]");
+    return modelCallCount === 1
+      ? textResponse("刘备死的时候六十三岁。[片段1]")
+      : supportCheckResponse("unsupported", [["片段1", "unsupported"]]);
   };
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
     tools: [NOVEL_TOOL],
@@ -608,12 +689,12 @@ test("⑨ 支撑护栏·例3 刘备死的时候多少岁：答案数值六十三
     modelCaller,
   });
   const data = await agent.processQueryData("刘备死的时候多少岁", "sango-novel");
-  assert.equal(data.answer, "演义中未涉及", "片段无年龄事实，模型凭史实先验作答应被拒答");
+  assert.equal(data.answer, "演义中未涉及", "片段无年龄事实，模型凭史实先验作答应被复核轮拒答");
   assert.deepEqual(data.citations, []);
-  assert.equal(modelCallCount, 1);
+  assert.equal(modelCallCount, 2);
 });
 
-test("⑩ 支撑护栏·例1 马超投靠刘备后如何：注入片段无结局内容（五虎/病逝无证据）→ 拒答", async () => {
+test("⑩ 复核轮·例1 马超投靠刘备后如何：复核判 unsupported（注入片段无结局内容）→ 拒答", async () => {
   const entries = [
     {
       id: "sanguo-yanyi:0065:c0007",
@@ -643,7 +724,9 @@ test("⑩ 支撑护栏·例1 马超投靠刘备后如何：注入片段无结局
   let modelCallCount = 0;
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
-    return textResponse("马超投靠刘备后，成为蜀汉五虎上将之一，最终病逝。[片段2]");
+    return modelCallCount === 1
+      ? textResponse("马超投靠刘备后，成为蜀汉五虎上将之一，最终病逝。[片段2]")
+      : supportCheckResponse("unsupported", [["片段2", "unsupported"]]);
   };
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
     tools: [NOVEL_TOOL],
@@ -657,12 +740,82 @@ test("⑩ 支撑护栏·例1 马超投靠刘备后如何：注入片段无结局
     modelCaller,
   });
   const data = await agent.processQueryData("马超投靠刘备后，后来如何了", "sango-novel");
-  assert.equal(data.answer, "演义中未涉及", "注入片段（衣带诏等）无「五虎/病逝」结局证据 → 拒答");
+  assert.equal(data.answer, "演义中未涉及", "注入片段（衣带诏等）无「五虎/病逝」结局证据 → 复核判不支撑 → 拒答");
   assert.deepEqual(data.citations, []);
-  assert.equal(modelCallCount, 1);
+  assert.equal(modelCallCount, 2);
 });
 
-test("⑪ 支撑护栏·部分支撑：只去不支撑引用、保留支撑引用（tier 2），引用清空则整答拒答", async () => {
+test("⑪ 复核轮·问法变体 马超后来咋样了：无语义触发词（词表旧规则必漏放）→ 复核判 unsupported → 拒答", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0057:c0016",
+      text: "马腾受衣带诏，与马超商议，欲除曹操。",
+      chapter: 57,
+      title: "柴桑口卧龙吊丧　耒阳县凤雏理事",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return modelCallCount === 1
+      ? textResponse("马超的境遇不错，后来成了一方大将。[片段1]")
+      : supportCheckResponse("unsupported", [["片段1", "unsupported"]]);
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "马超境遇不错",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("马超后来咋样了", "sango-novel");
+  assert.equal(data.answer, "演义中未涉及", "答案无死亡/数值/表字信号、人物锚点成立——词表旧规则必漏放，语义复核判不支撑 → 拒答");
+  assert.deepEqual(data.citations, []);
+  assert.equal(modelCallCount, 2);
+});
+
+test("⑫ 复核轮·问法变体 马超投奔刘备后的结局：无词表触发信号 → 复核判 unsupported → 拒答", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0065:c0007",
+      text: "马超与张飞在葭萌关前大战，玄德在城上观战。自白日战至夜，不分胜负。",
+      chapter: 65,
+      title: "马超大战葭萌关　刘备自领益州牧",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return modelCallCount === 1
+      ? textResponse("马超投奔刘备后的结局十分风光。[片段1]")
+      : supportCheckResponse("unsupported", [["片段1", "unsupported"]]);
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "马超结局风光",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("马超投奔刘备后的结局", "sango-novel");
+  assert.equal(data.answer, "演义中未涉及", "片段只讲葭萌关之战，不讲结局 → 语义复核拒答");
+  assert.deepEqual(data.citations, []);
+  assert.equal(modelCallCount, 2);
+});
+
+test("⑬ 复核轮·部分支撑：只留 supported 引用、摘除 unsupported、指针重编号、citations 与 cited 回填", async () => {
   const entries = [
     {
       id: "sanguo-yanyi:0005:c0002",
@@ -684,7 +837,12 @@ test("⑪ 支撑护栏·部分支撑：只去不支撑引用、保留支撑引�
   let modelCallCount = 0;
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
-    return textResponse("夏侯渊随曹操讨吕布，大破之。[片段1][片段2]");
+    return modelCallCount === 1
+      ? textResponse("袁绍聚众商议起兵，夏侯渊亦在军中。[片段1][片段2]")
+      : supportCheckResponse("supported", [
+          ["片段1", "unsupported"],
+          ["片段2", "supported"],
+        ]);
   };
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
     tools: [NOVEL_TOOL],
@@ -694,19 +852,19 @@ test("⑪ 支撑护栏·部分支撑：只去不支撑引用、保留支撑引�
         content: [{ type: "text", text: JSON.stringify(entries) }],
       }),
     },
-    fallbackConcluder: async () => "夏侯渊随曹操破吕布",
+    fallbackConcluder: async () => "袁绍聚众商议起兵",
     modelCaller,
   });
-  const data = await agent.processQueryData("夏侯渊怎么打败吕布的", "sango-novel");
-  assert.equal(data.citations.length, 1, "只保留支撑引用：袁绍段无人锚点被剔除");
-  assert.ok(data.citations[0].text.includes("夏侯惇字元让"), "保留片段为含夏侯渊的片段");
-  assert.doesNotMatch(data.answer, /\[片段2\]/, "不支撑指针已从正文移除");
-  assert.doesNotMatch(data.answer, /袁绍/, "被剔除片段不进 citations");
+  const data = await agent.processQueryData("袁绍如何起兵", "sango-novel");
+  assert.equal(data.citations.length, 1, "只保留 supported 引用：夏侯惇段被判 unsupported 被剔除");
+  assert.ok(data.citations[0].text.includes("袁绍聚众官于帐中"), "保留片段为聚集起兵的袁绍段");
+  assert.doesNotMatch(data.answer, /\[片段1\]/, "不支撑指针已从正文移除");
+  assert.doesNotMatch(data.answer, /夏侯惇字元让/, "被剔除片段不进 citations");
   assert.match(data.answer, /¹$/, "剩余支撑引用按渲染顺序重编号角标");
-  assert.equal(modelCallCount, 1, "裁剪是确定性动作，不触发兜底模型调用");
+  assert.equal(modelCallCount, 2, "裁剪是复核轮后的确定性动作，不触发兜底模型调用");
 });
 
-test("⑫ 支撑护栏·表字正例不误伤：表字值在片段中 → 原样保留（zi 判定只核值、不核归属）", async () => {
+test("⑭ 复核轮·表字正例不误伤：复核判 supported → 原样返回（语义支撑，不再依赖表字值字面归属）", async () => {
   const entries = [
     {
       id: "sanguo-yanyi:0005:c0002",
@@ -720,7 +878,9 @@ test("⑫ 支撑护栏·表字正例不误伤：表字值在片段中 → 原样
   let modelCallCount = 0;
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
-    return textResponse("夏侯惇字元让。[片段1]");
+    return modelCallCount === 1
+      ? textResponse("夏侯惇字元让。[片段1]")
+      : supportCheckResponse("supported", [["片段1", "supported"]]);
   };
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
     tools: [NOVEL_TOOL],
@@ -734,12 +894,12 @@ test("⑫ 支撑护栏·表字正例不误伤：表字值在片段中 → 原样
     modelCaller,
   });
   const data = await agent.processQueryData("夏侯惇字什么", "sango-novel");
-  assert.ok(data.answer.includes("字元让"), "表字值在片段中：不拒答、不裁剪");
+  assert.ok(data.answer.includes("字元让"), "表字值在片段中：复核判 supported，不拒答、不裁剪");
   assert.equal(data.citations.length, 1);
-  assert.equal(modelCallCount, 1);
+  assert.equal(modelCallCount, 2);
 });
 
-test("⑬ 支撑护栏·数值正例不误伤：中阿同值（答案 55 岁 ↔ 片段「年五十五」）→ 原样保留", async () => {
+test("⑮ 复核轮·数值正例不误伤：中阿同值（答案 55 岁 ↔ 片段「年五十五」）复核判 supported → 原样返回", async () => {
   const entries = [
     {
       id: "sanguo-yanyi:0081:c0007",
@@ -753,7 +913,9 @@ test("⑬ 支撑护栏·数值正例不误伤：中阿同值（答案 55 岁 ↔
   let modelCallCount = 0;
   const modelCaller = async (): Promise<ModelResponse> => {
     modelCallCount += 1;
-    return textResponse("张飞遇害时年55岁。[片段1]");
+    return modelCallCount === 1
+      ? textResponse("张飞遇害时年55岁。[片段1]")
+      : supportCheckResponse("supported", [["片段1", "supported"]]);
   };
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
     tools: [NOVEL_TOOL],
@@ -767,7 +929,212 @@ test("⑬ 支撑护栏·数值正例不误伤：中阿同值（答案 55 岁 ↔
     modelCaller,
   });
   const data = await agent.processQueryData("张飞遇害时多大岁数", "sango-novel");
-  assert.ok(data.answer.includes("55岁"), "数值中阿同值互相支撑：不拒答");
+  assert.ok(data.answer.includes("55岁"), "数值语义等价互相支撑：复核判 supported，不拒答");
   assert.equal(data.citations.length, 1);
-  assert.equal(modelCallCount, 1);
+  assert.equal(modelCallCount, 2);
+});
+
+test("⑯ 复核轮·纯叙述放行（控制组）：叙述句答案引用叙述段，复核判 supported → 原样返回", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0065:c0007",
+      text: "马超与张飞在葭萌关前大战，玄德在城上观战。自白日战至夜，不分胜负。",
+      chapter: 65,
+      title: "马超大战葭萌关　刘备自领益州牧",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return modelCallCount === 1
+      ? textResponse("张飞与马超大战百余合，不分胜负。[片段1]")
+      : supportCheckResponse("supported", [["片段1", "supported"]]);
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "张飞与马超不分胜负",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("张飞和马超谁赢了", "sango-novel");
+  assert.ok(data.answer.includes("不分胜负"), "纯叙述答案不被错误拒答");
+  assert.equal(data.citations.length, 1);
+  assert.equal(modelCallCount, 2);
+});
+
+test("⑰ 复核轮·overall=uncertain 按 unsupported 拒答（宁拒勿猜）", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0005:c0002",
+      text: "夏侯惇字元让，沛国谯人也。族弟夏侯渊。",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return modelCallCount === 1
+      ? textResponse("夏侯渊字妙才。[片段1]")
+      : supportCheckResponse("uncertain", [["片段1", "uncertain"]]);
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "夏侯渊字妙才",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("夏侯渊字什么", "sango-novel");
+  assert.equal(data.answer, "演义中未涉及", "uncertain 按 unsupported 处理（A004 宁拒勿猜）");
+  assert.deepEqual(data.citations, []);
+  assert.equal(modelCallCount, 2);
+});
+
+test("⑱ 复核轮·JSON 解析失败重试 1 次后仍失败 → 按 unsupported 拒答（non-JSON 输出不进入响应）", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0005:c0002",
+      text: "夏侯惇字元让，沛国谯人也。族弟夏侯渊。",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    if (modelCallCount === 1) {
+      return textResponse("夏侯渊字妙才。[片段1]");
+    }
+    return textResponse("这段片段支撑这个结论。"); // 两次复核轮均输出散文（非契约 JSON）
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "夏侯渊字妙才",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("夏侯渊字什么", "sango-novel");
+  assert.equal(data.answer, "演义中未涉及", "解析失败重试 1 次后仍失败 → 按 unsupported 拒答");
+  assert.deepEqual(data.citations, []);
+  assert.equal(modelCallCount, 3, "生成轮 1 次 + 复核轮 2 次（首轮 + 重试）");
+});
+
+test("⑲ 复核轮日志：成功轮记 llm_call_logs（stage=novel_support_check，含输入摘要 / 输出），不加新字段", async () => {
+  const traceId = "bug28-ok-logs-0001";
+  const entries = [
+    {
+      id: "sanguo-yanyi:0005:c0002",
+      text: "夏侯惇字元让，沛国谯人也。",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  const { openai } = scriptedOpenAI([
+    { content: "夏侯惇字元让。[片段1]", finishReason: "stop" },
+    { content: '{"citations":[{"pointer":"片段1","support":"supported"}],"overall":"supported"}', finishReason: "stop" },
+  ]);
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "夏侯惇字元让",
+  });
+  injectOpenAI(agent, openai);
+  store.ensureSkeleton("chat", traceId, "夏侯惇字什么", "sango-novel", Date.now());
+  const data = await runWithTraceId(traceId, () =>
+    agent.processQueryData("夏侯惇字什么", "sango-novel")
+  );
+  store.flush();
+  const detail = store.queryDetail(traceId)!;
+  const checkCalls = detail.llmCalls.filter((call) => call.stage === "novel_support_check");
+  assert.equal(checkCalls.length, 1, "复核判 supported：恰一条 novel_support_check 成功行");
+  assert.equal(checkCalls[0].status, "success");
+  assert.equal(checkCalls[0].attempt, 1);
+  assert.ok(
+    (checkCalls[0].requestSummary ?? "").includes("【注入片段】"),
+    "输入摘要含注入片段全文视图"
+  );
+  assert.ok(
+    (checkCalls[0].responseSummary ?? "").includes("supported"),
+    "输出摘要含契约 JSON"
+  );
+  assert.ok(data.answer.includes("字元让"), "复核判 supported → 原样返回");
+  assert.equal(detail.log.answer, null, "request_logs.answer 由 server 层 markResponded 回填（本单测只验 llm_call_logs）");
+});
+
+test("⑳ 复核轮日志：解析失败 ×2 计数落库（status=failed 标记行复用现有字段，观测解析率）", async () => {
+  const traceId = "bug28-parse-fail-0001";
+  const entries = [
+    {
+      id: "sanguo-yanyi:0005:c0002",
+      text: "夏侯惇字元让，沛国谯人也。族弟夏侯渊。",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  const { openai } = scriptedOpenAI([
+    { content: "夏侯渊字妙才。[片段1]", finishReason: "stop" },
+    { content: "我不知道怎么输出 JSON。", finishReason: "stop" },
+    { content: "还是不会输出 JSON。", finishReason: "stop" },
+  ]);
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "夏侯渊字妙才",
+  });
+  injectOpenAI(agent, openai);
+  store.ensureSkeleton("chat", traceId, "夏侯渊字什么", "sango-novel", Date.now());
+  const data = await runWithTraceId(traceId, () =>
+    agent.processQueryData("夏侯渊字什么", "sango-novel")
+  );
+  store.flush();
+  assert.equal(data.answer, "演义中未涉及", "解析失败重试后仍失败 → 拒答");
+  const detail = store.queryDetail(traceId)!;
+  const checkCalls = detail.llmCalls.filter((call) => call.stage === "novel_support_check");
+  assert.equal(checkCalls.length, 4, "2 次 HTTP 成功行 + 2 个解析失败 failed 标记行");
+  assert.equal(
+    checkCalls.filter((call) => call.status === "success").length,
+    2,
+    "两轮复核调用本身都成功返回"
+  );
+  const failed = checkCalls.filter((call) => call.status === "failed");
+  assert.equal(failed.length, 2, "解析失败计数 = failed 标记行数（观测解析率）");
+  assert.ok(
+    failed.every((call) => call.errorMessage.includes("解析失败")),
+    "失败标记行 error_message 落解析失败原因（复用现有字段，不新增列）"
+  );
 });

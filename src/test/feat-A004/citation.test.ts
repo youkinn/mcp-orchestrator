@@ -8,20 +8,21 @@ import {
   NOVEL_NO_HIT_ANSWER,
   buildFallback,
   buildInjectionView,
-  evaluateFragmentSupport,
-  filterUnsupportedPointers,
   loadAliasTable,
   pickBestFallbackFragment,
   renderAnswerWithCitations,
   scanRecallPersonIds,
   stripOverlongModelQuotes,
-  toArabicNumeral,
   toRecallFragments,
   toSuperscript,
   validateQuotePointers,
   verifyCitation,
   type InjectionView,
 } from "../../citation.js";
+import {
+  parseSupportCheckResult,
+  stripUnsupportedPointers,
+} from "../../supportCheck.js";
 
 test("① 别名表加载：路径指向真实 JSON 时读取生效（含 关羽=P002）", () => {
   const dir = mkdtempSync(join(tmpdir(), "a004-alias-"));
@@ -816,99 +817,133 @@ test("⑲.2 非法 / 越界 offset、len：只跳过该条，不崩、不插错�
   );
 });
 
-// ===== bug-00028：支撑护栏判定（零 LLM 规则）——纯函数级用例 =====
 
-test("⑳ 中文数字 → 阿拉伯：六十三/十三/二十四年/二零二六/四十五万/十三万 各就各位", () => {
-  assert.equal(toArabicNumeral("六十三"), 63);
-  assert.equal(toArabicNumeral("十三"), 13);
-  assert.equal(toArabicNumeral("五十四"), 54);
-  assert.equal(toArabicNumeral("二十四"), 24);
-  assert.equal(toArabicNumeral("二零二六"), 2026);
-  assert.equal(toArabicNumeral("十三万"), 130000);
-  assert.equal(toArabicNumeral("四十五万"), 450000);
-  assert.equal(toArabicNumeral("千万"), 10000000);
-  assert.equal(toArabicNumeral("甲乙"), null, "非数字串不可解析");
-  assert.equal(toArabicNumeral(""), null);
-});
+// ===== bug-00028：复核轮判定契约（novel_support_check）——纯函数级用例 =====
+// 语义裁决移交 LLM 复核轮（supportCheck.ts），词表型信号（死亡 / 数值同值 / 表字值）已删除，
+// 本组只测契约 JSON 的解析（熔断）与按 support 值的裁剪动作，不测任何语义规则。
 
-test("⑳.1 支撑判定·人物锚点：被引用片段不含答案断言人物 → person 不支撑", () => {
-  const alias = loadAliasTable("bug28-not-exist");
-  const reason = evaluateFragmentSupport(
-    "袁绍聚众官于帐中，商议起兵。",
-    "夏侯渊随曹操破吕布。",
-    "夏侯渊怎么打败吕布的",
-    alias
+test("⑳ 复核轮契约：正常 JSON 解析（supported / unsupported 混合 + overall）", () => {
+  const parsed = parseSupportCheckResult(
+    '{"citations":[{"pointer":"片段1","support":"supported"},{"pointer":"Q1","support":"unsupported"}],"overall":"supported"}'
   );
-  assert.equal(reason, "person");
+  assert.deepEqual(parsed, {
+    citations: [
+      { pointer: "片段1", support: "supported" },
+      { pointer: "Q1", support: "unsupported" },
+    ],
+    overall: "supported",
+  });
 });
 
-test("⑳.2 支撑判定·数值：答案数值片段无同值（原样 / 中阿同值均无）→ numeric 不支撑", () => {
-  const alias = loadAliasTable("bug28-not-exist");
-  const reason = evaluateFragmentSupport(
-    "周瑜令甘宁引兵追赶玄德。",
-    "刘备死的时候六十三岁。",
-    "刘备死的时候多少岁",
-    alias
+test("⑳.1 复核轮契约·uncertain 取值合法：不属于放宽动作，由调用方按 unsupported 拒答", () => {
+  const parsed = parseSupportCheckResult(
+    '{"citations":[{"pointer":"片段1","support":"uncertain"}],"overall":"uncertain"}'
   );
-  assert.equal(reason, "numeric");
+  assert.deepEqual(parsed, {
+    citations: [{ pointer: "片段1", support: "uncertain" }],
+    overall: "uncertain",
+  });
 });
 
-test("⑳.3 支撑判定·表字值：表字问句答案值不在片段 → zi-value 不支撑", () => {
-  const alias = loadAliasTable("bug28-not-exist");
-  const reason = evaluateFragmentSupport(
-    "夏侯惇字元让，沛国谯人也。族弟夏侯渊。",
-    "夏侯渊字妙才。",
-    "夏侯渊字什么",
-    alias
+test("⑳.2 复核轮契约·解析失败熔断：非 JSON / 空串 / 围栏外多余文字 → null（调用方重试 1 次后按 unsupported 拒答）", () => {
+  assert.equal(parseSupportCheckResult("马超投靠刘备后病逝。"), null, "散文输出非契约 JSON");
+  assert.equal(parseSupportCheckResult(""), null, "空输出");
+  assert.equal(parseSupportCheckResult("   \n  "), null, "纯空白输出");
+  assert.equal(
+    parseSupportCheckResult('解释了半天 {"overall":"supported","citations":[]} 结尾'),
+    null,
+    "JSON 前后夹带解释文字 → 非严格 JSON"
   );
-  assert.equal(reason, "zi-value");
 });
 
-test("⑳.4 支撑判定·死亡事件：答案宣称病逝、片段无死亡证据词 → death 不支撑", () => {
-  const alias = loadAliasTable("bug28-not-exist");
-  const reason = evaluateFragmentSupport(
-    "马腾受衣带诏，与马超商议，欲除曹操。",
-    "马超投靠刘备后，最终病逝。",
-    "马超投靠刘备后，后来如何了",
-    alias
+test("⑳.3 复核轮契约·```json 围栏容错：围栏包裹的合法 JSON 可解析（模型偶发围栏不判死）", () => {
+  const fenced = [
+    "```json",
+    '{"citations":[{"pointer":"片段1","support":"supported"}],"overall":"supported"}',
+    "```",
+  ].join("\n");
+  const parsed = parseSupportCheckResult(fenced);
+  assert.equal(parsed?.overall, "supported");
+  assert.equal(parsed?.citations[0]?.pointer, "片段1");
+});
+
+test("⑳.4 复核轮契约·字段缺失熔断：overall 缺 / citations 非数组 / pointer 空 / support 非法 → null", () => {
+  assert.equal(
+    parseSupportCheckResult('{"citations":[],"overall":"judged"}'),
+    null,
+    "overall 取值非法"
   );
-  assert.equal(reason, "death");
-});
-
-test("⑳.5 支撑判定·正例：人物在片段 + 无数值/表字/死亡触发 → 支撑（null）", () => {
-  const alias = loadAliasTable("bug28-not-exist");
-  const reason = evaluateFragmentSupport(
-    "云长提刀出阵，斩华雄于帐前！",
-    "斩华雄者系关羽，原文见[Q1]。",
-    "谁斩了华雄？",
-    alias
+  assert.equal(
+    parseSupportCheckResult('{"citations":[],"overall":null}'),
+    null,
+    "overall 缺失（null）"
   );
-  assert.equal(reason, null);
-});
-
-test("⑳.6 支撑判定·中阿同值：答案 55 岁 ↔ 片段「年五十五」互相支撑（不误杀合法数值答案）", () => {
-  const alias = loadAliasTable("bug28-not-exist");
-  const reason = evaluateFragmentSupport(
-    "原来张飞每睡不合眼；二贼以短刀刺入飞腹。飞大叫一声而亡。时年五十五。",
-    "张飞遇害时年55岁。",
-    "张飞遇害时多大岁数",
-    alias
+  assert.equal(
+    parseSupportCheckResult('{"citations":[],"overall":"supported","extra":1}')?.overall,
+    "supported",
+    "多余字段容忍，不影响契约字段校验"
   );
-  assert.equal(reason, null);
+  assert.equal(
+    parseSupportCheckResult('[{"pointer":"片段1","support":"supported"}]'),
+    null,
+    "顶层数组（非对象）→ 熔断"
+  );
+  assert.equal(
+    parseSupportCheckResult('{"citations":{},"overall":"supported"}'),
+    null,
+    "citations 非数组 → 熔断"
+  );
+  assert.equal(
+    parseSupportCheckResult('{"citations":[{"pointer":"","support":"supported"}],"overall":"supported"}'),
+    null,
+    "pointer 为空串 → 熔断"
+  );
+  assert.equal(
+    parseSupportCheckResult('{"citations":[{"pointer":"片段1"}],"overall":"supported"}'),
+    null,
+    "support 缺失 → 熔断"
+  );
+  assert.equal(
+    parseSupportCheckResult('{"citations":[{"pointer":"片段1","support":"maybe"}],"overall":"supported"}'),
+    null,
+    "support 取值非法 → 熔断"
+  );
+  assert.equal(
+    parseSupportCheckResult('{"citations":[null],"overall":"supported"}'),
+    null,
+    "citations 条目非对象 → 熔断"
+  );
 });
 
-test("⑳.7 逐条过滤：指针剥离只影响答案中的引用标记，不影响答案正文", () => {
-  const alias = loadAliasTable("bug28-not-exist");
-  const fragments = [
-    {
-      text: "夏侯惇字元让，沛国谯人也。族弟夏侯渊。",
-      source: "《三国演义》",
-      chapter: 5,
-    },
-  ];
-  const view = buildInjectionView(fragments, "夏侯渊字什么");
-  const result = filterUnsupportedPointers("夏侯渊字妙才。[片段1]", view, "夏侯渊字什么", alias);
-  assert.deepEqual(result.kept, []);
-  assert.deepEqual(result.dropped, ["片段1"]);
-  assert.equal(result.answer, "夏侯渊字妙才。", "指针移除后正文原样保留（是否拒答由调用方按 kept 空判定）");
+test("⑳.5 裁剪·部分支撑：只留 supported 引用、摘除 unsupported / uncertain / 未覆盖指针，正文不动", () => {
+  const { answer, kept } = stripUnsupportedPointers(
+    "夏侯渊随曹操讨吕布，大破之。[片段1][片段2]",
+    [
+      { pointer: "片段1", support: "supported" },
+      { pointer: "片段2", support: "unsupported" },
+    ]
+  );
+  assert.deepEqual(kept, ["片段1"]);
+  assert.equal(answer, "夏侯渊随曹操讨吕布，大破之。[片段1]", "被摘除指针只去掉标记，正文原样保留");
+});
+
+test("⑳.6 裁剪·uncertain 与未覆盖指针同样摘除（宁缺毋滥）；复核轮漏判的指针不保留", () => {
+  const { answer, kept } = stripUnsupportedPointers(
+    "斩华雄者系关羽，原文见[Q1]，另有[片段3]。",
+    [
+      { pointer: "Q1", support: "uncertain" },
+      { pointer: "片段3", support: "supported" },
+    ]
+  );
+  assert.deepEqual(kept, ["片段3"]);
+  assert.equal(answer, "斩华雄者系关羽，原文见，另有[片段3]。", "uncertain 指针摘除、未覆盖指针摘除");
+});
+
+test("⑳.7 裁剪·全不支撑 → kept 空（调用方据此拒答「演义中未涉及」）；重复出现一并摘除", () => {
+  const { answer, kept } = stripUnsupportedPointers(
+    "马超投靠刘备后，最终病逝。[片段2][片段2]",
+    [{ pointer: "片段2", support: "unsupported" }]
+  );
+  assert.deepEqual(kept, []);
+  assert.equal(answer, "马超投靠刘备后，最终病逝。", "指针全部摘除、重复出现一并摘除");
 });

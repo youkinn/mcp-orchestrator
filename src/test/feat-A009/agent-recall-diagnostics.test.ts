@@ -69,6 +69,19 @@ function textResponse(text: string): ModelResponse {
   return { content: [{ type: 'text', text }] };
 }
 
+/** 复核轮（novel_support_check）假 LLM 返回：契约 JSON（bug-00028；见 supportCheck.ts） */
+function supportCheckResponse(
+  overall: string,
+  citations: Array<[string, string]>
+): ModelResponse {
+  return textResponse(
+    JSON.stringify({
+      overall,
+      citations: citations.map(([pointer, support]) => ({ pointer, support })),
+    })
+  );
+}
+
 const ALIAS_TABLE = loadAliasTable('a009-not-exist'); // stub 别名表（关羽=P002、华雄=P013）
 
 const F1_QUOTE = '云长提刀出阵，斩华雄于帐前！';
@@ -164,7 +177,15 @@ test('① 快路径：候选进注入视图 → candidates[].injected=true + fun
         recallResult(makeDiagnostics(3, [candidate(1, CHUNK_1), candidate(2, CHUNK_2), candidate(3, CHUNK_3)]), 1),
     },
     fallbackConcluder: async () => '斩华雄者系关羽',
-    modelCaller: async () => textResponse('斩华雄者。[片段3]'),
+    modelCaller: (() => {
+      let callCount = 0;
+      return async (): Promise<ModelResponse> => {
+        callCount += 1;
+        return callCount === 1
+          ? textResponse('斩华雄者。[片段3]')
+          : supportCheckResponse('supported', [['片段3', 'supported']]);
+      };
+    })(),
     retrievalDiagnosticsPersister: (traceId, seq, diagnostics) => {
       recorded.push({ traceId, seq, diagnostics: diagnostics as Record<string, unknown> });
     },
@@ -200,7 +221,15 @@ test('② 被引用片段 → candidates[].cited=true + funnel.cited 计数', as
         recallResult(makeDiagnostics(3, [candidate(1, CHUNK_1), candidate(2, CHUNK_2), candidate(3, CHUNK_3)]), 1),
     },
     fallbackConcluder: async () => '斩华雄者系关羽',
-    modelCaller: async () => textResponse('按原文，斩华雄者系关羽。[Q1]'),
+    modelCaller: (() => {
+      let callCount = 0;
+      return async (): Promise<ModelResponse> => {
+        callCount += 1;
+        return callCount === 1
+          ? textResponse('按原文，斩华雄者系关羽。[Q1]')
+          : supportCheckResponse('supported', [['Q1', 'supported']]);
+      };
+    })(),
     retrievalDiagnosticsPersister: (_traceId, _seq, diagnostics) => {
       recorded.push({ diagnostics: diagnostics as Record<string, unknown> });
     },
@@ -235,7 +264,15 @@ test('③ 未进 top-N 候选不标记：诊断含第 4 条候选、工具仅返
         ),
     },
     fallbackConcluder: async () => '斩华雄者系关羽',
-    modelCaller: async () => textResponse('斩华雄者。[片段3]'),
+    modelCaller: (() => {
+      let callCount = 0;
+      return async (): Promise<ModelResponse> => {
+        callCount += 1;
+        return callCount === 1
+          ? textResponse('斩华雄者。[片段3]')
+          : supportCheckResponse('supported', [['片段3', 'supported']]);
+      };
+    })(),
     retrievalDiagnosticsPersister: (_traceId, _seq, diagnostics) => {
       recorded.push({ diagnostics: diagnostics as Record<string, unknown> });
     },
@@ -262,7 +299,15 @@ test('④ 落库失败旁路：persister 抛错不影响 /api/chat 响应与 dat
         recallResult(makeDiagnostics(3, [candidate(1, CHUNK_1), candidate(2, CHUNK_2), candidate(3, CHUNK_3)]), 1),
     },
     fallbackConcluder: async () => '斩华雄者系关羽',
-    modelCaller: async () => textResponse('按原文，斩华雄者系关羽。[Q1]'),
+    modelCaller: (() => {
+      let callCount = 0;
+      return async (): Promise<ModelResponse> => {
+        callCount += 1;
+        return callCount === 1
+          ? textResponse('按原文，斩华雄者系关羽。[Q1]')
+          : supportCheckResponse('supported', [['Q1', 'supported']]);
+      };
+    })(),
     retrievalDiagnosticsPersister: () => {
       persisted += 1;
       throw new Error('db down');
@@ -294,7 +339,9 @@ test('⑤ auto 分类编号 1 → 确定性预调注入：injected/cited 正常�
       // A011 起 auto 首轮为无 tools 分类轮：模型只输出编号，检索由服务端按编号确定性预调，不再模型自主调工具
       return callCount === 1
         ? textResponse('1')
-        : textResponse('按原文，斩华雄者系关羽。[Q1]');
+        : callCount === 2
+          ? textResponse('按原文，斩华雄者系关羽。[Q1]')
+          : supportCheckResponse('supported', [['Q1', 'supported']]);
     },
     retrievalDiagnosticsPersister: (_traceId, _seq, diagnostics) => {
       recorded.push({ diagnostics: diagnostics as Record<string, unknown> });

@@ -22,7 +22,6 @@ import {
   buildFallback,
   buildInjectionView,
   extractCitePointers,
-  filterUnsupportedPointers,
   loadAliasTable,
   pickBestFallbackFragment,
   renderAnswerWithCitations,
@@ -35,6 +34,13 @@ import {
   type InjectionView,
   type RecallFragment,
 } from "./citation.js";
+import {
+  SUPPORT_CHECK_STAGE,
+  SUPPORT_CHECK_SYSTEM_PROMPT,
+  parseSupportCheckResult,
+  stripUnsupportedPointers,
+  type SupportCheckResult,
+} from "./supportCheck.js";
 import {
   computePickedIndices,
   extractEntryChunkIds,
@@ -49,7 +55,8 @@ export type { ChatData } from "./citation.js";
 
 // feat-A007 埋点辅助（旁路静默）：序列化失败兜底 String，统一 8000 截断
 // feat-A011：auto 首轮从「带工具自主决策（routing）」改为「无 tools 轻量分类（classify）」，枚举同步
-type LlmStage = "classify" | "generation";
+// bug-00028：复核轮 stage novel_support_check（演义域生成轮后的语义支撑裁决，见 supportCheck.ts）
+type LlmStage = "classify" | "generation" | typeof SUPPORT_CHECK_STAGE;
 
 interface ModelCallOptions {
   disableThinking?: boolean;
@@ -778,6 +785,80 @@ export class Agent {
       .trim();
   }
 
+  /** bug-00028 复核轮（stage=novel_support_check）：语义裁决移交 LLM，规则层只剩结构门。
+   * 输入 = 注入片段全文（同生成轮视图）+ 模型答案 + 引用指针清单；输出仅契约 JSON（supportCheck.ts）。
+   * 复用生成轮同一条 invokeModel 通道（同一模型 / 配置 / 凭据 / llm_call_logs 落库），不新增第二套入口；
+   * 解析失败（非 JSON / 字段缺失）→ 同一输入重试 1 次 → 仍失败返回 null（调用方按 unsupported 拒答，
+   * 宁拒勿猜）；解析失败另行落 failed 标记行（复用 llm_call_logs 现有字段，观测解析率）。 */
+  private async runNovelSupportCheck(
+    answer: string,
+    view: InjectionView,
+    pointerTexts: string[]
+  ): Promise<SupportCheckResult | null> {
+    const messages: any[] = [
+      { role: "system", content: SUPPORT_CHECK_SYSTEM_PROMPT },
+      {
+        role: "user",
+        content: [
+          "【注入片段】",
+          view.text,
+          "【模型答案】",
+          answer,
+          "【引用指针清单】",
+          [...new Set(pointerTexts)].join("、"),
+        ].join("\n\n"),
+      },
+    ];
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const response = await this.invokeModel(
+        messages,
+        [],
+        SUPPORT_CHECK_STAGE,
+        { disableThinking: true, temperature: 0 }
+      );
+      const text = response.content
+        .filter((item) => item.type === "text")
+        .map((item) => item.text!)
+        .join("\n")
+        .trim();
+      const verdict = parseSupportCheckResult(text);
+      if (verdict) {
+        return verdict;
+      }
+      this.logSupportCheckParseFailure(messages, text, attempt);
+    }
+    return null;
+  }
+
+  /** 复核轮解析失败落库：status=failed 的标记行（复用 llm_call_logs 现有表结构与字段，不新增列）。
+   * 观测口径：stage=novel_support_check 且 status=failed 的行数 / 该 stage 总行数 = 解析失败率；
+   * 无 trace 上下文（单元测试等）不落库；旁路静默，绝不影响复核轮主流程。 */
+  private logSupportCheckParseFailure(
+    messages: any[],
+    output: string,
+    attempt: number
+  ): void {
+    const traceId = getTraceId();
+    if (typeof traceId !== "string" || traceId === "") {
+      return;
+    }
+    try {
+      appendLlmCall(traceId, {
+        stage: SUPPORT_CHECK_STAGE,
+        model: this.config.model,
+        requestAt: Date.now(),
+        responseAt: Date.now(),
+        requestSummary: summarizeJson(messages),
+        responseSummary: summarizeJson([{ type: "text", text: output }]),
+        attempt,
+        status: "failed",
+        errorMessage: "novel_support_check 解析失败：输出非契约 JSON",
+      });
+    } catch {
+      // 旁路：埋点失败静默
+    }
+  }
+
   /**
    * feat-A004/A006：引用硬校验（本地别名表扫描，0 次 LLM）+ 指针校验 + 服务端渲染引文与 citations。
    * 模型只输出「结论 + 指针」（`[Qn]`）：指针合法（∈ 本次注入的 qid）且断言人物 ⊆ 召回人物 →
@@ -826,15 +907,27 @@ export class Agent {
     const asserted = [...assertedIds].map((id) => ({ name: id, id }));
     const check = verifyCitation(asserted, recallText, recallPersonIds);
     if (pointer.ok && check.ok) {
-      // bug-00028：支撑护栏（零 LLM）——逐条引用判定是否支撑结论。
-      // 无任何支撑引用 -> 按 A004 拒答（正文「演义中未涉及」+ 清空引用，拒答类不写缓存，见 cache.ts record）；
-      // 有支撑但部分引用挂错 -> 只去掉不支撑的引用、保留其余（指针与 citations 同步裁掉，funnel.cited 随之回填）。
-      const filtered = filterUnsupportedPointers(
+      // bug-00028 复核轮（定稿设计 novel-answer-support-check.md）：语义裁决移交 LLM stage
+      // novel_support_check，词表型信号（死亡 / 数值同值 / 表字值）已删除，本分支不再有任何语义规则。
+      // 动作映射：overall=unsupported / uncertain（宁拒勿猜）/ 解析失败重试后仍失败 → 拒答
+      // 「演义中未涉及」+ 清空引用（A004 红线，拒答类不写缓存规则不变，见 cache.ts record）；
+      // 部分支撑 → 只留 supported 引用、指针重编号、citations 与 funnel.cited 回填；无支撑引用留存 → 同样拒答。
+      const verdict = await this.runNovelSupportCheck(
         cleaned,
         view,
-        query,
-        this.getAliasTable()
+        pointer.pointers
       );
+      if (
+        verdict === null ||
+        verdict.overall === "unsupported" ||
+        verdict.overall === "uncertain"
+      ) {
+        return {
+          data: { answer: NOVEL_NO_HIT_ANSWER, citations: [] },
+          citedChunkIds: new Set(),
+        };
+      }
+      const filtered = stripUnsupportedPointers(cleaned, verdict.citations);
       if (filtered.kept.length === 0) {
         return {
           data: { answer: NOVEL_NO_HIT_ANSWER, citations: [] },
