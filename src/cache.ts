@@ -248,6 +248,8 @@ export interface CacheLogPayload {
   hitLine: number;
   hit: boolean;
   tieHits: number | null;
+  /** 本次请求缓存判定耗时（毫秒，含 embedding 冷启动）；undefined/null=未采集 */
+  lookupMs?: number | null;
 }
 
 /** cache_entries 镜像行（§2.1 列一一对应）；id 与内存 LRU 条目同值 */
@@ -299,7 +301,7 @@ export interface CacheEntry {
 /** 未命中 reason 枚举（§3.10）：低相似 / 灰色区 / 歧义 / 焦点拒判 */
 export type CacheMissReason = "miss-low" | "miss-gray" | "miss-tie" | "miss-focus";
 
-/** lookup 判定结果（命中携带答案深拷贝；未命中供 record 内部判定写缓存） */
+/** lookup 判定结果（命中携带答案深拷贝；未命中供 record 内部判定写缓存）；lookupMs = 本次判定耗时毫秒（入口起至返回构造，含 embedding 冷启动） */
 export type CacheLookupResult =
   | {
       hit: true;
@@ -310,6 +312,7 @@ export type CacheLookupResult =
       data: ChatData;
       embedding: Float32Array;
       userQuery: string;
+      lookupMs: number;
     }
   | {
       hit: false;
@@ -319,6 +322,7 @@ export type CacheLookupResult =
       tieHits: number | null;
       embedding: Float32Array;
       userQuery: string;
+      lookupMs: number;
     };
 
 export interface CacheStatus {
@@ -520,9 +524,12 @@ export class CacheManager {
   /**
    * 命中判定（§1.2）：开关 → embedding（唯一异步点）→ LRU 全扫（cosine 全精度、落库 4 位小数）。
    * 返回 null = 旁路（开关关闭 / embedding 降级），不查不写不落 cache_logs；
-   * 命中 / 未命中一律落一行 cache_logs（traceId 为空时跳过，失败旁路静默）。
+   * 命中 / 未命中一律落一行 cache_logs（traceId 为空时跳过，失败旁路静默）；
+   * 结果统一携带 lookupMs（判定耗时毫秒，入口起至返回构造完成，含 embedding 冷启动；旁路不落库无需携带）。
    */
   async lookup(query: string, traceId: string): Promise<CacheLookupResult | null> {
+    // 判定计时起点（入口起算，含 embedding 冷启动；旁路 return null 不落库，无需 lookupMs）
+    const lookupStartedAt = performance.now();
     // 步骤 0：开关检查
     if (!this.enabled) {
       return null;
@@ -537,7 +544,7 @@ export class CacheManager {
       return null;
     }
     // 步骤 2：同步判定段（无 await；与后台清除 / 删除 / 开关的执行序见 §1.8）
-    return this.judge(judgedQuery, embedding, traceId, userQuery);
+    return this.judge(judgedQuery, embedding, traceId, userQuery, lookupStartedAt);
   }
 
   /**
@@ -635,12 +642,14 @@ export class CacheManager {
   }
 
   /** §1.2 步骤 2：内存 LRU 同步判定 + §2.4 cache_logs 落一行（判定完成即落，LLM 之前）。
+   * lookupMs = 自 lookup 入口起的判定耗时（构造结果时取 performance.now 差值，落库与结果一致）。
    * judgedQuery = 归一化后判定文本（字号→本名）；userQuery = 原始文本（落库 / 条目展示） */
   private judge(
     judgedQuery: string,
     embedding: Float32Array,
     traceId: string,
-    userQuery: string
+    userQuery: string,
+    lookupStartedAt: number
   ): CacheLookupResult {
     // §1.6 版本失效：条目 versionTag ≠ CACHE_VERSION → 全量清除一次 + warn，本次按池空判定
     const staleIndex = this.entries.findIndex(
@@ -662,6 +671,7 @@ export class CacheManager {
         tieHits: null,
         embedding,
         userQuery,
+        lookupMs: performance.now() - lookupStartedAt,
       };
       this.appendCacheLog(traceId, result);
       return result;
@@ -690,6 +700,7 @@ export class CacheManager {
         tieHits: candidates.length,
         embedding,
         userQuery,
+        lookupMs: performance.now() - lookupStartedAt,
       };
       this.appendCacheLog(traceId, result);
       return result;
@@ -706,6 +717,7 @@ export class CacheManager {
           tieHits: 1,
           embedding,
           userQuery,
+          lookupMs: performance.now() - lookupStartedAt,
         };
         this.appendCacheLog(traceId, result);
         return result;
@@ -732,6 +744,7 @@ export class CacheManager {
         data: deepClone(candidate.entry.answerObject),
         embedding,
         userQuery,
+        lookupMs: performance.now() - lookupStartedAt,
       };
       this.appendCacheLog(traceId, result);
       return result;
@@ -746,6 +759,7 @@ export class CacheManager {
       tieHits: 0,
       embedding,
       userQuery,
+      lookupMs: performance.now() - lookupStartedAt,
     };
     this.appendCacheLog(traceId, result);
     return result;
@@ -764,6 +778,7 @@ export class CacheManager {
         hitLine: this.hitLine,
         hit: result.hit,
         tieHits: result.tieHits,
+        lookupMs: result.lookupMs,
       });
     } catch {
       // 旁路静默：判定不受日志失败影响

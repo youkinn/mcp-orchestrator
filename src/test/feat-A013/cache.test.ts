@@ -397,6 +397,41 @@ test("lookup：embed 降级（isError / 抛异常 / 出参非法）→ 等同开
   }
 });
 
+test("lookup：返回值与 cache_logs payload 统一携带 lookupMs（≥0 有限毫秒）；旁路不落库不受影响", async () => {
+  const { manager, logStore, embed } = makeManager();
+  embed.vectors.set("谁斩了华雄", unitVector(5));
+
+  // 池空 → miss-low：结果与 payload 同步携带 lookupMs（mock logStore 捕获）
+  const miss = await manager.lookup("谁斩了华雄", "lm1");
+  assert.equal(miss?.hit, false, "池空应返回未命中结果");
+  assert.ok(miss, "未命中应返回结果对象（非旁路）");
+  assert.ok(
+    Number.isFinite(miss.lookupMs) && miss.lookupMs >= 0,
+    "未命中结果应携带 lookupMs（≥0 的有限毫秒数）"
+  );
+  const missRow = logRow(logStore, "lm1");
+  assert.equal(missRow.lookupMs, miss.lookupMs, "未命中 payload 应收到与结果一致的 lookupMs");
+
+  // 入池后二次请求 → 命中：命中路径同样携带 lookupMs
+  manager.record("谁斩了华雄", "lm1", miss, ANSWER);
+  const hit = await manager.lookup("谁斩了华雄", "lm2");
+  assert.equal(hit?.hit, true, "二次请求应命中");
+  assert.ok(hit, "命中应返回结果对象（非旁路）");
+  assert.ok(
+    Number.isFinite(hit.lookupMs) && hit.lookupMs >= 0,
+    "命中结果应携带 lookupMs（≥0 的有限毫秒数）"
+  );
+  const hitRow = logRow(logStore, "lm2");
+  assert.equal(hitRow.lookupMs, hit.lookupMs, "命中 payload 应收到与结果一致的 lookupMs");
+
+  // 旁路（enabled=false → return null）：不落库、不影响已落行
+  manager.setEnabled(false);
+  const bypass = await manager.lookup("谁斩了华雄", "lm3");
+  assert.equal(bypass, null, "开关关闭应旁路返回 null");
+  assert.equal(logStore.cacheLogs.length, 2, "旁路不新增 cache_logs 行");
+  assert.equal(logRow(logStore, "lm1").lookupMs, miss.lookupMs, "旁路不污染已落行");
+});
+
 test("lookup：版本失效——条目 versionTag ≠ CACHE_VERSION → 全量清除一次 + console.warn，本次按池空 miss-low 判定", async () => {
   const warns: string[] = [];
   const originalWarn = console.warn;
