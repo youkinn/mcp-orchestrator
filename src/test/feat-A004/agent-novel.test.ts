@@ -542,3 +542,232 @@ test("⑦ 注入上限放宽到 10 + 叙述段指针（bug-00009 张飞题）：
   assert.doesNotMatch(data.answer, /【原文片段】/, "指针合法不走兜底");
   assert.equal(modelCallCount, 2, "校验通过不触发兜底结论归纳");
 });
+
+// ===== bug-00028：生成轮支撑护栏（零 LLM）——三例回归 + 正例控制组 =====
+// 判定动作：无任何支撑引用 → 拒答「演义中未涉及」+ 清空引用；有支撑但引用挂错 → 只去不支撑引用。
+// 全部走 domain=sango-novel 标签锁域快路径：模型仅 1 次生成轮调用（拒答/裁剪均不触发兜底模型调用）。
+
+test("⑧ 支撑护栏·例2 夏侯渊字什么（演义原文本无夏侯渊的字）：表字值不在注入片段 → 拒答", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0005:c0002",
+      text: "夏侯惇字元让，沛国谯人也。族弟夏侯渊。",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return textResponse("夏侯渊字妙才。[片段1]");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "夏侯渊字妙才",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("夏侯渊字什么", "sango-novel");
+  assert.equal(data.answer, "演义中未涉及", "演义原文无该信息：凭先验作答应被护栏改写为拒答");
+  assert.deepEqual(data.citations, [], "拒答清空引用");
+  assert.equal(modelCallCount, 1, "拒答是后置确定性动作，不触发兜底结论模型调用");
+});
+
+test("⑨ 支撑护栏·例3 刘备死的时候多少岁：答案数值六十三不在注入片段 → 拒答", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0055:c0009",
+      text: "孙权闻玄德与孙夫人已去，急召周瑜商议。周瑜曰：“可速追之。”遂令甘宁、凌统引兵追赶。",
+      chapter: 55,
+      title: "玄德智激孙夫人　孔明二气周瑜",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return textResponse("刘备死的时候六十三岁。[片段1]");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "刘备六十三岁",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("刘备死的时候多少岁", "sango-novel");
+  assert.equal(data.answer, "演义中未涉及", "片段无年龄事实，模型凭史实先验作答应被拒答");
+  assert.deepEqual(data.citations, []);
+  assert.equal(modelCallCount, 1);
+});
+
+test("⑩ 支撑护栏·例1 马超投靠刘备后如何：注入片段无结局内容（五虎/病逝无证据）→ 拒答", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0065:c0007",
+      text: "马超与张飞在葭萌关前大战，玄德在城上观战。自白日战至夜，不分胜负。",
+      chapter: 65,
+      title: "马超大战葭萌关　刘备自领益州牧",
+      type: "narration",
+      quotes: [],
+    },
+    {
+      id: "sanguo-yanyi:0057:c0016",
+      text: "马腾受衣带诏，与马超商议，欲除曹操。",
+      chapter: 57,
+      title: "柴桑口卧龙吊丧　耒阳县凤雏理事",
+      type: "narration",
+      quotes: [],
+    },
+    {
+      id: "sanguo-yanyi:0058:c0002",
+      text: "马超与韩遂合兵，在潼关与曹操对峙。",
+      chapter: 58,
+      title: "马孟起兴兵雪恨　曹阿瞒割须弃袍",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return textResponse("马超投靠刘备后，成为蜀汉五虎上将之一，最终病逝。[片段2]");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "马超病逝",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("马超投靠刘备后，后来如何了", "sango-novel");
+  assert.equal(data.answer, "演义中未涉及", "注入片段（衣带诏等）无「五虎/病逝」结局证据 → 拒答");
+  assert.deepEqual(data.citations, []);
+  assert.equal(modelCallCount, 1);
+});
+
+test("⑪ 支撑护栏·部分支撑：只去不支撑引用、保留支撑引用（tier 2），引用清空则整答拒答", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0005:c0002",
+      text: "夏侯惇字元让，沛国谯人也。族弟夏侯渊。",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      type: "narration",
+      quotes: [],
+    },
+    {
+      id: "sanguo-yanyi:0009:c0003",
+      text: "袁绍聚众官于帐中，商议起兵。",
+      chapter: 9,
+      title: "除暴凶吕布助司徒　犯长安李傕听贾诩",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return textResponse("夏侯渊随曹操讨吕布，大破之。[片段1][片段2]");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "夏侯渊随曹操破吕布",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("夏侯渊怎么打败吕布的", "sango-novel");
+  assert.equal(data.citations.length, 1, "只保留支撑引用：袁绍段无人锚点被剔除");
+  assert.ok(data.citations[0].text.includes("夏侯惇字元让"), "保留片段为含夏侯渊的片段");
+  assert.doesNotMatch(data.answer, /\[片段2\]/, "不支撑指针已从正文移除");
+  assert.doesNotMatch(data.answer, /袁绍/, "被剔除片段不进 citations");
+  assert.match(data.answer, /¹$/, "剩余支撑引用按渲染顺序重编号角标");
+  assert.equal(modelCallCount, 1, "裁剪是确定性动作，不触发兜底模型调用");
+});
+
+test("⑫ 支撑护栏·表字正例不误伤：表字值在片段中 → 原样保留（zi 判定只核值、不核归属）", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0005:c0002",
+      text: "夏侯惇字元让，沛国谯人也。",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return textResponse("夏侯惇字元让。[片段1]");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "夏侯惇字元让",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("夏侯惇字什么", "sango-novel");
+  assert.ok(data.answer.includes("字元让"), "表字值在片段中：不拒答、不裁剪");
+  assert.equal(data.citations.length, 1);
+  assert.equal(modelCallCount, 1);
+});
+
+test("⑬ 支撑护栏·数值正例不误伤：中阿同值（答案 55 岁 ↔ 片段「年五十五」）→ 原样保留", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0081:c0007",
+      text: "原来张飞每睡不合眼；二贼以短刀刺入飞腹。飞大叫一声而亡。时年五十五。",
+      chapter: 81,
+      title: "急兄仇张飞遇害　雪弟恨先主兴兵",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return textResponse("张飞遇害时年55岁。[片段1]");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "张飞五十五岁遇害",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("张飞遇害时多大岁数", "sango-novel");
+  assert.ok(data.answer.includes("55岁"), "数值中阿同值互相支撑：不拒答");
+  assert.equal(data.citations.length, 1);
+  assert.equal(modelCallCount, 1);
+});

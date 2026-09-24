@@ -8,11 +8,14 @@ import {
   NOVEL_NO_HIT_ANSWER,
   buildFallback,
   buildInjectionView,
+  evaluateFragmentSupport,
+  filterUnsupportedPointers,
   loadAliasTable,
   pickBestFallbackFragment,
   renderAnswerWithCitations,
   scanRecallPersonIds,
   stripOverlongModelQuotes,
+  toArabicNumeral,
   toRecallFragments,
   toSuperscript,
   validateQuotePointers,
@@ -811,4 +814,101 @@ test("⑲.2 非法 / 越界 offset、len：只跳过该条，不崩、不插错�
     "[片段1] 甲曰：⟨Q1⟩“乙。”",
     "越界定位跳过，合法定位照常编号"
   );
+});
+
+// ===== bug-00028：支撑护栏判定（零 LLM 规则）——纯函数级用例 =====
+
+test("⑳ 中文数字 → 阿拉伯：六十三/十三/二十四年/二零二六/四十五万/十三万 各就各位", () => {
+  assert.equal(toArabicNumeral("六十三"), 63);
+  assert.equal(toArabicNumeral("十三"), 13);
+  assert.equal(toArabicNumeral("五十四"), 54);
+  assert.equal(toArabicNumeral("二十四"), 24);
+  assert.equal(toArabicNumeral("二零二六"), 2026);
+  assert.equal(toArabicNumeral("十三万"), 130000);
+  assert.equal(toArabicNumeral("四十五万"), 450000);
+  assert.equal(toArabicNumeral("千万"), 10000000);
+  assert.equal(toArabicNumeral("甲乙"), null, "非数字串不可解析");
+  assert.equal(toArabicNumeral(""), null);
+});
+
+test("⑳.1 支撑判定·人物锚点：被引用片段不含答案断言人物 → person 不支撑", () => {
+  const alias = loadAliasTable("bug28-not-exist");
+  const reason = evaluateFragmentSupport(
+    "袁绍聚众官于帐中，商议起兵。",
+    "夏侯渊随曹操破吕布。",
+    "夏侯渊怎么打败吕布的",
+    alias
+  );
+  assert.equal(reason, "person");
+});
+
+test("⑳.2 支撑判定·数值：答案数值片段无同值（原样 / 中阿同值均无）→ numeric 不支撑", () => {
+  const alias = loadAliasTable("bug28-not-exist");
+  const reason = evaluateFragmentSupport(
+    "周瑜令甘宁引兵追赶玄德。",
+    "刘备死的时候六十三岁。",
+    "刘备死的时候多少岁",
+    alias
+  );
+  assert.equal(reason, "numeric");
+});
+
+test("⑳.3 支撑判定·表字值：表字问句答案值不在片段 → zi-value 不支撑", () => {
+  const alias = loadAliasTable("bug28-not-exist");
+  const reason = evaluateFragmentSupport(
+    "夏侯惇字元让，沛国谯人也。族弟夏侯渊。",
+    "夏侯渊字妙才。",
+    "夏侯渊字什么",
+    alias
+  );
+  assert.equal(reason, "zi-value");
+});
+
+test("⑳.4 支撑判定·死亡事件：答案宣称病逝、片段无死亡证据词 → death 不支撑", () => {
+  const alias = loadAliasTable("bug28-not-exist");
+  const reason = evaluateFragmentSupport(
+    "马腾受衣带诏，与马超商议，欲除曹操。",
+    "马超投靠刘备后，最终病逝。",
+    "马超投靠刘备后，后来如何了",
+    alias
+  );
+  assert.equal(reason, "death");
+});
+
+test("⑳.5 支撑判定·正例：人物在片段 + 无数值/表字/死亡触发 → 支撑（null）", () => {
+  const alias = loadAliasTable("bug28-not-exist");
+  const reason = evaluateFragmentSupport(
+    "云长提刀出阵，斩华雄于帐前！",
+    "斩华雄者系关羽，原文见[Q1]。",
+    "谁斩了华雄？",
+    alias
+  );
+  assert.equal(reason, null);
+});
+
+test("⑳.6 支撑判定·中阿同值：答案 55 岁 ↔ 片段「年五十五」互相支撑（不误杀合法数值答案）", () => {
+  const alias = loadAliasTable("bug28-not-exist");
+  const reason = evaluateFragmentSupport(
+    "原来张飞每睡不合眼；二贼以短刀刺入飞腹。飞大叫一声而亡。时年五十五。",
+    "张飞遇害时年55岁。",
+    "张飞遇害时多大岁数",
+    alias
+  );
+  assert.equal(reason, null);
+});
+
+test("⑳.7 逐条过滤：指针剥离只影响答案中的引用标记，不影响答案正文", () => {
+  const alias = loadAliasTable("bug28-not-exist");
+  const fragments = [
+    {
+      text: "夏侯惇字元让，沛国谯人也。族弟夏侯渊。",
+      source: "《三国演义》",
+      chapter: 5,
+    },
+  ];
+  const view = buildInjectionView(fragments, "夏侯渊字什么");
+  const result = filterUnsupportedPointers("夏侯渊字妙才。[片段1]", view, "夏侯渊字什么", alias);
+  assert.deepEqual(result.kept, []);
+  assert.deepEqual(result.dropped, ["片段1"]);
+  assert.equal(result.answer, "夏侯渊字妙才。", "指针移除后正文原样保留（是否拒答由调用方按 kept 空判定）");
 });

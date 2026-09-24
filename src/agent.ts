@@ -22,6 +22,7 @@ import {
   buildFallback,
   buildInjectionView,
   extractCitePointers,
+  filterUnsupportedPointers,
   loadAliasTable,
   pickBestFallbackFragment,
   renderAnswerWithCitations,
@@ -825,10 +826,25 @@ export class Agent {
     const asserted = [...assertedIds].map((id) => ({ name: id, id }));
     const check = verifyCitation(asserted, recallText, recallPersonIds);
     if (pointer.ok && check.ok) {
+      // bug-00028：支撑护栏（零 LLM）——逐条引用判定是否支撑结论。
+      // 无任何支撑引用 -> 按 A004 拒答（正文「演义中未涉及」+ 清空引用，拒答类不写缓存，见 cache.ts record）；
+      // 有支撑但部分引用挂错 -> 只去掉不支撑的引用、保留其余（指针与 citations 同步裁掉，funnel.cited 随之回填）。
+      const filtered = filterUnsupportedPointers(
+        cleaned,
+        view,
+        query,
+        this.getAliasTable()
+      );
+      if (filtered.kept.length === 0) {
+        return {
+          data: { answer: NOVEL_NO_HIT_ANSWER, citations: [] },
+          citedChunkIds: new Set(),
+        };
+      }
       return {
-        data: renderAnswerWithCitations(cleaned, view),
+        data: renderAnswerWithCitations(filtered.answer, view),
         citedChunkIds: this.computeCitedChunkIds(
-          cleaned,
+          filtered.answer,
           view,
           fragments,
           chunkMeta

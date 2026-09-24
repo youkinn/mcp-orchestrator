@@ -615,3 +615,214 @@ export function buildFallback(
     ],
   };
 }
+
+// ===== bug-00028：生成轮后置支撑护栏（零 LLM 规则判定）=====
+// 触发位置：引用硬校验「指针合法 + 人物断言成立」之后、渲染之前（agent.ts applyNovelCitationGuard）。
+// 判定：答案的每条结构化引用（[Qn] / [片段N] → 注入片段）是否支撑结论，逐条给失败原因；
+//   1. person   — 片段不含答案断言人物（别名 ID 级，无 ID 人物退化为名字包含）——每片段级收紧，
+//                 原 verifyCitation 是召回全量人物，无法抓到「人物出现在别的片段、引用却挂到本题」；
+//   2. numeric  — 答案出现数值（阿拉伯 / 中文，含十百千万组合）时，片段须含同值数值（原样或等价形式）；
+//   3. zi-value — 表字问句（问「字什么/字是什么」）时，答案表字值须出现在片段中（例：妙才）；
+//   4. death    — 答案宣称死亡事件（病逝/遇害/被杀/而亡/卒/薨…）时，片段须含死亡证据词；
+//   一律字面 / 数值包含性匹配，0 次 LLM；失败即认为该引用不支撑结论。
+// 灰色地带与取舍（交付说明同步 dev-docs）：
+//   - 人物未别名化（范疆/张达/马腾等）时人物锚点中性化：答案无人物才跳过；
+//     「范、张二贼」式缩写无法字面关联，故不做术语包含硬门（否则误杀合法答案，见 agent-novel ⑦）。
+//   - 数值以「原样包含 / 中阿互转同值」双通道判；「六十有三」式变体无法解析 → 判不支撑（A004 宁拒勿猜）。
+//   - 表字值只做值包含，不做「该值挂在哪个人名下」的归属核对（例：答「夏侯渊字元让」引夏侯惇段会漏过，
+//     属 alias 归一化副作用族，方向 C 范围外）。
+//   - 死亡证据词限定强死亡字（死/亡/卒/薨/殁/殒/逝 及 遇害/被杀/被斩 等多字词），不含单字「杀/害」
+//     （杀向/欲害 常见于战争叙事，误杀面大）。
+//   - 无以上信号的纯叙述声明（人物锚点成立即放行）属护栏盲区：零 LLM 下不可判，记录待方向 B 检索覆盖。
+// ======================================================================
+
+/** 中文数字字符（十百千万为进位单位，非法字符外任何字都会中断该 token） */
+const CN_NUMERAL_CHARS = /[〇零一二两三四五六七八九十百千万]+/g;
+const CN_DIGITS: Record<string, number> = {
+  〇: 0, 零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4,
+  五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+};
+const CN_UNITS: Record<string, number> = { 十: 10, 百: 100, 千: 1000, 万: 10000 };
+
+/** 中文数字 → 阿拉伯数（0~99999999，万以上按万节分解）；无法解析返回 null。
+ * 纯数字串（无单位）按逐位拼接（二零二六 → 2026）；有单位按「数字×单位」累计（六十三 → 63，十三 → 13）。 */
+export function toArabicNumeral(zh: string): number | null {
+  if (!zh || zh.length > 32) {
+    return null;
+  }
+  const hasUnit = [...zh].some((ch) => CN_UNITS[ch] !== undefined);
+  if (!hasUnit) {
+    let value = 0;
+    for (const ch of zh) {
+      const digit = CN_DIGITS[ch];
+      if (digit === undefined) {
+        return null;
+      }
+      value = value * 10 + digit;
+    }
+    return value;
+  }
+  let total = 0;
+  let section = 0;
+  let digit = 0;
+  for (const ch of zh) {
+    const d = CN_DIGITS[ch];
+    if (d !== undefined) {
+      digit = d;
+      continue;
+    }
+    const unit = CN_UNITS[ch];
+    if (unit === undefined) {
+      return null;
+    }
+    if (unit === 10000) {
+      section = (section + digit) * unit;
+      total += section;
+      section = 0;
+      digit = 0;
+    } else {
+      section += (digit || 1) * unit;
+      digit = 0;
+    }
+  }
+  return total + section + digit;
+}
+
+/** 文本中出现的数值（阿拉伯 token + 中文数字 token，原样返回） */
+function extractNumerals(text: string): string[] {
+  return [
+    ...[...text.matchAll(/\d+/g)].map((matched) => matched[0]),
+    ...[...text.matchAll(CN_NUMERAL_CHARS)].map((matched) => matched[0]),
+  ];
+}
+
+/** 文本中全部数值的阿拉伯等价（可解析的），供中阿同值对照 */
+function numeralValuesOf(text: string): Set<number> {
+  const values = new Set<number>();
+  for (const token of extractNumerals(text)) {
+    if (/^\d+$/.test(token)) {
+      values.add(Number(token));
+      continue;
+    }
+    const value = toArabicNumeral(token);
+    if (value !== null) {
+      values.add(value);
+    }
+  }
+  return values;
+}
+
+/** 片段是否含答案数值：原文包含 / 中阿同值（片段侧解析对照）任一成立 */
+function fragmentContainsNumeral(fragmentText: string, token: string): boolean {
+  if (fragmentText.includes(token)) {
+    return true;
+  }
+  const value = /^\d+$/.test(token) ? Number(token) : toArabicNumeral(token);
+  if (value === null) {
+    return false;
+  }
+  if (fragmentText.includes(String(value))) {
+    return true;
+  }
+  return numeralValuesOf(fragmentText).has(value);
+}
+
+/** 表字问句：问「字什么 / 字是什么 / 字叫啥 / 表字」 */
+const ZI_QUESTION_PATTERN = /字(?:是|为|叫)?(?:什么|啥|何)|表字/;
+
+/** 答案里的表字值：紧随「字 / 表字」后的 1~12 个非标点字符 */
+const ZI_VALUE_PATTERN = /(?:表字|字)([^，。；、！？…\s]{1,12})/;
+
+/** 答案宣称「死亡事件」的信号（覆盖 bug-00028 例 1 的病逝；不含单字 死/杀/害，降低误触发） */
+const ANSWER_DEATH_SIGNAL =
+  /(?:病逝|病故|去世|逝世|身亡|遇害|被杀|被斩|斩首|阵亡|丧命|殒命|刺死|杀死|战死|病死|冤死|死于|之死|死时|而亡|卒|薨|殁|殒|终年)/;
+
+/** 片段侧死亡证据词（同信号口径；单字 死/亡/卒/薨/殁/殒/逝 亦可，不含 杀/害） */
+const FRAGMENT_DEATH_EVIDENCE =
+  /(?:遇害|被杀|被斩|斩首|阵亡|丧命|殒命|刺死|杀死|战死|病死|死于|而亡|遇难|病逝|病故|薨|殁|殒|[死亡卒])/;
+
+/** bug-00028 支撑判定失败原因（null = 支撑成立） */
+export type SupportFailureReason =
+  | "person"
+  | "numeric"
+  | "zi-value"
+  | "death"
+  | null;
+
+/** 单条片段支撑判定：fragmentText 为该引用对应的整段注入原文（fragment 级，非引语窗口） */
+export function evaluateFragmentSupport(
+  fragmentText: string,
+  answer: string,
+  query: string,
+  aliasTable: Map<string, string>
+): SupportFailureReason {
+  // 1. 人物锚点（每片段级）：答案断言人物须出现在被引用片段
+  const personsInAnswer = scanRecallPersonIds(answer, aliasTable);
+  if (personsInAnswer.size > 0) {
+    const personsInFragment = scanRecallPersonIds(fragmentText, aliasTable);
+    let overlap = false;
+    for (const id of personsInAnswer) {
+      if (personsInFragment.has(id)) {
+        overlap = true;
+        break;
+      }
+    }
+    if (!overlap) {
+      return "person";
+    }
+  }
+  // 2. 数值：答案每个数值都须在片段中有同值证据（原样或中阿互转）
+  // 先剥离指针标记（[Q1] / [片段5] 内的编号是引用下标，不是答案声明的数值）
+  const claimText = answer.replace(/\[(?:Q\d+|片段\d+)\]/g, "");
+  for (const token of extractNumerals(claimText)) {
+    if (!fragmentContainsNumeral(fragmentText, token)) {
+      return "numeric";
+    }
+  }
+  // 3. 表字问句：表字值须出现在片段中（例 2：妙才不在 ch5 → 不支撑）
+  if (ZI_QUESTION_PATTERN.test(query)) {
+    const matched = ZI_VALUE_PATTERN.exec(answer);
+    if (matched?.[1] && !fragmentText.includes(matched[1])) {
+      return "zi-value";
+    }
+  }
+  // 4. 死亡事件：答案有死亡信号 → 片段须含死亡证据（例 1：衣带诏段无 → 不支撑）
+  if (ANSWER_DEATH_SIGNAL.test(answer) && !FRAGMENT_DEATH_EVIDENCE.test(fragmentText)) {
+    return "death";
+  }
+  return null;
+}
+
+/** 逐条引用过滤：去掉不支撑结论的指针（保留其答案正文，仅移除指针本身与对应引用卡片）。
+ * 返回剔除后的答案 + 保留 / 剔除的指针列表；kept.length===0 即「无任何支撑引用」→ 由调用方拒答。 */
+export function filterUnsupportedPointers(
+  answer: string,
+  view: InjectionView,
+  query: string,
+  aliasTable: Map<string, string>
+): { answer: string; kept: string[]; dropped: string[] } {
+  const kept: string[] = [];
+  const dropped: string[] = [];
+  let filtered = answer;
+  for (const pointer of extractCitePointers(answer)) {
+    const resolved = resolvePointerRef(pointer, view);
+    if (!resolved) {
+      dropped.push(pointer);
+      filtered = filtered.replace(new RegExp(`\\[${escapeRegExp(pointer)}\\]`, "g"), "");
+      continue;
+    }
+    const fragmentText = view.fragments.get(resolved.fragmentKey)?.text ?? "";
+    const reason = evaluateFragmentSupport(fragmentText, answer, query, aliasTable);
+    if (reason === null) {
+      kept.push(pointer);
+    } else {
+      dropped.push(pointer);
+      filtered = filtered.replace(new RegExp(`\\[${escapeRegExp(pointer)}\\]`, "g"), "");
+    }
+  }
+  return { answer: filtered, kept, dropped };
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
