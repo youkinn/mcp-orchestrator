@@ -571,6 +571,8 @@ export interface LogStore {
     pageNo: number,
     pageSize: number
   ): { list: CacheEntryHitItem[]; total: number } | null;
+  /** feat-A013 验收修正：全池条目累计命中次数（条目 id → 累计命中数；口径同 queryEntryHits；无命中条目 → 0；noop store 返回空 Map） */
+  queryEntryHitCounts(): Map<number, number>;
   /** 误判标记 / 取消：返回行是否存在（已标记重复标记幂等；不存在 → false 供 404） */
   updateCacheLogMark(id: number, marked: boolean, markedBy: string | null): boolean;
   /** 镜像写入：返回新条目自增 id（写入失败静默降级 null） */
@@ -832,6 +834,7 @@ function createNoopStore(): LogStore {
     querySimilarityRows: () => ({ list: [], total: 0 }),
     queryMisjudgeStats: () => ({ hitTotal: 0, markedMisjudge: 0, misjudgeRate: null }),
     queryEntryHits: () => null,
+    queryEntryHitCounts: () => new Map(),
     updateCacheLogMark: () => false,
     insertCacheEntry: () => null,
     updateCacheEntry: () => false,
@@ -1877,6 +1880,24 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
       };
     },
 
+    queryEntryHitCounts(): Map<number, number> {
+      // 验收问题「缓存概览 4」：全池累计命中数，口径同 §3.12 弹框（cache_logs 中 hit=1 且 nearest_query = 条目 query_text；
+      // 含历史池、重启不归零）；LEFT JOIN 保证无日志 / 未命中条目计数为 0；条目被删则随 LEFT JOIN 不产出
+      const rows = db
+        .prepare(
+          `SELECT e.id AS id, COUNT(c.id) AS hits
+           FROM cache_entries e
+           LEFT JOIN cache_logs c ON c.hit = 1 AND c.nearest_query = e.query_text
+           GROUP BY e.id`
+        )
+        .all() as Array<{ id: number; hits: number }>;
+      const counts = new Map<number, number>();
+      for (const row of rows) {
+        counts.set(row.id, row.hits);
+      }
+      return counts;
+    },
+
     clearCacheEntries(): number {
       try {
         return clearCacheEntriesStmt.run().changes;
@@ -2023,6 +2044,11 @@ export function queryEntryHits(
   pageSize: number
 ): { list: CacheEntryHitItem[]; total: number } | null {
   return getLogStore().queryEntryHits(entryId, pageNo, pageSize);
+}
+
+/** feat-A013 验收修正：全池条目累计命中次数（条目 id → 累计命中数；口径同 queryEntryHits；无命中条目 → 0） */
+export function queryEntryHitCounts(): Map<number, number> {
+  return getLogStore().queryEntryHitCounts();
 }
 
 /** feat-A013：误判标记 / 取消；返回行是否存在（不存在 → false 供 404） */

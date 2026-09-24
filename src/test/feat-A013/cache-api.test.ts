@@ -243,16 +243,37 @@ test('④ DELETE /entries/:id：成功 / 不存在 404 / id 非法 400（§3.4�
 test('⑤ GET /entries：分页 / 排序 / 载荷纪律 / traceId 关联 / 参数校验（§3.5）', async (t) => {
   const store = createLogStore({ dbPath: ':memory:' });
   t.after(() => store.close());
+  // Manager 侧 hitCount（1/5/3）只是内存镜像展示值；验收问题「缓存概览 4」后不再作为对外 hitCount（见下累计值断言）
   const manager = new FakeCacheManager([
     { queryText: 'Q1', hitCount: 1, lastAccessAt: 100 },
     { queryText: 'Q2', hitCount: 5, lastAccessAt: 300 },
     { queryText: 'Q3', hitCount: 3, lastAccessAt: 200 },
   ]);
   const baseUrl = await startCacheApi(t, manager, store);
-  // traceId 关联（验收修正）：Q2 预埋两条同 user_query 的 cache_logs（后落一条 id 更大 → 取最近）；Q1 一条；Q3 无关联
-  seedCacheLog(store, TRACE_A, { userQuery: 'Q1' } as never);
-  seedCacheLog(store, '9f7c0000-0000-4000-8000-0000000000b1', { userQuery: 'Q2' } as never);
-  seedCacheLog(store, '9f7c0000-0000-4000-8000-0000000000b2', { userQuery: 'Q2' } as never);
+  // 镜像对齐（§2.1 口径：cache_entries 镜像 id == 内存 id，假 manager 不落库 → 手工补镜像行），累计命中 LEFT JOIN 才有归属
+  const now = Date.now();
+  for (const mirror of [
+    { id: 1, queryText: 'Q1' },
+    { id: 2, queryText: 'Q2' },
+    { id: 3, queryText: 'Q3' },
+  ]) {
+    store.insertCacheEntry({
+      id: mirror.id,
+      queryText: mirror.queryText,
+      embeddingB64: 'AAAA',
+      answerJson: '{}',
+      answerBytes: 128,
+      hitCount: 0,
+      lastAccessAt: 0,
+      createdAt: now,
+      versionTag: 'test',
+    });
+  }
+  // 累计命中 + traceId 关联（验收修正）：nearestQuery = 条目 queryText → Q1=1 / Q2=2 / Q3=0；
+  // Q2 预埋两条同 user_query 的 cache_logs（后落一条 id 更大 → 取最近）；Q1 一条；Q3 无关联
+  seedCacheLog(store, TRACE_A, { userQuery: 'Q1', nearestQuery: 'Q1' } as never);
+  seedCacheLog(store, '9f7c0000-0000-4000-8000-0000000000b1', { userQuery: 'Q2', nearestQuery: 'Q2' } as never);
+  seedCacheLog(store, '9f7c0000-0000-4000-8000-0000000000b2', { userQuery: 'Q2', nearestQuery: 'Q2' } as never);
 
   // 默认：pageNo=1 / pageSize=20 / lastAccessAt desc
   const all = await get(baseUrl, '/api/v1/cache/entries');
@@ -263,6 +284,15 @@ test('⑤ GET /entries：分页 / 排序 / 载荷纪律 / traceId 关联 / 参�
   assert.equal(all.body.data.pageSize, 20);
   // 载荷纪律：不含 embedding / 答案全文
   assert.deepEqual(Object.keys(all.body.data.list[0]).sort(), ['answerBytes', 'createdAt', 'embeddingBytes', 'hitCount', 'id', 'lastAccessAt', 'queryText', 'traceId']);
+  // hitCount 统一为累计命中次数（cache_logs hit=1 且 nearest_query = queryText），Manager 镜像值（Q1=1/Q2=5/Q3=3）不再输出
+  const hitByText = new Map<string, number>(
+    all.body.data.list.map((e: { queryText: string; hitCount: number }) => [e.queryText, e.hitCount])
+  );
+  assert.deepEqual(
+    [hitByText.get('Q1'), hitByText.get('Q2'), hitByText.get('Q3')],
+    [1, 2, 0],
+    'hitCount = cache_logs 累计命中次数（Q1=1/Q2=2/Q3=0）'
+  );
   // traceId 关联：有同 user_query 的 cache_logs 行 → 最近一条的 traceId；无 → null
   const byText = new Map<string, { queryText: string; traceId: string | null }>(
     all.body.data.list.map((e: { queryText: string; traceId: string | null }) => [e.queryText, e])
@@ -271,8 +301,21 @@ test('⑤ GET /entries：分页 / 排序 / 载荷纪律 / traceId 关联 / 参�
   assert.equal(byText.get('Q2')!.traceId, '9f7c0000-0000-4000-8000-0000000000b2', '多条关联行 → 取最近一条（id 更大）');
   assert.equal(byText.get('Q3')!.traceId, null, '无关联行 → null');
 
+  // sortBy=hitCount 按累计值排序（Q3(0)/Q1(1)/Q2(2)），非 Manager 镜像值（Q1(1)/Q3(3)/Q2(5)）
+  const sortedAll = await get(baseUrl, '/api/v1/cache/entries?sortBy=hitCount&order=asc&pageSize=20');
+  assert.deepEqual(
+    sortedAll.body.data.list.map((e: { queryText: string }) => e.queryText),
+    ['Q3', 'Q1', 'Q2'],
+    'hitCount asc 按累计值 Q3(0)/Q1(1)/Q2(2)'
+  );
+  const sortedAllDesc = await get(baseUrl, '/api/v1/cache/entries?sortBy=hitCount&order=desc&pageSize=20');
+  assert.deepEqual(
+    sortedAllDesc.body.data.list.map((e: { queryText: string }) => e.queryText),
+    ['Q2', 'Q1', 'Q3'],
+    'hitCount desc 按累计值 Q2(2)/Q1(1)/Q3(0)'
+  );
   const sorted = await get(baseUrl, '/api/v1/cache/entries?sortBy=hitCount&order=asc&pageSize=2&pageNo=2');
-  assert.deepEqual(sorted.body.data.list.map((e: { queryText: string }) => e.queryText), ['Q2'], 'hitCount asc = Q1(1)/Q3(3)/Q2(5)，第 2 页取 Q2');
+  assert.deepEqual(sorted.body.data.list.map((e: { queryText: string }) => e.queryText), ['Q2'], 'hitCount asc = Q3(0)/Q1(1)/Q2(2)，第 2 页取 Q2');
   assert.equal(sorted.body.data.total, 3);
 
   for (const bad of ['?pageNo=0', '?pageNo=abc', '?pageSize=0', '?pageSize=101', '?sortBy=text', '?order=up']) {

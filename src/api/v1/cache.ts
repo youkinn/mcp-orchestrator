@@ -17,6 +17,8 @@ const OPERATE_ERROR_MESSAGE = '操作缓存失败，请稍后重试';
 const STATS_ERROR_MESSAGE = '查询统计失败，请稍后重试';
 const MISJUDGE_NOTE =
   '误判率 = 区间标记误判数 / 区间命中总数；未标记不计为正确；hitTotal=0 时 rate 为 null';
+/** feat-A013 验收修正：sortBy=hitCount 需按 cache_logs 累计值重排，拉全池的分页上限（每页 ≤ 100、最多 5 页，覆盖默认 maxEntries=500） */
+const ENTRY_HITCOUNT_SCAN_PAGE_SIZE = 100;
 
 /** feat-A013：缓存池状态（§3.1 / §3.2 返回形状）。 */
 export interface CacheStatus {
@@ -294,22 +296,62 @@ export function createCacheApi(cacheManager: CacheManager, logStore?: LogStore):
         sendError(response, 400, 'order 只支持 asc/desc');
         return;
       }
-      const result = cacheManager.listEntries({
-        pageNo: paging.pageNo,
-        pageSize: paging.pageSize,
-        sortBy: sortByRaw,
-        order: orderRaw,
-      });
+      // 验收问题「缓存概览 4」：hitCount 统一为累计命中次数（同 §3.12 弹框口径：cache_logs 中 hit=1 且
+      // nearest_query = 条目 query_text；含历史池、重启不归零）。CacheManager 侧镜像值只作池内排序展示，不再作为对外 hitCount。
+      const hitCounts = store.queryEntryHitCounts();
       // 验收修正：条目点击跳转日志明细（同灰色区清单 traceId 精确跳转）——关联查询 cache_logs，不落 cache_entries 镜像列
-      const list = result.list.map((entry) => ({
-        ...entry,
-        traceId: store.queryLatestCacheLogTraceIdByUserQuery(entry.queryText),
-      }));
+      const decorate = (entries: ReadonlyArray<Omit<CacheEntryDetail, 'traceId'>>): CacheEntryDetail[] =>
+        entries.map((entry) => ({
+          ...entry,
+          hitCount: hitCounts.get(entry.id) ?? 0,
+          traceId: store.queryLatestCacheLogTraceIdByUserQuery(entry.queryText),
+        }));
+      let list: CacheEntryDetail[] = [];
+      let total = 0;
+      if (sortByRaw === 'hitCount') {
+        // 累计值来自 cache_logs，Manager 的 hitCount 排序口径不再可信 → 循环分页拉全池（pageSize ≤ 100、
+/** feat-A013 验收修正：sortBy=hitCount 需按 cache_logs 累计值重排，拉全池的分页上限（每页 ≤ 100，页数按 maxEntries 取整） */
+        const maxEntries = Math.max(1, cacheManager.getStatus().maxEntries);
+        const scanPageSize = Math.min(ENTRY_HITCOUNT_SCAN_PAGE_SIZE, maxEntries);
+        const maxPages = Math.ceil(maxEntries / scanPageSize);
+        const all: Array<Omit<CacheEntryDetail, 'traceId'>> = [];
+        for (let pageNo = 1; pageNo <= maxPages; pageNo += 1) {
+          const page = cacheManager.listEntries({
+            pageNo,
+            pageSize: scanPageSize,
+            sortBy: 'lastAccessAt',
+            order: 'desc',
+          });
+          total = page.total;
+          all.push(...page.list);
+          if (page.total <= all.length) {
+            break;
+          }
+        }
+        all.sort((a, b) => {
+          const diff = (hitCounts.get(a.id) ?? 0) - (hitCounts.get(b.id) ?? 0);
+          if (diff !== 0) {
+            return orderRaw === 'asc' ? diff : -diff;
+          }
+          return orderRaw === 'asc' ? a.id - b.id : b.id - a.id;
+        });
+        const start = (paging.pageNo - 1) * paging.pageSize;
+        list = decorate(all.slice(start, start + paging.pageSize));
+      } else {
+        const page = cacheManager.listEntries({
+          pageNo: paging.pageNo,
+          pageSize: paging.pageSize,
+          sortBy: sortByRaw,
+          order: orderRaw,
+        });
+        total = page.total;
+        list = decorate(page.list);
+      }
       response.json({
         code: 200,
         data: {
           list,
-          total: result.total,
+          total,
           pageNo: paging.pageNo,
           pageSize: paging.pageSize,
         },

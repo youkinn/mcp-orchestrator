@@ -460,6 +460,50 @@ test('⑬ 旧库迁移：cache_logs 缺 lookup_ms 打开补列 / 重复打开幂
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('⑭ queryEntryHitCounts 全池累计命中数（口径同 queryEntryHits：hit=1 且 nearest_query = 条目 query_text；无命中 → 0；跨条目 / 未命中不混入）', () => {
+  const store = createLogStore({ dbPath: ':memory:' });
+  t_after(store);
+  const q1Id = store.insertCacheEntry(entryPayload({ queryText: 'Q1' }))!;
+  const q2Id = store.insertCacheEntry(entryPayload({ queryText: 'Q2' }))!;
+  const q3Id = store.insertCacheEntry(entryPayload({ queryText: 'Q3' }))!;
+
+  // 命中累计：Q1 ×1、Q2 ×2（多条累计）；与 cache_entries.hit_count 镜像列无关（镜像由启动清空，不含重启前历史）
+  const rows: Array<{ trace: string; at: number; userQuery: string; nearestQuery: string; hit: boolean }> = [
+    { trace: TRACE_A, at: 1000, userQuery: 'Q1', nearestQuery: 'Q1', hit: true },
+    { trace: TRACE_B, at: 2000, userQuery: 'Q2', nearestQuery: 'Q2', hit: true },
+    { trace: TRACE_C, at: 3000, userQuery: 'Q2', nearestQuery: 'Q2', hit: true },
+    // 跨条目隔离：命中但 nearest_query 为无关 query → 不归入任何条目
+    { trace: TRACE_D, at: 4000, userQuery: '无关问题', nearestQuery: '无关条目', hit: true },
+    // 命中 1 与未命中 0 不混入：hit=0 且 nearest_query = Q1 → 不计入 Q1
+    { trace: TRACE_E, at: 5000, userQuery: 'Q1', nearestQuery: 'Q1', hit: false },
+  ];
+  for (const row of rows) {
+    ensureSkeleton(store, row.trace, row.at);
+    store.appendCacheLog(
+      row.trace,
+      cacheLogPayload({
+        userQuery: row.userQuery,
+        nearestQuery: row.nearestQuery,
+        hit: row.hit,
+        similarity: row.hit ? 0.9821 : 0.7,
+        tieHits: row.hit ? 1 : null,
+      })
+    );
+  }
+
+  const counts = store.queryEntryHitCounts();
+  assert.equal(counts.size, 3, '仅覆盖池内条目 id');
+  assert.equal(counts.get(q1Id), 1, 'Q1 命中 1 次');
+  assert.equal(counts.get(q2Id), 2, 'Q2 多行命中累计 2 次');
+  assert.equal(counts.get(q3Id), 0, '无日志条目 → 0');
+  assert.equal(counts.get(9999), undefined, '不存在条目不在 Map');
+
+  // 池空：无条目 → 空 Map（noop store 同样返回 new Map()）
+  const empty = createLogStore({ dbPath: ':memory:' });
+  t_after(empty);
+  assert.deepEqual(Array.from(empty.queryEntryHitCounts().entries()), [], '池空 → 空 Map');
+});
+
 function t_after(store: LogStore): void {
   test.after(() => store.close());
 }
