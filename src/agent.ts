@@ -26,6 +26,7 @@ import {
   pickBestFallbackFragment,
   renderAnswerWithCitations,
   scanRecallPersonIds,
+  stripLowOverlapSentences,
   stripOverlongModelQuotes,
   toRecallFragments,
   validateQuotePointers,
@@ -188,6 +189,9 @@ export const SANGO_NOVEL_DOMAIN_PROMPT = [
   " 5-1 用户问题中的事件结构是：(施事者=?, 动作=?, 受事者=?)",
   " 5-2 检索文档中的事件结构是：(施事者=?, 动作=?, 受事者=?)",
   " 5-3 两者方向是否一致？如果不一致，禁止用该文档回答。",
+  "6. 片段外信息不写不补：只依据注入片段作答，片段没有的内容一律不写、不以先验 / 史实补全。",
+  "7. 必须直接回答用户问题本身：答案须针对问题核心作答，答非所问（如问结局却答过程）视为不合格。",
+  "8. 用户问题携带的事件前提若与演义记载不符（如时间、人物、人物关系、事件归属等矛盾）：先按片段载明的演义事实说明并校正问题前提，再作答；禁止顺着错误前提硬凑答案，也禁止拒答。",
 ].join("\n");
 
 /** fengyunsanguo 域提示（§2.4）：题库快路径 / 分类编号 2 的生成轮 system 提示词 */
@@ -825,10 +829,22 @@ export class Agent {
     const asserted = [...assertedIds].map((id) => ({ name: id, id }));
     const check = verifyCitation(asserted, recallText, recallPersonIds);
     if (pointer.ok && check.ok) {
+      // bug-00028 单轮方案：复核轮（第二次 LLM 调用）已整体删除（负责人否决：token 与延迟翻倍）。
+      // 语义裁决收进生成轮通用指令（SANGO_NOVEL_DOMAIN_PROMPT 第 6~8 条），规则层只留结构门；
+      // 本步是第三条结构门「句-片段文本重叠」（零 LLM，citation.ts）：带 [片段N] 的叙述句与片段
+      // n-gram 重叠率低于阈值 → 裁剪整句；无留存句 → 拒答「演义中未涉及」+ citations []（拒答类
+      // 不写缓存规则不变，见 cache.ts record）。引语句（[Qn]）不受此门约束（沿用服务端渲染）。
+      const filtered = stripLowOverlapSentences(cleaned, view);
+      if (!filtered.trim()) {
+        return {
+          data: { answer: NOVEL_NO_HIT_ANSWER, citations: [] },
+          citedChunkIds: new Set(),
+        };
+      }
       return {
-        data: renderAnswerWithCitations(cleaned, view),
+        data: renderAnswerWithCitations(filtered, view),
         citedChunkIds: this.computeCitedChunkIds(
-          cleaned,
+          filtered,
           view,
           fragments,
           chunkMeta

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { Agent } from "../../agent.js";
 import { MCPTransport } from "../../transport.js";
 import { loadAliasTable } from "../../citation.js";
+import { SANGO_NOVEL_DOMAIN_PROMPT } from "../../agent.js";
 import type {
   LLMConfig,
   LLMProvider,
@@ -127,7 +128,7 @@ test("① 指针合法：模型只给结论 + 指针，服务端渲染引文 + �
   ]);
   assert.doesNotMatch(data.answer, /\[Q1\]/, "指针应已被服务端渲染替换");
   assert.doesNotMatch(data.answer, /段\d|（出处/, "不再内联出处，任何展示位无段号");
-  assert.equal(modelCallCount, 2, "校验通过不应有额外模型调用");
+  assert.equal(modelCallCount, 2, "分类 + 生成各一次：结构门放行后无兜底模型调用");
 });
 
 test("② 断言人物不在召回原文（曹操）：丢弃模型输出，输出兜底结论句 + 恰一条兜底片段", async () => {
@@ -259,7 +260,7 @@ test("②.3 长引语安全网：模型违规抄写超 30 字引语被丢弃，�
   assert.deepEqual(data.citations, [
     { text: RECALL_BODY, chapter: RECALL_CHAPTER, title: RECALL_TITLE },
   ]);
-  assert.equal(modelCallCount, 2, "安全网是确定性回收，不额外调模型");
+  assert.equal(modelCallCount, 2, "长引语安全网 + 结构门均为确定性动作，无兜底模型调用");
 });
 
 test("②.4 注入编号连续（bug-00009）：窗口裁掉证据段引语时并入保底，模型 [Q2] 指针合法，答案不被 Guard 改坏", async () => {
@@ -323,7 +324,7 @@ test("②.4 注入编号连续（bug-00009）：窗口裁掉证据段引语时�
     "citation text 为片段整段原文（工具出参 text）"
   );
   assert.doesNotMatch(data.answer, /【原文片段】/, "指针合法不应走兜底");
-  assert.equal(modelCallCount, 2, "校验通过不触发兜底结论归纳");
+  assert.equal(modelCallCount, 2, "分类 + 生成各一次：结构门放行后无兜底模型调用");
 });
 
 test("③ 检索无命中：回答「演义中未涉及」，不做归纳生成", async () => {
@@ -514,7 +515,7 @@ test("⑦ 注入上限放宽到 10 + 叙述段指针（bug-00009 张飞题）：
     modelCallCount += 1;
     return modelCallCount === 1
       ? textResponse("1")
-      : textResponse("张飞被范疆、张达刺死。[片段5]");
+      : textResponse("张飞当夜寝于帐中，二贼以短刀刺入飞腹，大叫一声而亡。[片段5]");
   };
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
     tools: [NOVEL_TOOL],
@@ -528,7 +529,7 @@ test("⑦ 注入上限放宽到 10 + 叙述段指针（bug-00009 张飞题）：
     modelCaller,
   });
   const data = await agent.processQueryData("张飞怎么死的");
-  assert.ok(data.answer.startsWith("张飞被范疆、张达刺死。"), "叙述句指针渲染后保留结论");
+  assert.ok(data.answer.startsWith("张飞当夜寝于帐中"), "叙述句指针渲染后保留结论");
   assert.ok(data.answer.endsWith("¹"), "叙述段指针只渲染角标 ¹，不内联原文");
   assert.doesNotMatch(data.answer, /密入帐中/, "answer 不内联片段原文（原文进 citations 卡片）");
   assert.equal(data.citations.length, 1, "只收被引用片段：仅 [片段5] 所在片段");
@@ -540,5 +541,249 @@ test("⑦ 注入上限放宽到 10 + 叙述段指针（bug-00009 张飞题）：
   );
   assert.doesNotMatch(data.answer, /\[片段5\]/, "指针已被服务端渲染替换");
   assert.doesNotMatch(data.answer, /【原文片段】/, "指针合法不走兜底");
-  assert.equal(modelCallCount, 2, "校验通过不触发兜底结论归纳");
+  assert.equal(modelCallCount, 2, "分类 + 生成各一次：结构门放行后无兜底模型调用");
+});
+
+
+// ===== bug-00028 单轮方案（复核轮已删除）：结构保险丝——生成轮 1 次 + 结构门 0 次 LLM =====
+// 语义裁决收进生成轮通用指令（SANGO_NOVEL_DOMAIN_PROMPT 第 6~8 条），规则层只留结构门
+// （指针合法 / 人物⊆召回 / 句-片段文本重叠）。全部走 domain=sango-novel 标签锁域快路径：
+// 模型调用恒为生成轮 1 次，拒答 / 裁剪均为生成后的确定性动作（不触发兜底结论模型调用）。
+
+test("⑧ 单轮·例2 夏侯渊字什么：片段无夏侯渊的字 → 生成轮按域提示自律拒答（演义中未涉及）", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0005:c0002",
+      text: "夏侯惇字元让，沛国谯人也。族弟夏侯渊。",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return textResponse("演义中未涉及"); // 片段无夏侯渊的字信息：生成轮按域提示自律拒答
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "夏侯渊字妙才",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("夏侯渊字什么", "sango-novel");
+  assert.equal(data.answer, "演义中未涉及", "演义原文无该信息：生成轮按域提示自律拒答");
+  assert.deepEqual(data.citations, [], "拒答清空引用");
+  assert.equal(modelCallCount, 1, "单轮生成：拒答由生成轮直接输出，无复核轮 / 兜底模型调用");
+});
+
+test("⑨ 单轮·结构门·例3 刘备死的时候多少岁：答案与片段零重叠 → 裁剪后拒答", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0055:c0009",
+      text: "孙权闻玄德与孙夫人已去，急召周瑜商议。周瑜曰：“可速追之。”遂令甘宁、凌统引兵追赶。",
+      chapter: 55,
+      title: "玄德智激孙夫人　孔明二气周瑜",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return textResponse("刘备死的时候六十三岁。[片段1]"); // 答案断言与片段文本零重叠 → 结构门裁剪
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "刘备六十三岁",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("刘备死的时候多少岁", "sango-novel");
+  assert.equal(data.answer, "演义中未涉及", "答案断言与片段文本零重叠 → 结构门裁剪整句 → 无留存句拒答");
+  assert.deepEqual(data.citations, []);
+  assert.equal(modelCallCount, 1, "单轮生成：裁剪与拒答是生成后的确定性动作");
+});
+
+test("⑩ 单轮·例1 马超投靠刘备后如何：多个片段均无结局内容 → 生成轮自律拒答", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0065:c0007",
+      text: "马超与张飞在葭萌关前大战，玄德在城上观战。自白日战至夜，不分胜负。",
+      chapter: 65,
+      title: "马超大战葭萌关　刘备自领益州牧",
+      type: "narration",
+      quotes: [],
+    },
+    {
+      id: "sanguo-yanyi:0057:c0016",
+      text: "马腾受衣带诏，与马超商议，欲除曹操。",
+      chapter: 57,
+      title: "柴桑口卧龙吊丧　耒阳县凤雏理事",
+      type: "narration",
+      quotes: [],
+    },
+    {
+      id: "sanguo-yanyi:0058:c0002",
+      text: "马超与韩遂合兵，在潼关与曹操对峙。",
+      chapter: 58,
+      title: "马孟起兴兵雪恨　曹阿瞒割须弃袍",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return textResponse("演义中未涉及"); // 注入片段均无「五虎/病逝」结局内容：生成轮按域提示自律拒答
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "马超病逝",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("马超投靠刘备后，后来如何了", "sango-novel");
+  assert.equal(data.answer, "演义中未涉及", "注入片段（衣带诏等）无「五虎/病逝」结局证据 → 生成轮按域提示自律拒答");
+  assert.deepEqual(data.citations, []);
+  assert.equal(modelCallCount, 1, "单轮生成：拒答由生成轮直接输出，无复核轮 / 兜底模型调用");
+});
+
+test("⑭ 单轮·结构门·表字正例不误伤：叙述句与片段高度重叠 → 原样返回", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0005:c0002",
+      text: "夏侯惇字元让，沛国谯人也。",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return textResponse("夏侯惇字元让。[片段1]"); // 句子 2-gram 与片段全重合 → 结构门放行
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "夏侯惇字元让",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("夏侯惇字什么", "sango-novel");
+  assert.ok(data.answer.includes("字元让"), "表字值在片段中：重叠达标，不拒答、不裁剪");
+  assert.equal(data.citations.length, 1);
+  assert.equal(modelCallCount, 1, "单轮生成：结构门放行是生成后的确定性动作");
+});
+
+test("⑯ 单轮·结构门·纯叙述放行（控制组）：叙述句与片段重叠达标 → 原样返回", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0065:c0007",
+      text: "马超与张飞在葭萌关前大战，玄德在城上观战。自白日战至夜，不分胜负。",
+      chapter: 65,
+      title: "马超大战葭萌关　刘备自领益州牧",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return textResponse("马超与张飞在葭萌关前大战百余合，不分胜负。[片段1]"); // 与片段高分重叠 → 放行
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "张飞与马超不分胜负",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("张飞和马超谁赢了", "sango-novel");
+  assert.ok(data.answer.includes("不分胜负"), "叙述句与片段重叠达标，不被错误拒答");
+  assert.equal(data.citations.length, 1);
+  assert.equal(modelCallCount, 1, "单轮生成：结构门放行是生成后的确定性动作");
+});
+
+test("㉓ 单轮·生成轮提示词含三条通用语义指令且不含具体案例词", () => {
+  assert.ok(SANGO_NOVEL_DOMAIN_PROMPT.includes("片段外信息不写不补"), "指令 a：片段外信息不写不补");
+  assert.ok(SANGO_NOVEL_DOMAIN_PROMPT.includes("答非所问"), "指令 b：必须直接回答用户问题本身");
+  assert.ok(SANGO_NOVEL_DOMAIN_PROMPT.includes("与演义记载不符"), "指令 c：问题前提与演义不符 → 校正后再作答");
+  assert.ok(SANGO_NOVEL_DOMAIN_PROMPT.includes("禁止拒答"), "指令 c：前提不符禁止硬凑与拒答");
+  for (const banned of ["夏侯惇", "马超", "右眼", "左目", "葭萌关", "曹性"]) {
+    assert.ok(
+      !SANGO_NOVEL_DOMAIN_PROMPT.includes(banned),
+      `通用指令不得含具体案例词：${banned}`
+    );
+  }
+});
+
+test("㉔ 单轮·结构门部分裁剪：低重叠句被裁剪、高重叠句保留并渲染，citations 只收保留片段", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0065:c0007",
+      text: "马超与张飞在葭萌关前大战，玄德在城上观战。自白日战至夜，不分胜负。",
+      chapter: 65,
+      title: "马超大战葭萌关　刘备自领益州牧",
+      type: "narration",
+      quotes: [],
+    },
+    {
+      id: "sanguo-yanyi:0009:c0003",
+      text: "袁绍聚众官于帐中，商议起兵。",
+      chapter: 9,
+      title: "除暴凶吕布助司徒　犯长安李傕听贾诩",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return textResponse("马超与张飞战于葭萌关，不分胜负。[片段1] 马超后来投靠了袁绍。[片段2]");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "马超与张飞不分胜负",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("马超与张飞战况如何", "sango-novel");
+  assert.ok(data.answer.includes("不分胜负"), "高重叠句保留并渲染");
+  assert.doesNotMatch(data.answer, /投靠了袁绍/, "低重叠句被结构门裁剪");
+  assert.equal(data.citations.length, 1, "只收保留句引用的片段");
+  assert.ok(data.citations[0].text.includes("葭萌关"), "保留片段为片段1（葭萌关段）");
+  assert.ok(data.answer.endsWith("¹"), "保留指针渲染上标角标");
+  assert.equal(modelCallCount, 1, "单轮生成：裁剪与渲染是生成后的确定性动作");
 });

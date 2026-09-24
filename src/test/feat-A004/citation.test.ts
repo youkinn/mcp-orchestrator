@@ -1,4 +1,4 @@
-﻿import { test } from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -6,12 +6,16 @@ import { join } from "node:path";
 import {
   MAX_MODEL_QUOTE_LENGTH,
   NOVEL_NO_HIT_ANSWER,
+  SENTENCE_OVERLAP_NGRAM,
+  SENTENCE_OVERLAP_THRESHOLD,
   buildFallback,
   buildInjectionView,
   loadAliasTable,
   pickBestFallbackFragment,
   renderAnswerWithCitations,
   scanRecallPersonIds,
+  sentenceFragmentOverlap,
+  stripLowOverlapSentences,
   stripOverlongModelQuotes,
   toRecallFragments,
   toSuperscript,
@@ -19,6 +23,7 @@ import {
   verifyCitation,
   type InjectionView,
 } from "../../citation.js";
+
 
 test("① 别名表加载：路径指向真实 JSON 时读取生效（含 关羽=P002）", () => {
   const dir = mkdtempSync(join(tmpdir(), "a004-alias-"));
@@ -811,4 +816,86 @@ test("⑲.2 非法 / 越界 offset、len：只跳过该条，不崩、不插错�
     "[片段1] 甲曰：⟨Q1⟩“乙。”",
     "越界定位跳过，合法定位照常编号"
   );
+});
+
+// ===== bug-00028 单轮方案：结构门第三条「句-片段文本重叠」——纯函数级用例 =====
+// 语义裁决已收进生成轮提示词（零额外 LLM 调用），本组只测结构门的归一化 / 重叠率 / 裁剪边界
+// （sentenceFragmentOverlap / stripLowOverlapSentences，见 citation.ts）。
+
+test("⑳ 结构门·重叠率：句子 2-gram 命中片段的比例（全文重合 → 1；无关句 → 0）", () => {
+  assert.equal(
+    sentenceFragmentOverlap("夏侯惇字元让。", "夏侯惇字元让，沛国谯人也。"),
+    1,
+    "句子 2-gram 全部命中片段"
+  );
+  assert.equal(
+    sentenceFragmentOverlap("刘备死的时候六十三岁。", "孙权闻玄德与孙夫人已去，急召周瑜商议。"),
+    0,
+    "答案断言与片段零字面重叠"
+  );
+});
+
+test("⑳.1 结构门·归一化：全角数字转半角、标点空白剔除、引语剔除（引语沿用服务端渲染，不参与判定）", () => {
+  assert.equal(sentenceFragmentOverlap("５５", "55"), 1, "全角数字转半角后同形");
+  assert.equal(
+    sentenceFragmentOverlap(
+      "关公曰：“酒且斟下，某去便来。”出帐提刀。",
+      "关公曰：“酒且斟下，某去便来。”出帐提刀，飞身上马。"
+    ),
+    1,
+    "引语（“…”）剔除后，叙述部分与片段同形"
+  );
+  assert.ok(
+    sentenceFragmentOverlap("张飞遇害时年55岁。", "时年五十五。") < SENTENCE_OVERLAP_THRESHOLD,
+    "「五十五」与「55」字面不同形 → 低重叠（语义等价不在纯文本结构门职责，由生成轮指令约束）"
+  );
+});
+
+test("⑳.2 结构门·裁剪边界：重叠 ≥ 阈值保留、< 阈值整句裁剪、全裁空串（调用方拒答）", () => {
+  const view = buildInjectionView([
+    {
+      text: "马超与张飞在葭萌关前大战，玄德在城上观战。自白日战至夜，不分胜负。",
+      source: "s",
+      chapter: 65,
+      title: "马超大战葭萌关　刘备自领益州牧",
+    },
+    {
+      text: "袁绍聚众官于帐中，商议起兵。",
+      source: "s",
+      chapter: 9,
+      title: "除暴凶吕布助司徒　犯长安李傕听贾诩",
+    },
+  ]);
+  // 高于阈值放行：原样保留
+  assert.equal(
+    stripLowOverlapSentences("马超与张飞在葭萌关前大战百余合，不分胜负。[片段1]", view),
+    "马超与张飞在葭萌关前大战百余合，不分胜负。[片段1]",
+    "重叠 ≥ 阈值 → 完整保留"
+  );
+  // 低于阈值裁剪：整句连同指针移除
+  assert.equal(
+    stripLowOverlapSentences("马超后来投靠了袁绍。[片段2]", view),
+    "",
+    "重叠 < 阈值 → 整句裁剪，返回空串（调用方据此拒答）"
+  );
+  // 混合：高低各一句 → 只留高重叠句
+  assert.equal(
+    stripLowOverlapSentences(
+      "马超与张飞在葭萌关前大战百余合，不分胜负。[片段1] 马超后来投靠了袁绍。[片段2]",
+      view
+    ),
+    "马超与张飞在葭萌关前大战百余合，不分胜负。[片段1]",
+    "低重叠句被裁、高重叠句保留"
+  );
+  // 引语句 [Qn] 与无指针句不受本门约束
+  assert.equal(
+    stripLowOverlapSentences("斩华雄者系关羽，原文见[Q1]。", view),
+    "斩华雄者系关羽，原文见[Q1]。",
+    "引语句不受句-片段重叠门约束（沿用服务端渲染）"
+  );
+});
+
+test("⑳.3 结构门·阈值常量：0.5 默认从严（低于裁剪 / 高于放行的分界），n-gram 取 2", () => {
+  assert.equal(SENTENCE_OVERLAP_THRESHOLD, 0.5, "阈值常量默认 0.5（Coco 定稿，先从严测边界）");
+  assert.equal(SENTENCE_OVERLAP_NGRAM, 2, "n-gram 长度默认 2（可对比 3-gram 调参）");
 });

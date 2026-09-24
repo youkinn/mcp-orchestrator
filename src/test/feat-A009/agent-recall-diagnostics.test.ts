@@ -69,6 +69,7 @@ function textResponse(text: string): ModelResponse {
   return { content: [{ type: 'text', text }] };
 }
 
+
 const ALIAS_TABLE = loadAliasTable('a009-not-exist'); // stub 别名表（关羽=P002、华雄=P013）
 
 const F1_QUOTE = '云长提刀出阵，斩华雄于帐前！';
@@ -164,7 +165,7 @@ test('① 快路径：候选进注入视图 → candidates[].injected=true + fun
         recallResult(makeDiagnostics(3, [candidate(1, CHUNK_1), candidate(2, CHUNK_2), candidate(3, CHUNK_3)]), 1),
     },
     fallbackConcluder: async () => '斩华雄者系关羽',
-    modelCaller: async () => textResponse('斩华雄者。[片段3]'),
+    modelCaller: async () => textResponse('华雄连斩数将，无人能敌。[片段3]'),
     retrievalDiagnosticsPersister: (traceId, seq, diagnostics) => {
       recorded.push({ traceId, seq, diagnostics: diagnostics as Record<string, unknown> });
     },
@@ -235,7 +236,7 @@ test('③ 未进 top-N 候选不标记：诊断含第 4 条候选、工具仅返
         ),
     },
     fallbackConcluder: async () => '斩华雄者系关羽',
-    modelCaller: async () => textResponse('斩华雄者。[片段3]'),
+    modelCaller: async () => textResponse('华雄连斩数将，无人能敌。[片段3]'),
     retrievalDiagnosticsPersister: (_traceId, _seq, diagnostics) => {
       recorded.push({ diagnostics: diagnostics as Record<string, unknown> });
     },

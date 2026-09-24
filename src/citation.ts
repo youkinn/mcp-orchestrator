@@ -1,4 +1,4 @@
-﻿// feat-A004：《三国演义》原著检索的引用硬校验模块
+// feat-A004：《三国演义》原著检索的引用硬校验模块
 // 校验规则：答案断言人物集合（ID 级）⊆ 召回原文人物集合（ID 级），不成立走兜底。
 // 人物 ID 化：本地别名表（封闭集合）扫描；无 ID 的次要人物退化为字符串包含校验。
 // 引用与出处改服务端渲染（spec §6.3）：模型只输出指针 `[Qn]`，引语原文与出处由本模块按
@@ -445,6 +445,106 @@ export function stripOverlongModelQuotes(answer: string): string {
   return answer.replace(/「([^」]*)」/g, (whole, inner: string) =>
     inner.length > MAX_MODEL_QUOTE_LENGTH ? "" : whole
   );
+}
+
+// bug-00028 单轮方案·结构门第三条：句-片段文本重叠（零 LLM，见 agent.ts applyNovelCitationGuard）。
+// 答案里带 [片段N] 的叙述句与该片段做字符 n-gram 重叠判定：归一化（剔除空白标点、全角数字转半角、
+// 引号内容不参与）后，句子 n-gram 命中片段集合的比例低于阈值 → 整句裁剪；引语句（[Qn]）不受此门
+// 约束（沿用服务端渲染）。只依赖片段文本，不引入任何词表 / 枚举。
+
+/** 句-片段重叠阈值（结构门第三条）：重叠率低于该值判定该句与片段不符（默认从严，0.5 起测边界） */
+export const SENTENCE_OVERLAP_THRESHOLD = 0.5;
+/** 句-片段重叠的字符 n-gram 长度 */
+export const SENTENCE_OVERLAP_NGRAM = 2;
+
+/** 重叠归一化：剔除引语（引号内容不参与本门判定）、全角数字转半角、剔除空白与标点 */
+function normalizeOverlapText(text: string): string {
+  return text
+    .replace(/「[^」]*」|『[^』]*』|“[^”]*”|‘[^’]*’/g, "")
+    .replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+    .replace(/[\s\p{P}\p{S}]/gu, "");
+}
+
+/** 字符 n-gram 集合 */
+function charNgrams(text: string, n: number): Set<string> {
+  const grams = new Set<string>();
+  for (let i = 0; i + n <= text.length; i++) {
+    grams.add(text.slice(i, i + n));
+  }
+  return grams;
+}
+
+/** 叙述句与片段的 n-gram 重叠率：句子 n-gram 命中片段集合的比例；句子不足 n 字符 → 0（从严） */
+export function sentenceFragmentOverlap(
+  sentence: string,
+  fragmentText: string,
+  n = SENTENCE_OVERLAP_NGRAM
+): number {
+  // 指针（[Qn] / [片段N]）是服务端编号标记，不参与文本重叠：先剔除再归一
+  const sentGrams = charNgrams(
+    normalizeOverlapText(sentence.replace(/\[(?:Q\d+|片段\d+)\]/g, "")),
+    n
+  );
+  if (sentGrams.size === 0) {
+    return 0;
+  }
+  const fragGrams = charNgrams(normalizeOverlapText(fragmentText), n);
+  let hit = 0;
+  for (const gram of sentGrams) {
+    if (fragGrams.has(gram)) {
+      hit += 1;
+    }
+  }
+  return hit / sentGrams.size;
+}
+
+/** 把答案切成句（句末标点 / 指针为边界），[Qn] / [片段N] 指针并入所属句子 */
+function splitAnswerSentences(answer: string): Array<{
+  text: string;
+  narrativePointers: string[];
+}> {
+  const sentences: Array<{ text: string; narrativePointers: string[] }> = [];
+  const re = /([^。！？；]*[。！？；]?)((?:\[(?:Q\d+|片段\d+)\])*)/g;
+  let matched: RegExpExecArray | null;
+  while ((matched = re.exec(answer)) !== null) {
+    if (matched[0] === "") {
+      break;
+    }
+    const text = (matched[1] ?? "") + (matched[2] ?? "");
+    if (!text.trim()) {
+      continue;
+    }
+    const narrativePointers = [...(matched[2] ?? "").matchAll(/\[片段(\d+)\]/g)].map(
+      (m) => `片段${m[1]}`
+    );
+    sentences.push({ text, narrativePointers });
+  }
+  return sentences;
+}
+
+/** 结构门第三条：裁剪与所引片段低重叠的叙述句（带 [片段N]）；句子引用多个片段时取最大重叠率。
+ * 返回裁剪后答案（调用方按空串 → 拒答「演义中未涉及」+ citations []）。 */
+export function stripLowOverlapSentences(
+  answer: string,
+  view: InjectionView
+): string {
+  const kept: string[] = [];
+  for (const sentence of splitAnswerSentences(answer)) {
+    if (sentence.narrativePointers.length === 0) {
+      kept.push(sentence.text);
+      continue;
+    }
+    const best = sentence.narrativePointers.reduce((max, pointer) => {
+      const fragment = view.fragments.get(pointer);
+      return fragment
+        ? Math.max(max, sentenceFragmentOverlap(sentence.text, fragment.text))
+        : max;
+    }, 0);
+    if (best >= SENTENCE_OVERLAP_THRESHOLD) {
+      kept.push(sentence.text);
+    }
+  }
+  return kept.join("");
 }
 
 /** 上标角标字符（feat-A006）：¹²³⁴⁵⁶⁷⁸⁹⁰，下标按出现顺序从 1 起 */
