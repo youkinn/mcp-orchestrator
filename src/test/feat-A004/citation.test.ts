@@ -454,7 +454,7 @@ test("⑯.1 上标角标：¹²³⁴⁵⁶⁷⁸⁹⁰ 字符集，>9 用多字�
   assert.equal(toSuperscript(100), "¹⁰⁰");
 });
 
-test("⑯.2 叙述段指针：`[片段N]` → 仅角标（不内联原文），citations 收录该片段（bug-00009 张飞题）", () => {
+test("⑯.2 叙述段指针（bug-00024）：指针后有正文 → 仅角标、正文保留；裸指针（后无正文）→ 「片段原文」+ 角标，citations 收录该片段", () => {
   const view: InjectionView = {
     text: "",
     quotes: new Map(),
@@ -470,20 +470,27 @@ test("⑯.2 叙述段指针：`[片段N]` → 仅角标（不内联原文），c
     ]),
     quoteFragments: new Map(),
   };
-  const out = renderAnswerWithCitations("张飞被范疆、张达刺死。[片段5]", view);
+  const naked = renderAnswerWithCitations("张飞被范疆、张达刺死。[片段5]", view);
   assert.equal(
-    out.answer,
-    "张飞被范疆、张达刺死。¹"
+    naked.answer,
+    "张飞被范疆、张达刺死。「范、张二贼，密入帐中，以短刀刺入飞腹。飞大叫一声而亡。」¹",
+    "裸指针（后无正文）以片段原文补全，answer 可独立成读"
   );
-  assert.doesNotMatch(out.answer, /密入帐中/, "叙述段指针不内联片段原文");
-  assert.deepEqual(out.citations, [
+  const withBody = renderAnswerWithCitations("张飞被范疆、张达刺死。[片段5]凶器为短刀。", view);
+  assert.equal(
+    withBody.answer,
+    "张飞被范疆、张达刺死。¹凶器为短刀。",
+    "指针后有正文：仅角标、正文保留、不内联原文（旧行为不变）"
+  );
+  assert.doesNotMatch(withBody.answer, /密入帐中/, "有正文时不内联片段原文");
+  assert.deepEqual(naked.citations, [
     {
       text: "范、张二贼，密入帐中，以短刀刺入飞腹。飞大叫一声而亡。",
       chapter: 81,
       title: "急兄仇张飞遇害　雪弟恨先主兴兵",
     },
   ]);
-  assert.doesNotMatch(out.answer, /\[片段5\]/, "指针已渲染替换");
+  assert.doesNotMatch(withBody.answer, /\[片段5\]/, "指针已渲染替换");
 });
 
 test("⑯.3 片段粒度合并：多引语同片段 → 一条 citation，角标相同", () => {
@@ -636,6 +643,51 @@ test("⑯.6 无引用恒 []：answer 无指针时 citations 为空、answer 原�
   const out = renderAnswerWithCitations(answer, view);
   assert.equal(out.answer, answer);
   assert.deepEqual(out.citations, []);
+});
+
+test("⑯.7 裸指针补全（bug-00024 实况）：相邻裸指针 `[片段N] [片段M]` → 各补「片段原文」+ 角标，无裸角标、无指针残留", () => {
+  const view: InjectionView = {
+    text: "",
+    quotes: new Map(),
+    fragments: new Map([
+      [
+        "片段3",
+        {
+          text: "吕布见了，弃了公孙瓒，便战张飞。",
+          chapter: 5,
+          title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+        },
+      ],
+      [
+        "片段4",
+        {
+          text: "飞抖擞精神，酣战吕布。连斗五十余合，不分胜负。",
+          chapter: 5,
+          title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+        },
+      ],
+    ]),
+    quoteFragments: new Map(),
+  };
+  const out = renderAnswerWithCitations(
+    "三英战吕布，先有张飞出马。\n\n[片段3] [片段4]",
+    view
+  );
+  assert.equal(
+    out.answer,
+    "三英战吕布，先有张飞出马。\n\n「吕布见了，弃了公孙瓒，便战张飞。」¹ 「飞抖擞精神，酣战吕布。连斗五十余合，不分胜负。」²",
+    "指针间的空白（模型输出自带）原样保留，渲染只替换指针 token"
+  );
+  assert.doesNotMatch(out.answer, /\[片段\d+\]/, "裸指针全部补全，无残留");
+  assert.doesNotMatch(out.answer, /(?<!」)[¹²³⁴⁵⁶⁷⁸⁹⁰]/, "角标均附着「原文」，无裸角标");
+  assert.equal(out.citations.length, 2, "两条裸指针各收录一条 citation");
+  assert.deepEqual(
+    out.citations.map((item) => item.text),
+    [
+      "吕布见了，弃了公孙瓒，便战张飞。",
+      "飞抖擞精神，酣战吕布。连斗五十余合，不分胜负。",
+    ]
+  );
 });
 
 test("⑰ 长引语安全网：超 30 字的「…」视为违规抄写被丢弃，短引语原样保留", () => {

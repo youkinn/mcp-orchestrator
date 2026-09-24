@@ -529,8 +529,12 @@ test("⑦ 注入上限放宽到 10 + 叙述段指针（bug-00009 张飞题）：
   });
   const data = await agent.processQueryData("张飞怎么死的");
   assert.ok(data.answer.startsWith("张飞被范疆、张达刺死。"), "叙述句指针渲染后保留结论");
-  assert.ok(data.answer.endsWith("¹"), "叙述段指针只渲染角标 ¹，不内联原文");
-  assert.doesNotMatch(data.answer, /密入帐中/, "answer 不内联片段原文（原文进 citations 卡片）");
+  assert.ok(
+    data.answer.endsWith(
+      "「范、张二贼，探知消息，初更时分，各藏短刀，密入帐中，直至床前。原来张飞每睡不合眼；当夜寝于帐中，二贼以短刀刺入飞腹。飞大叫一声而亡。时年五十五。」¹"
+    ),
+    "bug-00024：裸指针（后无正文）自动内联该片段原文 + 角标，answer 可独立成读"
+  );
   assert.equal(data.citations.length, 1, "只收被引用片段：仅 [片段5] 所在片段");
   assert.equal(data.citations[0].chapter, 81);
   assert.equal(data.citations[0].title, "急兄仇张飞遇害　雪弟恨先主兴兵");
@@ -541,4 +545,46 @@ test("⑦ 注入上限放宽到 10 + 叙述段指针（bug-00009 张飞题）：
   assert.doesNotMatch(data.answer, /\[片段5\]/, "指针已被服务端渲染替换");
   assert.doesNotMatch(data.answer, /【原文片段】/, "指针合法不走兜底");
   assert.equal(modelCallCount, 2, "校验通过不触发兜底结论归纳");
+});
+
+test("⑧ bug-00024 三英战吕布裸指针 trace：模型输出「结论\\n\\n[片段3] [片段4]」→ answer 内联两段「原文」+ 角标，形态与 5018ace0 好样本一致", async () => {
+  const frag2 = "张飞挺丈八蛇矛，直取吕布，二将大战五十余合，不分胜负。";
+  const frag3 = "云长拍马舞刀，与张飞夹攻吕布，三匹马丁字儿厮杀。";
+  const frag4 = "玄德掣双股剑，骤黄鬃马，刺斜里助战；吕布见三人围攻，架隔遮拦不定，拨马回阵而走。";
+  const entries = [
+    { id: "sanguo-yanyi:0005:c0014", text: "吕布纵赤兔马，往来驰骋，众诸侯莫敢近前。", chapter: 5, title: RECALL_TITLE, type: "narration", quotes: [] },
+    { id: "sanguo-yanyi:0005:c0015", text: frag2, chapter: 5, title: RECALL_TITLE, type: "narration", quotes: [] },
+    { id: "sanguo-yanyi:0005:c0016", text: frag3, chapter: 5, title: RECALL_TITLE, type: "narration", quotes: [] },
+    { id: "sanguo-yanyi:0005:c0017", text: frag4, chapter: 5, title: RECALL_TITLE, type: "narration", quotes: [] },
+  ];
+  let modelCallCount = 0;
+  const modelCaller = async (): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    return modelCallCount === 1
+      ? textResponse("1")
+      : textResponse("三英战吕布，吕布力敌三人，先战张飞，又敌关羽、刘备。\n\n[片段3] [片段4]");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "三英合力，战退吕布",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("三英战吕布，结局如何");
+  assert.equal(
+    data.answer,
+    `三英战吕布，吕布力敌三人，先战张飞，又敌关羽、刘备。\n\n「${frag3}」¹ 「${frag4}」²`,
+    "裸指针以片段原文补全（与 5018ace0 好样本同为「结论 + ¹引语正文 + ²引语正文」形态；指针间空白随模型输出保留）"
+  );
+  assert.doesNotMatch(data.answer, /\[片段\d+\]/, "裸指针全部渲染，无残留");
+  assert.doesNotMatch(data.answer, /⟨Q\d+⟩/, "无内部编号");
+  assert.doesNotMatch(data.answer, /(?<!」)[¹²³⁴⁵⁶⁷⁸⁹⁰]/, "角标均附着「原文」，无裸角标");
+  assert.equal(data.citations.length, 2, "两条裸指针各收录一条 citation（按出现顺序）");
+  assert.deepEqual(data.citations.map((item) => item.text), [frag3, frag4]);
+  assert.equal(modelCallCount, 2, "渲染兜底是确定性回收，不额外调模型");
 });

@@ -476,8 +476,9 @@ function resolvePointerRef(
 }
 
 /** 服务端渲染引用与出处（feat-A006）：`[Qn]` 引语指针 → 「引文」+ 全局上标角标，
- * `[片段N]` 叙述段指针 → 仅全局上标角标（不内联原文，answer 只放结论，原文进 citations 卡片）；
- * 不再内联出处；citations 按引用出现顺序、片段粒度合并（同片段多引语合并为一条，
+ * `[片段N]` 叙述段指针 → 指针后有正文时仅全局上标角标（不内联原文，正文保留）；裸指针
+ * （跳过空白后遇另一指针 `[` 或字符串末尾）→ 「片段原文」+ 角标（bug-00024，与 [Qn] 同形态，
+ * answer 自洽可独立成读）；不再内联出处；citations 按引用出现顺序、片段粒度合并（同片段多引语合并为一条，
  * 角标数量 = 片段数量），只收被引用片段；未注册的指针原样保留。 */
 export function renderAnswerWithCitations(
   answer: string,
@@ -485,27 +486,34 @@ export function renderAnswerWithCitations(
 ): ChatData {
   const citations: Citation[] = [];
   const citedIndexes = new Map<string, number>();
-  const rendered = answer.replace(/\[(Q\d+|片段\d+)\]/g, (whole, ref: string) => {
-    const resolved = resolvePointerRef(ref, view);
-    if (!resolved) {
-      return whole;
+  const rendered = answer.replace(
+    /\[(Q\d+|片段\d+)\]/g,
+    (whole, ref: string, offset: number) => {
+      const resolved = resolvePointerRef(ref, view);
+      if (!resolved) {
+        return whole;
+      }
+      let index = citedIndexes.get(resolved.fragmentKey);
+      if (index === undefined) {
+        index = citations.length + 1;
+        citedIndexes.set(resolved.fragmentKey, index);
+        const fragment = view.fragments.get(resolved.fragmentKey);
+        citations.push({
+          text: fragment?.text ?? resolved.quote.text,
+          chapter: fragment?.chapter ?? resolved.quote.chapter,
+          title: fragment?.title ?? resolved.quote.title,
+        });
+      }
+      if (ref.startsWith("Q")) {
+        return `「${resolved.quote.text}」${toSuperscript(index)}`;
+      }
+      // bug-00024：裸指针（跳过空白后遇另一指针或字符串末尾）→ 以片段原文补全
+      if (/^\s*(?:\[|$)/.test(answer.slice(offset + whole.length))) {
+        return `「${resolved.quote.text}」${toSuperscript(index)}`;
+      }
+      return toSuperscript(index);
     }
-    let index = citedIndexes.get(resolved.fragmentKey);
-    if (index === undefined) {
-      index = citations.length + 1;
-      citedIndexes.set(resolved.fragmentKey, index);
-      const fragment = view.fragments.get(resolved.fragmentKey);
-      citations.push({
-        text: fragment?.text ?? resolved.quote.text,
-        chapter: fragment?.chapter ?? resolved.quote.chapter,
-        title: fragment?.title ?? resolved.quote.title,
-      });
-    }
-    if (ref.startsWith("Q")) {
-      return `「${resolved.quote.text}」${toSuperscript(index)}`;
-    }
-    return toSuperscript(index);
-  });
+  );
   return { answer: rendered, citations };
 }
 
