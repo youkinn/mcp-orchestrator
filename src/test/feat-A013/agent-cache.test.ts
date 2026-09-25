@@ -280,7 +280,7 @@ test("问点不同（chapter vs process）不命中：走原链路且不写缓�
   assert.equal(row?.nearestQuery, "严颜被义释是哪一回");
 });
 
-test("开关：关闭后同一问题再问走 LLM（不查不落），开启后恢复命中", async () => {
+test("开关：关闭后同一问题再问走 LLM（不查不落），关闭即清空；开启后池空同问重新走 LLM 并重新入池", async () => {
   const vectors = new Map<string, Float32Array>();
   vectors.set("谁斩了华雄", unitVector(0));
   const fixture = makeAgentFixture({ vectors });
@@ -292,11 +292,14 @@ test("开关：关闭后同一问题再问走 LLM（不查不落），开启后�
   assert.equal(fixture.transport.toolCalls.length, 2, "关闭后同一问题再问走检索");
   assert.equal(fixture.transport.embedCalls.length, 1, "关闭后不查缓存（旁路不调 embed）");
   assert.equal(fixture.logStore.cacheLogs.length, 1, "关闭后不落 cache_logs");
+  assert.equal(fixture.manager.getStatus().entryCount, 0, "关闭 = 停用 + 清空（负责人 2026-09-25 拍板）：池子已清空");
   fixture.manager.setEnabled(true);
   await trace("sw-3", () => fixture.agent.processQueryData("谁斩了华雄", "sango-novel"));
-  assert.equal(fixture.modelCalls.generation, 2, "开启后恢复命中（0 次 LLM）");
-  assert.equal(fixture.transport.toolCalls.length, 2, "开启后恢复命中（检索次数不再增长）");
-  assert.equal(fixture.transport.embedCalls.length, 2, "开启后恢复判定（embed 调用恢复）");
+  // 新口径（负责人 2026-09-25 拍板）：关闭即清空，重开从空池重新积累——同问不再命中
+  assert.equal(fixture.modelCalls.generation, 3, "开启后池子已空：同问重新走 LLM 并重新入池");
+  assert.equal(fixture.transport.toolCalls.length, 3, "开启后同问重新走检索");
+  assert.equal(fixture.transport.embedCalls.length, 2, "空池 lookup 仍先取 embedding 再判空（§1.2 步骤 1），本次 +1");
+  assert.equal(fixture.manager.getStatus().entryCount, 1, "重新入池：池内 1 条");
 });
 
 test("embedding 降级：/api/chat 等价行为不受影响，请求正常返回，console.warn 一次", async () => {

@@ -454,13 +454,20 @@ export class CacheManager {
   }
 
   /** 开关（§1.6 / §3.2）：进程内状态立即生效，并同步写持久化 cache_settings（失败旁路静默）；
-   * 重启恢复上次开关状态；env CACHE_ENABLED 显式设置优先于运行时切换 */
+   * 重启恢复上次开关状态；env CACHE_ENABLED 显式设置优先于运行时切换。
+   * 口径（负责人 2026-09-25 拍板，偏离 A013 归档『开关与清除分离』）：关闭 = 停用 + 清空——
+   * setEnabled(false) 同步清空缓存池（内存 + cache_entries 镜像，cache_logs 保留，同 clearAll 语义）；
+   * 重开从空池重新积累，验收 8『开启后恢复命中』不再成立；setEnabled(true) 不清空、行为不变。 */
   setEnabled(enabled: boolean): CacheStatus {
     this.enabled = enabled;
     try {
       this.logStore.setCacheSetting(CACHE_ENABLED_SETTING_KEY, enabled ? "true" : "false");
     } catch {
       // 旁路静默：持久化失败不影响本次切换语义（下次启动回退 env / 缺省）
+    }
+    if (!enabled) {
+      // 关闭 = 停用 + 清空：直接走 clearAll（内存 + 镜像清空，cache_logs 保留）
+      this.clearAll();
     }
     return this.getStatus();
   }

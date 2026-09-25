@@ -358,25 +358,31 @@ test("lookup：分区边界——0.92 命中 / 0.80 灰色区（不写）/ 0.799
   }
 });
 
-test("lookup：开关关闭 → 旁路（不调 embed、不落 cache_logs、record 不写）；开启恢复", async () => {
+test("lookup：开关关闭 → 旁路（不调 embed、不落 cache_logs、record 不写）且关闭即清空；开启后池空同问重新判定", async () => {
   const { manager, logStore, embed } = makeManager();
   embed.vectors.set("谁斩了华雄", unitVector(5));
   await writeEntry(manager, "谁斩了华雄", "t1");
 
   const status = manager.setEnabled(false);
   assert.equal(status.enabled, false);
+  assert.equal(manager.getStatus().entryCount, 0, "关闭 = 停用 + 清空（负责人 2026-09-25 拍板）：池子已清空");
+  assert.equal(logStore.mirrors.length, 0, "关闭即清空镜像");
   const lookup = await manager.lookup("谁斩了华雄", "t2");
   assert.equal(lookup, null, "关闭后不查缓存");
   assert.equal(embed.calls.length, 1, "关闭后不应调用 embed");
   assert.equal(logStore.cacheLogs.length, 1, "关闭后不再落 cache_logs");
   manager.record("谁斩了华雄", "t2", lookup, ANSWER);
-  assert.equal(manager.getStatus().entryCount, 1, "关闭后 record 不写");
+  assert.equal(manager.getStatus().entryCount, 0, "关闭后 record 不写");
+  assert.equal(logStore.mirrors.length, 0, "关闭后 record 不写镜像");
 
   const reopened = manager.setEnabled(true);
   assert.equal(reopened.enabled, true);
-  const hit = await manager.lookup("谁斩了华雄", "t3");
-  assert.equal(hit?.hit, true, "开启后恢复命中");
-  assert.equal(embed.calls.length, 2);
+  // 新口径（负责人 2026-09-25 拍板）：关闭即清空，重开从空池重新积累——同问不再命中（验收 8 不再成立）
+  const miss = await manager.lookup("谁斩了华雄", "t3");
+  assert.equal(miss?.hit, false, "开启后池子已空：同一问题重新判定（不命中）");
+  assert.equal(miss?.reason, "miss-low");
+  assert.equal(embed.calls.length, 2, "空池 lookup 仍先取 embedding 再判空（§1.2 步骤 1）");
+  assert.equal(manager.getStatus().entryCount, 0, "仅判定未 record 不入池");
 });
 
 test("lookup：embed 降级（isError / 抛异常 / 出参非法）→ 等同开关关闭，console.warn 一次，不落 cache_logs", async () => {
@@ -575,18 +581,31 @@ test("LRU：小容量写入超上限从队尾逐出（内存删 + 镜像 DELETE�
   assert.equal(manager.getStatus().entryCount, 2);
 });
 
-test("管理操作：setEnabled 返回新状态、deleteEntry 仅删该 id、clearAll 返回清除数且镜像全清", async () => {
+test("管理操作：setEnabled 返回新状态（关闭 = 停用 + 清空，幂等）、deleteEntry 仅删该 id、clearAll 返回清除数且镜像全清", async () => {
   const { manager, logStore, embed } = makeManager();
   embed.vectors.set("管Q甲", unitVector(30));
   embed.vectors.set("管Q乙", unitVector(31));
+
+  // 空池切开关：状态形状正确；重复关闭幂等
+  assert.deepEqual(manager.setEnabled(false), { enabled: false, hitLine: 0.92, maxEntries: 500, entryCount: 0 });
+  assert.equal(manager.setEnabled(false).enabled, false, "重复关闭幂等、不报错");
+  assert.equal(manager.setEnabled(true).enabled, true, "重开状态正确");
+
   await writeEntry(manager, "管Q甲", "m1");
   await writeEntry(manager, "管Q乙", "m2");
+  assert.equal(manager.getStatus().entryCount, 2, "开启状态可正常入池");
 
+  // 关闭 = 停用 + 清空（负责人 2026-09-25 拍板）：内存池与镜像清空，重开从空池重新积累
   const status = manager.setEnabled(false);
-  assert.deepEqual(status, { enabled: false, hitLine: 0.92, maxEntries: 500, entryCount: 2 });
+  assert.deepEqual(status, { enabled: false, hitLine: 0.92, maxEntries: 500, entryCount: 0 });
+  assert.equal(logStore.mirrors.length, 0, "关闭即清空镜像");
+  assert.equal(manager.listEntries({ pageSize: 100 }).total, 0, "关闭后 listEntries 为空");
   const enabledAgain = manager.setEnabled(true);
   assert.equal(enabledAgain.enabled, true);
 
+  // 重开后再写条目，验证 deleteEntry / clearAll（原语义不变）
+  await writeEntry(manager, "管Q甲", "m3");
+  await writeEntry(manager, "管Q乙", "m4");
   const idA = manager.listEntries({ pageSize: 100 }).list.find((item) => item.queryText === "管Q甲")?.id as number;
   assert.equal(manager.deleteEntry(idA), true, "删除存在的 id 返回 true");
   assert.equal(manager.deleteEntry(9999), false, "删除不存在的 id 返回 false");
@@ -596,8 +615,7 @@ test("管理操作：setEnabled 返回新状态、deleteEntry 仅删该 id、cle
   const target = manager.listEntries({ pageSize: 100 }).list[0];
   assert.equal(target.queryText, "管Q乙");
   // 删除的 id 不影响再次命中其余条目
-  embed.vectors.set("管Q乙", unitVector(31));
-  const hit = await manager.lookup("管Q乙", "m3");
+  const hit = await manager.lookup("管Q乙", "m5");
   assert.equal(hit?.hit, true, "单条删除仅该条目失效");
 
   const cleared = manager.clearAll();
@@ -768,6 +786,30 @@ test("开关构造恢复：cache_settings 持久化 'false' → 无显式 env �
       process.env.CACHE_ENABLED = previous;
     }
   }
+});
+
+test("开关口径：关闭 = 停用 + 清空——entryCount 归零、listEntries 空、镜像清空；重开仍为空；重复 false 幂等", async () => {
+  const { manager, logStore, embed } = makeManager();
+  embed.vectors.set("清Q甲", unitVector(50));
+  embed.vectors.set("清Q乙", unitVector(51));
+  await writeEntry(manager, "清Q甲", "c1");
+  await writeEntry(manager, "清Q乙", "c2");
+  assert.equal(manager.getStatus().entryCount, 2, "前置：池内有 2 条");
+  assert.equal(logStore.mirrors.length, 2, "前置：镜像 2 条");
+
+  assert.equal(manager.setEnabled(false).enabled, false);
+  assert.equal(manager.getStatus().entryCount, 0, "关闭即清空内存池");
+  assert.equal(manager.listEntries({ pageSize: 100 }).total, 0, "关闭后 listEntries 为空");
+  assert.equal(manager.listEntries({ pageSize: 100 }).list.length, 0, "关闭后条目明细为空");
+  assert.equal(logStore.mirrors.length, 0, "关闭即清空 cache_entries 镜像（cache_logs 保留）");
+  assert.equal(logStore.cacheLogs.length, 2, "cache_logs 历史保留（清空不动审计数据）");
+
+  assert.equal(manager.setEnabled(false).enabled, false, "重复关闭幂等、不报错");
+  assert.equal(manager.getStatus().entryCount, 0, "重复关闭后仍为空");
+  assert.equal(manager.setEnabled(true).enabled, true, "重开状态正确");
+  assert.equal(manager.getStatus().entryCount, 0, "重开从空池重新积累（验收 8『开启后恢复命中』不再成立）");
+  assert.equal(manager.listEntries({ pageSize: 100 }).total, 0, "重开后 listEntries 仍为空");
+  assert.equal(logStore.mirrors.length, 0, "重开后镜像为空");
 });
 
 test("setHitLine：运行时调整命中线立即生效；越界拒绝（返回 NaN 且值不变）", async () => {

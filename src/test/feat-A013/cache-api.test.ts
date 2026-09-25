@@ -55,6 +55,10 @@ class FakeCacheManager implements CacheManager {
 
   setEnabled(enabled: boolean): CacheStatus {
     this.enabled = enabled;
+    if (!enabled) {
+      // 关闭 = 停用 + 清空（与真实 CacheManager 对齐，负责人 2026-09-25 拍板）：entries 同步清空
+      this.entries.clear();
+    }
     return this.getStatus();
   }
 
@@ -866,12 +870,14 @@ test('⑯ 开关持久化闭环：PUT enabled=false → 同一 LogStore 重建 C
   assert.equal(putRes.status, 200);
   const afterPut = await get(baseUrl1, '/api/v1/cache/status');
   assert.equal(afterPut.body.data.enabled, false, '切换立即生效');
+  assert.equal(afterPut.body.data.entryCount, 0, '关闭 = 停用 + 清空：entryCount 归零');
 
   // ② 同一持久化存储重建 CacheManager（模拟重启）：GET 仍 false
   const second = new CacheManagerImpl({ transport: new FakeEmbedClient(), logStore });
   const baseUrl2 = await startCacheApi(t, second, logStore);
   const restarted = await get(baseUrl2, '/api/v1/cache/status');
   assert.equal(restarted.body.data.enabled, false, '重启恢复上次持久化开关 false');
+  assert.equal(restarted.body.data.entryCount, 0, '关闭即清空：重建后池空');
 
   // ③ env CACHE_ENABLED=true 显式设置优先于持久化 'false'
   process.env.CACHE_ENABLED = 'true';

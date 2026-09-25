@@ -178,7 +178,8 @@ export function createCacheApi(cacheManager: CacheManager, logStore?: LogStore):
   });
 
   // PUT /api/v1/cache/status —— 开关切换（§3.2；必须 boolean，立即生效；重启恢复上次开关状态，
-  // env CACHE_ENABLED 显式设置优先于运行时切换）
+  // env CACHE_ENABLED 显式设置优先于运行时切换。口径（负责人 2026-09-25 拍板）：关闭 = 停用 + 清空，
+  // setEnabled(false) 同步清空缓存池（内存 + cache_entries 镜像清空，cache_logs 保留），重开从空池重新积累）
   router.put('/status', (request: Request, response: Response) => {
     try {
       const enabled = (request.body ?? {}) as { enabled?: unknown };
