@@ -11,6 +11,7 @@ import type { Agent } from '../../agent.js';
 import { createServer } from '../../server.js';
 import type { MCPTransport } from '../../transport.js';
 import type { ToolCallResult } from '../../types.js';
+import { CacheManager as CacheManagerImpl } from '../../cache.js';
 import { createLogStore, type LogStore } from '../../storage/logs.js';
 import {
   createCacheApi,
@@ -127,6 +128,24 @@ class StubAgent {
 class QuizSimTransport {
   async fengyunsanguo_quiz_command(message: string): Promise<ToolCallResult> {
     return { content: [{ type: 'text', text: `模拟回复：${message}` }] };
+  }
+}
+
+/** CacheEmbeddingClient 形状（§1.7.2）：callInternal；本用例构造不真跑 embed */
+class FakeEmbedClient {
+  async callInternal(_name: string, _args: Record<string, unknown>): Promise<ToolCallResult> {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            dim: 1024,
+            encoding: 'base64-float32-le',
+            data: Buffer.alloc(4096).toString('base64'),
+          }),
+        },
+      ],
+    };
   }
 }
 
@@ -816,4 +835,48 @@ test('⑮ PUT /max-entries：缓存上限运行时调整 200 / 非法 400 / 值�
   assert.equal(noBody.status, 400);
   const still = await get(baseUrl, '/api/v1/cache/status');
   assert.equal(still.body.data.maxEntries, 800, '非法调整后上限不变');
+});
+
+test('⑯ 开关持久化闭环：PUT enabled=false → 同一 LogStore 重建 CacheManager → GET 仍 false；env CACHE_ENABLED=true 显式设置优先于持久化', async (t) => {
+  const keys = ['CACHE_ENABLED', 'CACHE_HIT_LINE', 'CACHE_MAX_ENTRIES'];
+  const previous: Record<string, string | undefined> = {};
+  for (const key of keys) {
+    previous[key] = process.env[key];
+  }
+  t.after(() => {
+    for (const key of keys) {
+      if (previous[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = previous[key];
+      }
+    }
+  });
+  for (const key of keys) {
+    delete process.env[key];
+  }
+
+  const logStore = createLogStore({ dbPath: ':memory:' });
+  t.after(() => logStore.close());
+
+  // ① 首个实例：PUT 关 → 状态立即 false
+  const first = new CacheManagerImpl({ transport: new FakeEmbedClient(), logStore });
+  const baseUrl1 = await startCacheApi(t, first, logStore);
+  const putRes = await send(baseUrl1, 'PUT', '/api/v1/cache/status', { enabled: false });
+  assert.equal(putRes.status, 200);
+  const afterPut = await get(baseUrl1, '/api/v1/cache/status');
+  assert.equal(afterPut.body.data.enabled, false, '切换立即生效');
+
+  // ② 同一持久化存储重建 CacheManager（模拟重启）：GET 仍 false
+  const second = new CacheManagerImpl({ transport: new FakeEmbedClient(), logStore });
+  const baseUrl2 = await startCacheApi(t, second, logStore);
+  const restarted = await get(baseUrl2, '/api/v1/cache/status');
+  assert.equal(restarted.body.data.enabled, false, '重启恢复上次持久化开关 false');
+
+  // ③ env CACHE_ENABLED=true 显式设置优先于持久化 'false'
+  process.env.CACHE_ENABLED = 'true';
+  const third = new CacheManagerImpl({ transport: new FakeEmbedClient(), logStore });
+  const baseUrl3 = await startCacheApi(t, third, logStore);
+  const envWins = await get(baseUrl3, '/api/v1/cache/status');
+  assert.equal(envWins.body.data.enabled, true, 'env 显式设置优先于持久化');
 });

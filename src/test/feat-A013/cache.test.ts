@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   CACHE_VERSION,
+  CACHE_ENABLED_SETTING_KEY,
   CacheManager,
   EMBEDDING_BYTES,
   ENTRY_STRUCTURE_BYTES,
@@ -21,6 +22,7 @@ class FakeCacheLogStore implements CacheLogStore {
   updates: Array<{ id: number; patch: { hitCount?: number; lastAccessAt?: number } }> = [];
   deletes: number[] = [];
   clearCount = 0;
+  settings = new Map<string, string>();
 
   appendCacheLog(traceId: string, payload: CacheLogPayload): void {
     this.cacheLogs.push({ traceId, payload });
@@ -41,6 +43,12 @@ class FakeCacheLogStore implements CacheLogStore {
   clearCacheEntries(): void {
     this.clearCount += 1;
     this.mirrors = [];
+  }
+  getCacheSetting(key: string): string | null {
+    return this.settings.get(key) ?? null;
+  }
+  setCacheSetting(key: string, value: string): void {
+    this.settings.set(key, value);
   }
 }
 
@@ -708,6 +716,56 @@ test("env 默认值：CACHE_ENABLED / CACHE_HIT_LINE / CACHE_MAX_ENTRIES 启动�
       } else {
         process.env[key] = previous[key];
       }
+    }
+  }
+});
+
+test("开关持久化：setEnabled(false) 写 cache_settings；同一存储重建恢复上次开关状态（env 未显式设置）", () => {
+  const keys = ["CACHE_ENABLED", "CACHE_HIT_LINE", "CACHE_MAX_ENTRIES"];
+  const previous: Record<string, string | undefined> = {};
+  for (const key of keys) {
+    previous[key] = process.env[key];
+  }
+  try {
+    for (const key of keys) {
+      delete process.env[key];
+    }
+    const fixture = makeManager({ enabled: undefined });
+    fixture.manager.setEnabled(false);
+    assert.equal(
+      fixture.logStore.getCacheSetting(CACHE_ENABLED_SETTING_KEY),
+      "false",
+      "setEnabled(false) 后持久化读到 'false'"
+    );
+    const restored = new CacheManager({
+      transport: new FakeEmbedClient(),
+      logStore: fixture.logStore,
+    });
+    assert.equal(restored.getStatus().enabled, false, "同一持久化存储重建后恢复上次开关 false");
+  } finally {
+    for (const key of keys) {
+      if (previous[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = previous[key];
+      }
+    }
+  }
+});
+
+test("开关构造恢复：cache_settings 持久化 'false' → 无显式 env 时新 manager enabled=false", () => {
+  const previous = process.env.CACHE_ENABLED;
+  try {
+    delete process.env.CACHE_ENABLED;
+    const logStore = new FakeCacheLogStore();
+    logStore.setCacheSetting(CACHE_ENABLED_SETTING_KEY, "false");
+    const manager = new CacheManager({ transport: new FakeEmbedClient(), logStore });
+    assert.equal(manager.getStatus().enabled, false, "持久化 'false' 构造恢复生效");
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CACHE_ENABLED;
+    } else {
+      process.env.CACHE_ENABLED = previous;
     }
   }
 });

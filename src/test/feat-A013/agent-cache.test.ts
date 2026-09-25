@@ -131,6 +131,10 @@ class FakeCacheLogStore implements CacheLogStore {
     this.clearCount += 1;
     this.mirrors = [];
   }
+  setCacheSetting(_key: string, _value: string): void {}
+  getCacheSetting(_key: string): string | null {
+    return null;
+  }
 }
 
 const RECALL_QUOTE = "云长提刀出阵，斩华雄于帐前！";

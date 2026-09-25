@@ -21,6 +21,9 @@ export const DEFAULT_HIT_LINE = 0.92;
 /** 默认缓存上限（§1.5）：CACHE_MAX_ENTRIES env 默认值（保守起步，实测后上调至 ≤ 1000） */
 export const DEFAULT_MAX_ENTRIES = 500;
 
+/** 开关持久化键（cache_settings 表，见 src/storage/logs.ts）：setEnabled 写入、构造恢复读取 */
+export const CACHE_ENABLED_SETTING_KEY = "cache.enabled";
+
 /** embedding 维度与字节口径（§1.1 / §3.5）：1024 维 × 4B = 4096 */
 export const EMBEDDING_DIM = 1024;
 export const EMBEDDING_BYTES = EMBEDDING_DIM * 4;
@@ -220,11 +223,12 @@ function decodeEmbedding(text: string): Float32Array | null {
   }
 }
 
-/** 环境变量读取：CACHE_ENABLED 初始开关（默认开）；解析失败按默认（与配置项口径一致） */
-function readEnvEnabled(): boolean {
+/** 环境变量读取：CACHE_ENABLED 显式设置 → 布尔值；未设置 / 空串 → null（调用方依次回退持久化值 / 缺省 true）；
+ * 解析失败按 true（与配置项口径一致） */
+function readEnvEnabled(): boolean | null {
   const raw = process.env.CACHE_ENABLED;
   if (raw === undefined || raw.trim() === "") {
-    return true;
+    return null;
   }
   const value = raw.trim().toLowerCase();
   return !(value === "0" || value === "false" || value === "off" || value === "no");
@@ -238,6 +242,22 @@ function readEnvNumber(name: string, fallback: number): number {
   }
   const value = Number(raw);
   return Number.isFinite(value) ? value : fallback;
+}
+
+/** 持久化恢复：cache_settings 上次运行时开关值（'true' / 'false'）；无记录 / 非法 / 读取失败 → null（回缺省） */
+function readPersistedEnabled(logStore: CacheLogStore): boolean | null {
+  try {
+    const raw = logStore.getCacheSetting(CACHE_ENABLED_SETTING_KEY);
+    if (raw === "true") {
+      return true;
+    }
+    if (raw === "false") {
+      return false;
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 /** LogStore 公开方法契约（接口文档 §2.4）：cache_logs 落一行 + cache_entries 镜像，同步直写、旁路静默。
  * 方法名照 §2.4；payload 形状由本文件定义（老陈按 §2.1 / §2.2 列对齐实现）。 */
@@ -274,6 +294,10 @@ export interface CacheLogStore {
   ): void;
   deleteCacheEntry(id: number): void;
   clearCacheEntries(): void;
+  /** 持久化设置读取（cache_settings 表）：无记录 / 读取失败 → null */
+  getCacheSetting(key: string): string | null;
+  /** 持久化设置写入（cache_settings 表）：同步直写、失败旁路静默（与其余 cache 写入一致） */
+  setCacheSetting(key: string, value: string): void;
 }
 
 /** embedding 获取通道（§1.7.2 总台装配）：MCPTransport.callInternal，
@@ -370,7 +394,8 @@ export interface CacheManagerOptions {
   transport: CacheEmbeddingClient;
   /** LogStore（老陈按 §2.4 落库点实现后传入 getLogStore()；测试注入内存 fake） */
   logStore: CacheLogStore;
-  /** 开关初始值：缺省读 CACHE_ENABLED env（默认开） */
+  /** 开关初始值：显式传入最优先（测试注入）；缺省依次回退 CACHE_ENABLED env（仅显式设置，部署级硬开关）→
+   * cache_settings 持久化上次运行时值 → 默认开 */
   enabled?: boolean;
   /** 命中线：缺省读 CACHE_HIT_LINE env（默认 0.92）；启动配置项，运行时不可改 */
   hitLine?: number;
@@ -403,7 +428,9 @@ export class CacheManager {
   constructor(options: CacheManagerOptions) {
     this.embedClient = options.transport;
     this.logStore = options.logStore;
-    this.enabled = options.enabled ?? readEnvEnabled();
+    // 开关解析优先级（高→低）：显式 options.enabled → env CACHE_ENABLED 显式设置（部署级硬开关）→
+    // cache_settings 持久化上次运行时值 → 缺省 true（重启恢复上次开关状态，env 显式设置优先）
+    this.enabled = options.enabled ?? readEnvEnabled() ?? readPersistedEnabled(this.logStore) ?? true;
     this.hitLine = options.hitLine ?? readEnvNumber("CACHE_HIT_LINE", DEFAULT_HIT_LINE);
     this.maxEntries =
       options.maxEntries ??
@@ -426,9 +453,15 @@ export class CacheManager {
     };
   }
 
-  /** 开关（§1.6 / §3.2）：进程内状态立即生效；不做持久化，重启回 CACHE_ENABLED 初始值 */
+  /** 开关（§1.6 / §3.2）：进程内状态立即生效，并同步写持久化 cache_settings（失败旁路静默）；
+   * 重启恢复上次开关状态；env CACHE_ENABLED 显式设置优先于运行时切换 */
   setEnabled(enabled: boolean): CacheStatus {
     this.enabled = enabled;
+    try {
+      this.logStore.setCacheSetting(CACHE_ENABLED_SETTING_KEY, enabled ? "true" : "false");
+    } catch {
+      // 旁路静默：持久化失败不影响本次切换语义（下次启动回退 env / 缺省）
+    }
     return this.getStatus();
   }
 

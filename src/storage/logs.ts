@@ -130,6 +130,10 @@ CREATE TABLE IF NOT EXISTS cache_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_cache_logs_created ON cache_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_cache_logs_hit_created ON cache_logs(hit, created_at);
+CREATE TABLE IF NOT EXISTS cache_settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS cache_hit_line_changes (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   previous   REAL NOT NULL,
@@ -587,6 +591,10 @@ export interface LogStore {
   appendHitLineChange(previous: number, current: number): void;
   /** feat-A013：最近一条命中线修改记录（ORDER BY id DESC LIMIT 1）；无记录 / 读取失败 → null */
   getLastHitLineChange(): { previous: number; current: number; at: number } | null;
+  /** feat-A013 验收遗留：缓存设置持久化写入（cache_settings 表；同步直写，失败旁路静默不抛，同 §2.4 风格） */
+  setCacheSetting(key: string, value: string): void;
+  /** feat-A013 验收遗留：读取持久化的缓存设置；无记录 / 读取失败 → null */
+  getCacheSetting(key: string): string | null;
   /** 立即把写缓冲批量落盘（测试 / 优雅退出用；生产由 1s 或 50 条自动触发） */
   flush(): void;
   /** 立即执行一次过期数据清理（每日定时器之外，供测试） */
@@ -844,6 +852,8 @@ function createNoopStore(): LogStore {
     countCacheEntries: () => 0,
     appendHitLineChange: noopWrite,
     getLastHitLineChange: () => null,
+    setCacheSetting: noopWrite,
+    getCacheSetting: () => null,
     flush: noopWrite,
     runRetentionCleanup: noopWrite,
     close: noopWrite,
@@ -1031,6 +1041,13 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   `);
   const queryLastHitLineChangeStmt = db.prepare(
     `SELECT previous, current, changed_at FROM cache_hit_line_changes ORDER BY id DESC LIMIT 1`
+  );
+  /** feat-A013 验收遗留：缓存开关持久化（cache_settings；同步直写，失败旁路静默，同 appendHitLineChange 风格） */
+  const insertCacheSettingStmt = db.prepare(
+    'INSERT OR REPLACE INTO cache_settings (key, value) VALUES (?, ?)'
+  );
+  const queryCacheSettingStmt = db.prepare(
+    'SELECT value FROM cache_settings WHERE key = ?'
   );
   const pendingOps: Array<() => void> = [];
 
@@ -1555,6 +1572,25 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           : { previous: row.previous, current: row.current, at: row.changed_at };
       } catch (error) {
         console.error('Failed to read last hit line change:', error);
+        return null;
+      }
+    },
+
+    setCacheSetting(key, value): void {
+      // 同步直写 + 失败旁路静默：开关持久化是下次启动恢复依据，写入失败不影响本次切换语义
+      try {
+        insertCacheSettingStmt.run(key, value);
+      } catch (error) {
+        console.error('Failed to write cache setting (bypass):', error);
+      }
+    },
+
+    getCacheSetting(key) {
+      try {
+        const row = queryCacheSettingStmt.get(key) as { value: string } | undefined;
+        return row === undefined ? null : row.value;
+      } catch (error) {
+        console.error('Failed to read cache setting:', error);
         return null;
       }
     },
@@ -2091,4 +2127,14 @@ export function appendHitLineChange(previous: number, current: number): void {
 /** feat-A013：最近一条命中线修改记录（§3.6 overview.lastHitLineChange 数据源；无记录 → null） */
 export function getLastHitLineChange(): { previous: number; current: number; at: number } | null {
   return getLogStore().getLastHitLineChange();
+}
+
+/** feat-A013 验收遗留：缓存设置持久化写入（cache_settings；同步直写，失败旁路静默） */
+export function setCacheSetting(key: string, value: string): void {
+  getLogStore().setCacheSetting(key, value);
+}
+
+/** feat-A013 验收遗留：读取持久化的缓存设置（无记录 / 读取失败 → null） */
+export function getCacheSetting(key: string): string | null {
+  return getLogStore().getCacheSetting(key);
 }
