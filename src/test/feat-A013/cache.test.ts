@@ -52,12 +52,13 @@ class FakeCacheLogStore implements CacheLogStore {
   }
 }
 
-/** 出参编码（§1.7.1 成功形状） */
+/** 出参编码（§1.7.1 成功形状；A016 §3.3 新增 normVersion——编排侧只读 dim/encoding/data、忽略新字段） */
 function encodeEmbedding(vec: Float32Array): string {
   return JSON.stringify({
     dim: 1024,
     encoding: "base64-float32-le",
     data: Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength).toString("base64"),
+    normVersion: "A016-N1",
   });
 }
 
@@ -879,47 +880,61 @@ test("setMaxEntries：调大生效并返回新值；调小立即从队尾逐出�
   assert.equal(manager.getStatus().entryCount, 2, "非法后条目不变");
 });
 
-test("lookup：人名字号归一化换说法命中（云长→关羽）；落库仍存原始文本", async () => {
+test("lookup：归一化由工具承接——换说法同向量命中，编排侧传原文不改写（A016 §3.1 / §4.1）", async () => {
   const { manager, logStore, embed } = makeManager();
+  // 工具（sango_query_embed）内部归一化：字号/换说法与规范形归一化后同串 → 同向量 → cosine≈1（§4.2 命中语义）
   embed.vectors.set("关羽过五关斩六将", unitVector(0));
+  embed.vectors.set("云长过五关斩六将", unitVector(0));
   await writeEntry(manager, "关羽过五关斩六将", "t1");
 
-  // 未归一化时「云长过五关斩六将」无 embedding 映射（降级旁路 null）；归一化后与池中条目同文本 → cosine=1.0 恒命中
   const result = await manager.lookup("云长过五关斩六将", "t2");
-  assert.equal(result?.hit, true, "云长→关羽 换说法应命中");
+  assert.equal(result?.hit, true, "云长→关羽 换说法应命中（同向量 cosine=1.0）");
   assert.equal(result?.similarity, 1);
   assert.equal(result?.reason, "hit");
   assert.equal(result?.nearestQuery, "关羽过五关斩六将");
-  // 原词保持：cache_logs.user_query 与条目 queryText 仍为原始文本
+  assert.equal(
+    embed.calls.at(-1)?.query,
+    "云长过五关斩六将",
+    "编排侧传原文、不自行改写（A016 §3.1）"
+  );
+  // §4.3：cache_logs.user_query 与条目 queryText 仍为原始文本
   const row = logRow(logStore, "t2");
   assert.equal(row.userQuery, "云长过五关斩六将");
   assert.equal(row.nearestQuery, "关羽过五关斩六将");
   assert.equal(row.hitLine, 0.92);
 });
 
-test("lookup：人名字号归一化长词优先（关云长 / 诸葛孔明）", async () => {
+test("lookup：字号/别称原文直传工具、均不自行改写（关云长 / 诸葛孔明 / 公瑾）", async () => {
   const { manager, embed } = makeManager();
+  // 工具侧归一化承接：字号查询与规范形同向量（mock 模拟工具归一化产出）
   embed.vectors.set("关羽温酒斩华雄", unitVector(0));
+  embed.vectors.set("关云长温酒斩华雄", unitVector(0));
   embed.vectors.set("诸葛亮三气周瑜", unitVector(1));
+  embed.vectors.set("诸葛孔明三气公瑾", unitVector(1));
   await writeEntry(manager, "关羽温酒斩华雄", "t1");
   await writeEntry(manager, "诸葛亮三气周瑜", "t2");
 
   const r1 = await manager.lookup("关云长温酒斩华雄", "t3");
-  assert.equal(r1?.hit, true, "关云长→关羽（长词优先，不拆成「关关羽」）");
+  assert.equal(r1?.hit, true, "关云长→关羽 应命中");
   const r2 = await manager.lookup("诸葛孔明三气公瑾", "t4");
-  assert.equal(r2?.hit, true, "诸葛孔明→诸葛亮、公瑾→周瑜");
+  assert.equal(r2?.hit, true, "诸葛孔明 / 公瑾 → 诸葛亮 / 周瑜 应命中");
+  assert.deepEqual(
+    embed.calls.map((call) => call.query),
+    ["关羽温酒斩华雄", "诸葛亮三气周瑜", "关云长温酒斩华雄", "诸葛孔明三气公瑾"],
+    "写入与判定一律传原文，编排侧零改写（A016 §3.1）"
+  );
 });
 
-test("lookup：人名字号归一化不放大不相关文本相似度", async () => {
+test("lookup：工具归一化不放大不相关文本相似度（孔明 vs 池内两条目）", async () => {
   const { manager, embed } = makeManager();
   embed.vectors.set("关羽过五关斩六将", unitVector(0));
   embed.vectors.set("华容道关羽释曹操", unitVector(1));
-  embed.vectors.set("诸葛亮施计借东风", unitVector(2)); // 归一化后（孔明→诸葛亮）才有映射；未归一化会查不到向量
+  embed.vectors.set("孔明施计借东风", unitVector(2)); // 工具归一化后向量，与池内仍不相关
   await writeEntry(manager, "关羽过五关斩六将", "t1");
   await writeEntry(manager, "华容道关羽释曹操", "t2");
 
   const result = await manager.lookup("孔明施计借东风", "t3");
-  assert.equal(result?.hit, false, "归一化后（诸葛亮施计借东风）与池内仍不相关 → 不命中");
+  assert.equal(result?.hit, false, "工具归一化后仍与池内不相关 → 不命中（归一化不放大相似度）");
   assert.equal(result?.reason, "miss-low");
   assert.equal(result?.similarity, 0);
 });
