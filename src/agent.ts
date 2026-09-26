@@ -839,12 +839,14 @@ export class Agent {
   }
 
   /**
-   * feat-A004/A006：引用硬校验（本地别名表扫描，0 次 LLM）+ 指针校验 + 服务端渲染引文与 citations。
-   * 模型只输出「结论 + 指针」（`[Qn]`）：指针合法（∈ 本次注入的 qid）且断言人物 ⊆ 召回人物 →
-   * 由字段渲染「引文」+ 全局上标角标并组装 citations（按引用出现顺序、片段粒度合并）；
-   * 指针非法 / 抄写超长引语 / 断言不成立 → 兜底（结论句带角标 ¹ + 恰一条兜底片段）。
-   * feat-A009：同步计算被引用片段 → 候选 chunkId 集合（服务端内部映射，不做文本比对），
-   * 供收尾回填 candidates[].cited / funnel.cited。
+   * 演义域引用护栏（feat-A004/A006 起，A016 演进）：
+   * - 硬校验（0 LLM）：别名表断言扫描 + 指针合法性校验（指针 ∈ 注入 qid、断言人物 ⊆ 召回）；
+   * - 结构门「句-片段文本重叠」：重叠 ≥ 阈值放行；低重叠叙述句按复核预算 1 做边界语义复核
+   *   （stage novel_boundary_check，至多 1 次 LLM；引语内容句豁免、不进候选，bug-00039/00040）；
+   *   全部裁剪无留存 → 拒答「演义中未涉及」+ citations []；
+   * - 校验通过 → 服务端渲染引文 + 全局上标角标并组装 citations（按引用出现顺序、片段粒度合并）；
+   *   同时回填被引用片段 → 候选 chunkId 集合（feat-A009：内部映射，不做文本比对）；
+   *   校验不过 → 兜底结论归纳（concludeFallback，异常路径 +1 LLM）。
    */
   private async applyNovelCitationGuard(
     answer: string,
@@ -886,16 +888,16 @@ export class Agent {
     const asserted = [...assertedIds].map((id) => ({ name: id, id }));
     const check = verifyCitation(asserted, recallText, recallPersonIds);
     if (pointer.ok && check.ok) {
-      // bug-00028 单轮方案：复核轮（第二次 LLM 调用）已整体删除（负责人否决：token 与延迟翻倍）。
-      // 语义裁决收进生成轮通用指令（SANGO_NOVEL_DOMAIN_PROMPT 第 6~8 条），规则层只留结构门；
-      // 本步是第三条结构门「句-片段文本重叠」。
+      // 结构门第三条「句-片段文本重叠」（bug-00028 起单轮生成方案，语义裁决指令收进生成轮
+      // 通用指令 SANGO_NOVEL_DOMAIN_PROMPT；本门只做规则层预筛，重叠 < 阈值的个别句按
+      // 复核预算 1 次边界语义复核）。
       // bug-00032/33/34（A016 验收三票，根因同源）：重叠门由「字面一票否决」改为「低重叠 →
       // 边界语义复核」——字面 n-gram 分不清「语义支撑的改述结论」与「先验断言」（两类重叠都低），
       // 把正确的改述结论句误裁（c549084b / ca7d9c6a / 275551c3 实证）。重叠 ≥ 阈值正常放行
       // （零额外调用）；重叠 < 阈值的待裁叙述句触发一次轻量 LLM 语义支撑复核（独立 stage
       // novel_boundary_check，正常样本不出现）：supported → 放行整句，unsupported → 裁剪；
       // 全部裁剪无留存 → 拒答「演义中未涉及」+ citations []（拒答口径与缓存规则不变）。
-      // 引语句（[Qn]）不受此门约束（沿用服务端渲染）。
+      // 引语内容句（含 [Qn]/无指针引语句）豁免见 findLowOverlapSentences（bug-00040）。
       // bug-00037（4d7a408a）：结论句不带指针、指针挂引文句时，结论断言原样逃过本门——现
       // 无指针叙述句也纳入重叠检查（对全部注入片段取最高重叠），低重叠同样走边界语义复核。
       let filtered = cleaned;
