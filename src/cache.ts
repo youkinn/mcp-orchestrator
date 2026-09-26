@@ -1,16 +1,18 @@
-// feat-A013：三国演义问答语义缓存（编排侧判定 / LRU / 落库）
 // 契约：接口文档 mcp-orchestrator/api/feat-A013-query-cache.md §1（缓存层契约）与 §2.4（落库点总览）。
 // 本文件只做编排侧判定与 LRU 逻辑：embedding 经 transport.callInternal('sango_query_embed') 获取（§1.2 步骤 1、
 // §1.7.2「三不原则」由 transport 保证）；cache_logs / cache_entries 镜像全部经 LogStore 公开方法同步直写（§2.4）。
+// feat-A016（接口文档 feat-A016-term-normalization-interface.md §3 / §4）：归一化移交 sango_query_embed，
+// 编排侧零改写——embedding / 判定 / 焦点校验一律基于原文，本文件不再自实现归一化（§4.1 / §4.4）。
 import { NOVEL_NO_HIT_ANSWER, type ChatData } from "./citation.js";
 import type { ToolCallResult } from "./types.js";
 
 /** 语义判定内部工具名（接口文档 §1.7.1）：mcp-server 本期新增的轻量工具，模型不可见 */
 export const SANGO_QUERY_EMBED_TOOL = "sango_query_embed";
 
-/** 答案产物版本（§1.6）：语料 / 提示词 / 路由相关版本变更时递增，
- * lookup 发现条目 versionTag ≠ 本常量 → 全量清除一次 + console.warn，防命中旧答案 */
-export const CACHE_VERSION = "A013-2026-09-23-1";
+/** 答案产物版本（A013 §1.6 / A016 §4.5）：语料 / 提示词 / 路由 / 归一化规范形（含 normVersion 范围）相关版本变更时递增，
+ * lookup 发现条目 versionTag ≠ 本常量 → 全量清除一次 + console.warn，防命中旧答案。
+ * A016 起本值换代标记新键空间（归一化由 sango_query_embed 承接）；表（规范形）变更部署 = 重启 sango + 本值换代 */
+export const CACHE_VERSION = "A016-2026-09-26-1";
 
 /** 相似度分区下沿（§1.3）：0.80 本期固定写死、不对外配置（调整另立课题） */
 export const LOW_SIMILARITY_LINE = 0.8;
@@ -49,48 +51,6 @@ function cosine(a: Float32Array, b: Float32Array): number {
   }
   const denom = Math.sqrt(normA) * Math.sqrt(normB);
   return denom === 0 ? 0 : dot / denom;
-}
-
-/** 三国人物字号/别称 → 本名（判定链路人名字号归一化，§1.2）：长词优先，仅替换字号/别名本身，不替换「字」「号」等提问词 */
-const PERSON_NAME_ALIASES: ReadonlyArray<{ alias: string; name: string }> = [
-  { alias: "关云长", name: "关羽" },
-  { alias: "诸葛孔明", name: "诸葛亮" },
-  { alias: "云长", name: "关羽" },
-  { alias: "玄德", name: "刘备" },
-  { alias: "孟德", name: "曹操" },
-  { alias: "孔明", name: "诸葛亮" },
-  { alias: "翼德", name: "张飞" },
-  { alias: "子龙", name: "赵云" },
-  { alias: "奉先", name: "吕布" },
-  { alias: "公瑾", name: "周瑜" },
-  { alias: "仲达", name: "司马懿" },
-  { alias: "元让", name: "夏侯惇" },
-  { alias: "妙才", name: "夏侯渊" },
-  { alias: "文远", name: "张辽" },
-  { alias: "汉升", name: "黄忠" },
-  { alias: "孟起", name: "马超" },
-  { alias: "文长", name: "魏延" },
-  { alias: "伯约", name: "姜维" },
-  { alias: "伯符", name: "孙策" },
-  { alias: "仲谋", name: "孙权" },
-  { alias: "本初", name: "袁绍" },
-  { alias: "士元", name: "庞统" },
-  { alias: "仲颖", name: "董卓" },
-];
-
-/** 按词条长度降序（长词优先：关云长 先于 云长，避免拆成「关关羽」），命中即替换 */
-const PERSON_NAME_ALIASES_BY_LENGTH: ReadonlyArray<{ alias: string; name: string }> =
-  PERSON_NAME_ALIASES.slice().sort((a, b) => b.alias.length - a.alias.length);
-
-/** 人名字号归一化：表驱动、长词优先；无命中原样返回。只作用判定输入，不落地库文本 */
-function normalizePersonNames(query: string): string {
-  let normalized = query;
-  for (const { alias, name } of PERSON_NAME_ALIASES_BY_LENGTH) {
-    if (normalized.includes(alias)) {
-      normalized = normalized.split(alias).join(name);
-    }
-  }
-  return normalized;
 }
 
 /** 焦点类（§1.2.1）：词表为文档常量，实现照抄 */
@@ -586,16 +546,15 @@ export class CacheManager {
       return null;
     }
     const userQuery = query.trim();
-    // 步骤 0.5：人名字号归一化（§1.2）：字号/别称统一为本名，只作用判定链路
-    // （embedding 与比对、焦点校验）；cache_logs.user_query / 条目 queryText 仍存原始文本
-    const judgedQuery = normalizePersonNames(userQuery);
+    // 步骤 0.5（A016 §4.1 / §4.4）：不再自实现归一化——embedding 与判定、焦点校验一律基于原文，
+    // 归一化由 sango_query_embed 工具承接（§3.2）；cache_logs.user_query / 条目 queryText 仍存原始文本
     // 步骤 1：embedding 获取（唯一 await 点）；失败 → 降级旁路，等同开关关闭
-    const embedding = await this.fetchEmbedding(judgedQuery);
+    const embedding = await this.fetchEmbedding(userQuery);
     if (!embedding) {
       return null;
     }
     // 步骤 2：同步判定段（无 await；与后台清除 / 删除 / 开关的执行序见 §1.8）
-    return this.judge(judgedQuery, embedding, traceId, userQuery, lookupStartedAt);
+    return this.judge(embedding, traceId, userQuery, lookupStartedAt);
   }
 
   /**
@@ -658,7 +617,8 @@ export class CacheManager {
     this.evictIfNeeded();
   }
 
-  /** §1.2 步骤 1：embedding 获取；失败 → console.warn 一次 + 返回 null（降级旁路） */
+  /** §1.2 步骤 1：embedding 获取（A016 §4.1：传原文，归一化由 sango_query_embed 承接）；
+   * 失败 → console.warn 一次 + 返回 null（降级旁路） */
   private async fetchEmbedding(query: string): Promise<Float32Array | null> {
     let result: ToolCallResult;
     try {
@@ -694,9 +654,8 @@ export class CacheManager {
 
   /** §1.2 步骤 2：内存 LRU 同步判定 + §2.4 cache_logs 落一行（判定完成即落，LLM 之前）。
    * lookupMs = 自 lookup 入口起的判定耗时（构造结果时取 performance.now 差值，落库与结果一致）。
-   * judgedQuery = 归一化后判定文本（字号→本名）；userQuery = 原始文本（落库 / 条目展示） */
+   * A016 §4.4：userQuery = trim 后原文，判定（embedding 比对 / 焦点校验）与落库统一用原文。 */
   private judge(
-    judgedQuery: string,
     embedding: Float32Array,
     traceId: string,
     userQuery: string,
@@ -759,7 +718,7 @@ export class CacheManager {
     // b2：唯一候选 → 焦点一致性轻校验（§1.2.1）
     if (candidates.length === 1) {
       const candidate = candidates[0];
-      if (focusClassesDisjoint(judgedQuery, candidate.entry.queryText)) {
+      if (focusClassesDisjoint(userQuery, candidate.entry.queryText)) {
         const result: CacheLookupResult = {
           hit: false,
           reason: "miss-focus",

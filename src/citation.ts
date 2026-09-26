@@ -447,16 +447,18 @@ export function stripOverlongModelQuotes(answer: string): string {
   );
 }
 
-// bug-00028 单轮方案·结构门第三条：句-片段文本重叠（零 LLM，见 agent.ts applyNovelCitationGuard）。
+// bug-00028 单轮方案·结构门第三条：句-片段文本重叠（判定纯函数，见 agent.ts applyNovelCitationGuard）。
 // 答案里带 [片段N] 的叙述句与该片段做字符 n-gram 重叠判定：归一化（剔除空白标点、全角数字转半角、
-// 引号内容不参与）后，句子 n-gram 命中片段集合的比例低于阈值 → 整句裁剪；引语句（[Qn]）不受此门
-// 约束（沿用服务端渲染）。只依赖片段文本，不引入任何词表 / 枚举。
+// 引号内容不参与）后，句子 n-gram 命中片段集合的比例低于阈值 → 低重叠句（边界复核候选）；
+// 引语句（[Qn]）不受此门约束（沿用服务端渲染）。只依赖片段文本，不引入任何词表 / 枚举。
+// bug-00032/33/34：重叠门由「字面一票否决」改为「低重叠 → 边界语义复核」——重叠 < 阈值的待裁句
+// 由 agent 走一次轻量 LLM 语义复核（supported 放行 / unsupported 裁剪，见 agent.ts
+// checkNovelBoundarySupport）；本文件只做纯函数拆分（低重叠句挑选 + 裁剪），不发起任何 LLM 调用。
 
-/** 句-片段重叠阈值（结构门第三条）：重叠率低于该值判定该句与片段不符（默认从严，0.5 起测边界） */
+/** 句-片段重叠阈值（结构门第三条）：重叠率低于该值 → 边界语义复核候选（默认从严，0.5 起测边界） */
 export const SENTENCE_OVERLAP_THRESHOLD = 0.5;
 /** 句-片段重叠的字符 n-gram 长度 */
 export const SENTENCE_OVERLAP_NGRAM = 2;
-
 /** 重叠归一化：剔除引语（引号内容不参与本门判定）、全角数字转半角、剔除空白与标点 */
 function normalizeOverlapText(text: string): string {
   return text
@@ -498,12 +500,22 @@ export function sentenceFragmentOverlap(
   return hit / sentGrams.size;
 }
 
+/** 去掉答案里的引用指针标记（[片段N] / [Qn]），返回句子正文（bug-00038：复核候选与拒答判定按正文） */
+export function stripPointerMarkers(text: string): string {
+  return text.replace(/\[(?:Q\d+|片段\d+)\]/g, "");
+}
+
 /** 把答案切成句（句末标点 / 指针为边界），[Qn] / [片段N] 指针并入所属句子 */
 function splitAnswerSentences(answer: string): Array<{
   text: string;
   narrativePointers: string[];
+  quotePointers: string[];
 }> {
-  const sentences: Array<{ text: string; narrativePointers: string[] }> = [];
+  const sentences: Array<{
+    text: string;
+    narrativePointers: string[];
+    quotePointers: string[];
+  }> = [];
   const re = /([^。！？；]*[。！？；]?)((?:\[(?:Q\d+|片段\d+)\])*)/g;
   let matched: RegExpExecArray | null;
   while ((matched = re.exec(answer)) !== null) {
@@ -514,37 +526,133 @@ function splitAnswerSentences(answer: string): Array<{
     if (!text.trim()) {
       continue;
     }
-    const narrativePointers = [...(matched[2] ?? "").matchAll(/\[片段(\d+)\]/g)].map(
+    // 指针不限于句尾（bug-00037：句号前指针同样归属本句），从整句正文提取
+    const narrativePointers = [...text.matchAll(/\[片段(\d+)\]/g)].map(
       (m) => `片段${m[1]}`
     );
-    sentences.push({ text, narrativePointers });
+    const quotePointers = [...text.matchAll(/\[Q(\d+)\]/g)].map(
+      (m) => `Q${m[1]}`
+    );
+    sentences.push({ text, narrativePointers, quotePointers });
   }
   return sentences;
 }
 
-/** 结构门第三条：裁剪与所引片段低重叠的叙述句（带 [片段N]）；句子引用多个片段时取最大重叠率。
- * 返回裁剪后答案（调用方按空串 → 拒答「演义中未涉及」+ citations []）。 */
+/** 低重叠叙述句（边界语义复核候选）：带 [片段N] 或与注入片段低重叠的叙述句，重叠率 < 阈值。 */
+export interface LowOverlapSentence {
+  /** 整句原始文本（含 [片段N] / [Qn] 指针） */
+  text: string;
+  /** 该句引用的叙述段指针（如 片段5）；无指针叙述句为空数组 */
+  pointers: string[];
+  /** 候选片段重叠率的最大值（仍 < SENTENCE_OVERLAP_THRESHOLD；无注入片段时为 0） */
+  bestOverlap: number;
+  /** 重叠率最高片段原文（复核参考文本；无注入片段时为 null） */
+  bestFragmentText: string | null;
+}
+
+/** 结构门第三条·低重叠句挑选（纯函数）：返回需要边界语义复核的叙述句。
+ * 带 [片段N] 的句子取其引用片段的最大重叠率；无指针叙述句（bug-00037：结论句不带指针、
+ * 指针挂在引文句时，结论断言会逃过本门）对全部注入片段取最大重叠率。引语句（[Qn]）
+ * 不受本门约束（服务端渲染）；重叠率低于阈值即列为复核候选，由调用方按判定结果
+ * 用 stripAnswerSentences 放行（不裁剪）或裁剪。
+ * bug-00039：单请求复核预算=1（生成轮之后边界语义复核至多 1 次）——调用方（agent.ts）
+ * 只复核 bestOverlap 最高（并列取数组最先出现）的唯一候选句，其余候选直接按
+ * unsupported 裁剪；本文件只做纯函数拆分（挑选 + 裁剪），不发起任何 LLM 调用。
+ * bug-00038：去掉 [片段N]/[Qn] 标记后无正文的纯指针句先行剔除，不进复核候选。 */
+export function findLowOverlapSentences(
+  answer: string,
+  view: InjectionView
+): LowOverlapSentence[] {
+  const low: LowOverlapSentence[] = [];
+  for (const sentence of splitAnswerSentences(answer)) {
+    // bug-00038：纯指针句（去掉 [片段N]/[Qn] 后无正文）不进复核候选——结论句被裁光后
+    // 仅剩的裸引用行会因零字数零重叠被判低重叠句触发 LLM 复核（trace ba5bb4ec 的额外
+    // 调用来源），且正文为空仍可能判 supported 保留，最终渲染出「空正文+脚注」。
+    if (!stripPointerMarkers(sentence.text).trim()) {
+      continue;
+    }
+    // bug-00040：去掉指针后非空、但重叠归一化后为空（整句内容均为引语）→ 不进复核候选、不裁剪、
+    // 不占复核预算。模型引文行如 [Q19]“……！……！” 被句切分后（！为句边界）会产生“……！/……”等
+    // 无指针引语片段句：引语内容在重叠归一化时被剔除 → 必低重叠 → 之前每次都会逐句进复核（纯浪费调用）；
+    // 引语本就由指针 + 字段渲染提供，无需复核。
+    if (normalizeOverlapText(stripPointerMarkers(sentence.text)) === "") {
+      continue;
+    }
+    if (sentence.narrativePointers.length === 0) {
+      // bug-00037：引语句（[Qn]，服务端渲染）不受重叠门约束；纯无指针叙述句纳入全片段重叠检查
+      if (sentence.quotePointers.length > 0) {
+        continue;
+      }
+      let bestOverlap = 0;
+      let bestFragment: RenderedQuote | undefined;
+      for (const fragment of view.fragments.values()) {
+        const overlap = sentenceFragmentOverlap(sentence.text, fragment.text);
+        if (bestFragment === undefined || overlap > bestOverlap) {
+          bestOverlap = overlap;
+          bestFragment = fragment;
+        }
+      }
+      if (bestOverlap < SENTENCE_OVERLAP_THRESHOLD) {
+        low.push({
+          text: sentence.text,
+          pointers: [],
+          bestOverlap,
+          bestFragmentText: bestFragment?.text ?? null,
+        });
+      }
+      continue;
+    }
+    let bestOverlap = 0;
+    let bestFragment: RenderedQuote | undefined;
+    for (const pointer of sentence.narrativePointers) {
+      const fragment = view.fragments.get(pointer);
+      if (!fragment) {
+        continue;
+      }
+      const overlap = sentenceFragmentOverlap(sentence.text, fragment.text);
+      // 首个可解析片段即作为复核参考（零重叠也应给到片段文本），重叠更高才替换
+      if (bestFragment === undefined || overlap > bestOverlap) {
+        bestOverlap = overlap;
+        bestFragment = fragment;
+      }
+    }
+    if (bestOverlap < SENTENCE_OVERLAP_THRESHOLD) {
+      low.push({
+        text: sentence.text,
+        pointers: sentence.narrativePointers,
+        bestOverlap,
+        bestFragmentText: bestFragment?.text ?? null,
+      });
+    }
+  }
+  return low;
+}
+
+/** 结构门第三条·裁剪（纯函数）：把命中文本的整句（连同指针）从答案中移除，返回剩余答案。 */
+export function stripAnswerSentences(
+  answer: string,
+  dropTexts: ReadonlySet<string>
+): string {
+  return splitAnswerSentences(answer)
+    .filter((sentence) => !dropTexts.has(sentence.text))
+    .map((sentence) => sentence.text)
+    .join("");
+}
+
+/** 结构门第三条·字面裁剪（零 LLM 兼容口径，保留给纯函数用例 / 复核不可用时的保守回落）：
+ * 直接裁剪所有低重叠叙述句。返回裁剪后答案（调用方按空串 → 拒答「演义中未涉及」+ citations []）。 */
 export function stripLowOverlapSentences(
   answer: string,
   view: InjectionView
 ): string {
-  const kept: string[] = [];
-  for (const sentence of splitAnswerSentences(answer)) {
-    if (sentence.narrativePointers.length === 0) {
-      kept.push(sentence.text);
-      continue;
-    }
-    const best = sentence.narrativePointers.reduce((max, pointer) => {
-      const fragment = view.fragments.get(pointer);
-      return fragment
-        ? Math.max(max, sentenceFragmentOverlap(sentence.text, fragment.text))
-        : max;
-    }, 0);
-    if (best >= SENTENCE_OVERLAP_THRESHOLD) {
-      kept.push(sentence.text);
-    }
+  const low = findLowOverlapSentences(answer, view);
+  if (low.length === 0) {
+    return answer;
   }
-  return kept.join("");
+  return stripAnswerSentences(
+    answer,
+    new Set(low.map((sentence) => sentence.text))
+  );
 }
 
 /** 上标角标字符（feat-A006）：¹²³⁴⁵⁶⁷⁸⁹⁰，下标按出现顺序从 1 起 */

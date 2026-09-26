@@ -818,9 +818,10 @@ test("⑲.2 非法 / 越界 offset、len：只跳过该条，不崩、不插错�
   );
 });
 
-// ===== bug-00028 单轮方案：结构门第三条「句-片段文本重叠」——纯函数级用例 =====
-// 语义裁决已收进生成轮提示词（零额外 LLM 调用），本组只测结构门的归一化 / 重叠率 / 裁剪边界
-// （sentenceFragmentOverlap / stripLowOverlapSentences，见 citation.ts）。
+// ===== bug-00028 结构保险丝：结构门第三条「句-片段文本重叠」——纯函数级用例 =====
+// bug-00032/33/34 后重叠门为「低重叠 → 边界语义复核」（复核在 agent.ts，正常样本零调用）；
+// 本组只测纯函数（citation.ts）：归一化 / 重叠率 / 低重叠句挑选 / 字面裁剪边界
+// （sentenceFragmentOverlap / findLowOverlapSentences / stripLowOverlapSentences）。
 
 test("⑳ 结构门·重叠率：句子 2-gram 命中片段的比例（全文重合 → 1；无关句 → 0）", () => {
   assert.equal(
@@ -847,7 +848,7 @@ test("⑳.1 结构门·归一化：全角数字转半角、标点空白剔除、
   );
   assert.ok(
     sentenceFragmentOverlap("张飞遇害时年55岁。", "时年五十五。") < SENTENCE_OVERLAP_THRESHOLD,
-    "「五十五」与「55」字面不同形 → 低重叠（语义等价不在纯文本结构门职责，由生成轮指令约束）"
+    "「五十五」与「55」字面不同形 → 低重叠（语义等价不在纯文本判定职责，由边界语义复核裁决）"
   );
 });
 
