@@ -6,6 +6,7 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import type { Agent } from '../../agent.js';
 import { createServer } from '../../server.js';
+import { createLogStore } from '../../storage/logs.js';
 import type { MCPTransport } from '../../transport.js';
 import {
   ToolExecutionError,
@@ -268,6 +269,7 @@ async function startServer(
   const app = createServer(asAgent(agent), quiz, {
     port: 0,
     allowedOrigin: '*',
+    logStore: createLogStore({ dbPath: ':memory:' }),
   });
 
   const server = app.listen(0);
