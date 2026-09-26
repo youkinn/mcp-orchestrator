@@ -459,9 +459,6 @@ export function stripOverlongModelQuotes(answer: string): string {
 export const SENTENCE_OVERLAP_THRESHOLD = 0.5;
 /** 句-片段重叠的字符 n-gram 长度 */
 export const SENTENCE_OVERLAP_NGRAM = 2;
-/** bug-00039：低重叠句边界语义复核循环的上限（复核为逐句串行 LLM，实测单次约 1s）；超限句不再复核、直接按 unsupported 裁剪 */
-export const MAX_BOUNDARY_REVIEWS = 3;
-
 /** 重叠归一化：剔除引语（引号内容不参与本门判定）、全角数字转半角、剔除空白与标点 */
 function normalizeOverlapText(text: string): string {
   return text
@@ -558,6 +555,9 @@ export interface LowOverlapSentence {
  * 指针挂在引文句时，结论断言会逃过本门）对全部注入片段取最大重叠率。引语句（[Qn]）
  * 不受本门约束（服务端渲染）；重叠率低于阈值即列为复核候选，由调用方按判定结果
  * 用 stripAnswerSentences 放行（不裁剪）或裁剪。
+ * bug-00039：单请求复核预算=1（生成轮之后边界语义复核至多 1 次）——调用方（agent.ts）
+ * 只复核 bestOverlap 最高（并列取数组最先出现）的唯一候选句，其余候选直接按
+ * unsupported 裁剪；本文件只做纯函数拆分（挑选 + 裁剪），不发起任何 LLM 调用。
  * bug-00038：去掉 [片段N]/[Qn] 标记后无正文的纯指针句先行剔除，不进复核候选。 */
 export function findLowOverlapSentences(
   answer: string,
@@ -569,6 +569,13 @@ export function findLowOverlapSentences(
     // 仅剩的裸引用行会因零字数零重叠被判低重叠句触发 LLM 复核（trace ba5bb4ec 的额外
     // 调用来源），且正文为空仍可能判 supported 保留，最终渲染出「空正文+脚注」。
     if (!stripPointerMarkers(sentence.text).trim()) {
+      continue;
+    }
+    // bug-00040：去掉指针后非空、但重叠归一化后为空（整句内容均为引语）→ 不进复核候选、不裁剪、
+    // 不占复核预算。模型引文行如 [Q19]“……！……！” 被句切分后（！为句边界）会产生“……！/……”等
+    // 无指针引语片段句：引语内容在重叠归一化时被剔除 → 必低重叠 → 之前每次都会逐句进复核（纯浪费调用）；
+    // 引语本就由指针 + 字段渲染提供，无需复核。
+    if (normalizeOverlapText(stripPointerMarkers(sentence.text)) === "") {
       continue;
     }
     if (sentence.narrativePointers.length === 0) {

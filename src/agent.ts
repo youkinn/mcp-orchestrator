@@ -23,7 +23,6 @@ import {
   buildInjectionView,
   extractCitePointers,
   loadAliasTable,
-  MAX_BOUNDARY_REVIEWS,
   pickBestFallbackFragment,
   renderAnswerWithCitations,
   scanRecallPersonIds,
@@ -902,26 +901,35 @@ export class Agent {
       let filtered = cleaned;
       const lowOverlap = findLowOverlapSentences(cleaned, view);
       if (lowOverlap.length > 0) {
-        // bug-00039：低重叠句复核循环加上限——逐句复核是串行 LLM 调用（trace ba5bb4ec
-        // 实测单次约 1s），模型一次输出多句低重叠结论时用户要等 N 秒。只复核前
-        // MAX_BOUNDARY_REVIEWS 个低重叠句，超限句按 unsupported（=裁剪）处理：保守防
-        // 无支撑内容放行；提示词约束答案「一句结论」，正常路径 1~2 句根本不触发上限，
-        // 它只是格式越界时的安全网（拒答口径与 4bea3ab 一致：全部裁剪后判空 → 拒答）。
+        // bug-00039：单请求复核预算=1——逐句复核是串行 LLM 调用
+        // （trace ba5bb4ec 实测单次约 1s），低重叠候选只复核 bestOverlap 最高（并列取
+        // 数组最先出现）的唯一句；bestFragmentText === null（无片段参考）直接判
+        // unsupported、不调 LLM；其余候选句一律直接计入 unsupported 裁剪集合（保守防
+        // 无支撑内容放行，预算外不再逐句串行复核）。提示词约束答案「一句结论」，正常路径
+        // 根本不触发复核，它只是格式越界时的安全网（拒答口径与 4bea3ab 一致：全部裁剪后
+        // 判空 → 拒答，见下方 stripPointerMarkers 判空）。
+        // bug-00040：引语片段句（整句内容均为引语）已在 findLowOverlapSentences 中豁免，
+        // 不进复核候选、不裁剪、不占复核预算。
         const unsupported: string[] = [];
-        for (const [index, sentence] of lowOverlap.entries()) {
-          if (index >= MAX_BOUNDARY_REVIEWS) {
-            unsupported.push(sentence.text);
-            continue;
+        let bestSentence = lowOverlap[0];
+        for (const sentence of lowOverlap) {
+          if (sentence.bestOverlap > bestSentence.bestOverlap) {
+            bestSentence = sentence;
           }
-          const verdict =
-            sentence.bestFragmentText === null
-              ? "unsupported"
-              : await this.checkNovelBoundarySupport(
-                  query,
-                  sentence.text,
-                  sentence.bestFragmentText
-                );
-          if (verdict !== "supported") {
+        }
+        const verdict =
+          bestSentence.bestFragmentText === null
+            ? "unsupported"
+            : await this.checkNovelBoundarySupport(
+                query,
+                bestSentence.text,
+                bestSentence.bestFragmentText
+              );
+        if (verdict !== "supported") {
+          unsupported.push(bestSentence.text);
+        }
+        for (const sentence of lowOverlap) {
+          if (sentence !== bestSentence) {
             unsupported.push(sentence.text);
           }
         }

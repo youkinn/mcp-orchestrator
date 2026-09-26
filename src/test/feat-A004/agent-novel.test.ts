@@ -1054,7 +1054,7 @@ test("㉗ 单轮·边界复核·负例 bug-00038：结论句判 unsupported 裁�
   assert.equal(modelCallCount, 2, "生成轮 + 一次边界语义复核");
 });
 
-test("㉘ 单轮·边界复核循环上限 bug-00039：4 句低重叠 → 复核恰好 3 次（MAX_BOUNDARY_REVIEWS），第 4 句超限不复核、直接按 unsupported 裁剪", async () => {
+test("㉘ 单轮·边界复核预算 bug-00039：4 句低重叠 → 恰 1 次复核（仅 bestOverlap 最高句，单请求复核预算=1），其余候选直接按 unsupported 裁剪", async () => {
   const entries = [
     {
       id: "sanguo-yanyi:0065:c0007",
@@ -1079,7 +1079,7 @@ test("㉘ 单轮·边界复核循环上限 bug-00039：4 句低重叠 → 复核
     modelCallCount += 1;
     if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
       checkCallCount += 1;
-      return textResponse("supported"); // 前三句本可放行——第 4 句被裁是因超限而非语义不支撑
+      return textResponse("supported"); // 仅最高重叠句（葭萌关一役句）给复核机会；其余候选超出单请求复核预算 → 直接裁剪
     }
     return textResponse("马超与张飞战于葭萌关，不分胜负。[片段1] 葭萌关一役马超鏖战张飞。玄德立于城楼观战。刘备观战暗自赞叹。两将力战至夜未分胜败。");
   };
@@ -1095,13 +1095,56 @@ test("㉘ 单轮·边界复核循环上限 bug-00039：4 句低重叠 → 复核
     modelCaller,
   });
   const data = await agent.processQueryData("马超与张飞战况如何", "sango-novel");
-  assert.ok(data.answer.includes("葭萌关一役马超鏖战张飞"), "第 1 句低重叠句复核 supported → 放行");
-  assert.ok(data.answer.includes("玄德立于城楼观战"), "第 2 句低重叠句复核 supported → 放行");
-  assert.ok(data.answer.includes("刘备观战暗自赞叹"), "第 3 句低重叠句复核 supported → 放行");
-  assert.doesNotMatch(data.answer, /两将力战至夜未分胜败/, "第 4 句超复核上限 → 不复核直接按 unsupported 裁剪");
-  assert.equal(checkCallCount, 3, "复核恰为 MAX_BOUNDARY_REVIEWS=3 次，第 4 句不再串行调模型");
-  assert.equal(modelCallCount, 4, "生成轮 1 次 + 边界复核 3 次（第 4 句零 LLM 调用）");
+  assert.ok(data.answer.includes("马超与张飞战于葭萌关，不分胜负"), "高重叠叙述句保留并渲染");
+  assert.ok(data.answer.includes("葭萌关一役马超鏖战张飞"), "最高重叠句（bestOverlap=0.4）复核 supported → 放行");
+  assert.doesNotMatch(data.answer, /玄德立于城楼观战|刘备观战暗自赞叹|两将力战至夜未分胜败/, "其余 3 句低重叠候选超出复核预算 → 直接按 unsupported 裁剪");
+  assert.equal(checkCallCount, 1, "单请求复核预算=1：只复核最高重叠的 1 句，其余不再串行调模型");
+  assert.equal(modelCallCount, 2, "生成轮 1 次 + 边界复核恰 1 次（预算外零 LLM 调用）");
   assert.equal(data.citations.length, 1, "只收保留句引用的片段");
   assert.ok(data.citations[0].text.includes("葭萌关"), "保留片段为片段1（葭萌关段）");
   assert.ok(data.answer.includes("¹"), "指针渲染上标角标");
+});
+
+test("㉙ 单轮·边界复核预算·引语片段句豁免 bug-00040：[Q1] 引文行被句切分成无指针引语片段句（“……！……！”按 ！ 切分）→ 不进复核候选、不占复核预算，引文行保留渲染", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0069:c0009",
+      text: "孙权遣人至荆州，欲结亲于关羽。关羽大怒曰：吾虎女安肯嫁犬子乎！遂不允婚事。",
+      chapter: 69,
+      title: "刘备进位汉中王　关羽水淹七军",
+      type: "narration",
+      quotes: [{ offset: 21, len: 9 }],
+    },
+  ];
+  let modelCallCount = 0;
+  let checkCallCount = 0;
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      return textResponse("supported");
+    }
+    // 模型引文行形如 [Q19]“……！……！”：按 ！ 句切分后产生“……！/……！/” 等无指针引语片段句，
+    // 重叠归一化剔除引语后为空 → bug-00040 豁免：不进复核候选、不裁剪、不占复核预算
+    return textResponse("关羽大怒，不允婚事。\n\n[Q1]“……！……！”");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "关羽不允婚事",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("孙权向关羽求亲，关羽怎么回复", "sango-novel");
+  assert.equal(checkCallCount, 0, "引语片段句全部豁免：低重叠叙述句数=0 → 零复核（不调 LLM）");
+  assert.equal(modelCallCount, 1, "仅生成轮 1 次：引语片段句不消耗任何复核预算");
+  assert.ok(data.answer.includes("吾虎女安肯嫁犬子乎"), "[Q1] 引文行保留并渲染为「引语原文」+ 上标角标");
+  assert.ok(data.answer.includes("……"), "被句切分的引语片段（……！……！”）保留渲染、未被裁剪");
+  assert.ok(data.answer.includes("¹"), "引文指针渲染上标角标");
+  assert.equal(data.citations.length, 1, "引文指针对应片段收进 citations");
+  assert.ok(data.citations[0].text.includes("吾虎女安肯嫁犬子乎"), "citation 为该引语所在片段整段原文");
 });
