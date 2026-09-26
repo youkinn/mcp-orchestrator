@@ -29,6 +29,7 @@ import {
   findLowOverlapSentences,
   stripAnswerSentences,
   stripOverlongModelQuotes,
+  stripPointerMarkers,
   toRecallFragments,
   validateQuotePointers,
   verifyCitation,
@@ -918,7 +919,9 @@ export class Agent {
           filtered = stripAnswerSentences(cleaned, new Set(unsupported));
         }
       }
-      if (!filtered.trim()) {
+      // bug-00038：拒答判定按「去指针后的正文」——全部裁剪无留存、或只剩裸 [片段N]/[Qn]
+      // 引用行（无正文）都属于无正文可答 → 拒答「演义中未涉及」+ citations []，避免渲染空正文+脚注。
+      if (!stripPointerMarkers(filtered).trim()) {
         return {
           data: { answer: NOVEL_NO_HIT_ANSWER, citations: [] },
           citedChunkIds: new Set(),

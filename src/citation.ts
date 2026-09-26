@@ -501,6 +501,11 @@ export function sentenceFragmentOverlap(
   return hit / sentGrams.size;
 }
 
+/** 去掉答案里的引用指针标记（[片段N] / [Qn]），返回句子正文（bug-00038：复核候选与拒答判定按正文） */
+export function stripPointerMarkers(text: string): string {
+  return text.replace(/\[(?:Q\d+|片段\d+)\]/g, "");
+}
+
 /** 把答案切成句（句末标点 / 指针为边界），[Qn] / [片段N] 指针并入所属句子 */
 function splitAnswerSentences(answer: string): Array<{
   text: string;
@@ -550,13 +555,20 @@ export interface LowOverlapSentence {
  * 带 [片段N] 的句子取其引用片段的最大重叠率；无指针叙述句（bug-00037：结论句不带指针、
  * 指针挂在引文句时，结论断言会逃过本门）对全部注入片段取最大重叠率。引语句（[Qn]）
  * 不受本门约束（服务端渲染）；重叠率低于阈值即列为复核候选，由调用方按判定结果
- * 用 stripAnswerSentences 放行（不裁剪）或裁剪。 */
+ * 用 stripAnswerSentences 放行（不裁剪）或裁剪。
+ * bug-00038：去掉 [片段N]/[Qn] 标记后无正文的纯指针句先行剔除，不进复核候选。 */
 export function findLowOverlapSentences(
   answer: string,
   view: InjectionView
 ): LowOverlapSentence[] {
   const low: LowOverlapSentence[] = [];
   for (const sentence of splitAnswerSentences(answer)) {
+    // bug-00038：纯指针句（去掉 [片段N]/[Qn] 后无正文）不进复核候选——结论句被裁光后
+    // 仅剩的裸引用行会因零字数零重叠被判低重叠句触发 LLM 复核（trace ba5bb4ec 的额外
+    // 调用来源），且正文为空仍可能判 supported 保留，最终渲染出「空正文+脚注」。
+    if (!stripPointerMarkers(sentence.text).trim()) {
+      continue;
+    }
     if (sentence.narrativePointers.length === 0) {
       // bug-00037：引语句（[Qn]，服务端渲染）不受重叠门约束；纯无指针叙述句纳入全片段重叠检查
       if (sentence.quotePointers.length > 0) {

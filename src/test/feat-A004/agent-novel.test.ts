@@ -1014,3 +1014,42 @@ test("㉖ 单轮·边界复核·正例：无指针改述结论句与片段语义
   assert.equal(modelCallCount, 2, "生成轮 + 边界语义复核各一次");
   assert.equal(data.citations.length, 1, "引文句保留并渲染");
 });
+
+test("㉗ 单轮·边界复核·负例 bug-00038：结论句判 unsupported 裁剪、仅剩裸 [片段1] 行（无正文）→ 拒答「演义中未涉及」且 citations 为空（trace ba5bb4ec 复刻）", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0071:c0001",
+      text: "夏侯渊与黄忠对阵，两马相交，未及数合，黄忠诈败而走，渊随后赶来，至汉水南岸，黄忠回身一箭，正中渊肩窝，夏侯渊落马而死。",
+      chapter: 71,
+      title: "占对山黄忠逸待劳　据汉水赵云寡胜众",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  let checkCallCount = 0;
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      return textResponse("unsupported"); // 「夏侯渊字妙才」为片段无载的先验知识 → 复核不支撑
+    }
+    return textResponse("夏侯渊字妙才。\n\n[片段1]"); // 先验断言结论句 + 单独成行的裸 [片段1] 引用指针
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "夏侯渊字妙才",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("夏侯渊字什么", "sango-novel");
+  assert.equal(data.answer, "演义中未涉及", "结论句被裁、仅剩的裸引用行无正文 → 拒答，不渲染空正文+脚注");
+  assert.deepEqual(data.citations, []);
+  assert.equal(checkCallCount, 1, "仅结论句触发一次边界复核；裸 [片段1] 行（无正文）不进复核候选");
+  assert.equal(modelCallCount, 2, "生成轮 + 一次边界语义复核");
+});
