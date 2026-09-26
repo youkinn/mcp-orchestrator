@@ -10,6 +10,7 @@ import {
   SANGO_NOVEL_DOMAIN_PROMPT,
 } from '../../agent.js';
 import { createServer } from '../../server.js';
+import { createLogStore } from '../../storage/logs.js';
 import { MCPTransport } from '../../transport.js';
 import type {
   LLMConfig,
@@ -447,7 +448,11 @@ async function startApp(
     modelCaller: model.respond,
   });
 
-  const app = createServer(agent, transport, { port: 0, allowedOrigin: '*' });
+  const app = createServer(agent, transport, {
+    port: 0,
+    allowedOrigin: '*',
+    logStore: createLogStore({ dbPath: ':memory:' }),
+  });
   const server = app.listen(0);
   await once(server, 'listening');
   const address = server.address() as AddressInfo;
