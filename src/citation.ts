@@ -505,8 +505,13 @@ export function sentenceFragmentOverlap(
 function splitAnswerSentences(answer: string): Array<{
   text: string;
   narrativePointers: string[];
+  quotePointers: string[];
 }> {
-  const sentences: Array<{ text: string; narrativePointers: string[] }> = [];
+  const sentences: Array<{
+    text: string;
+    narrativePointers: string[];
+    quotePointers: string[];
+  }> = [];
   const re = /([^。！？；]*[。！？；]?)((?:\[(?:Q\d+|片段\d+)\])*)/g;
   let matched: RegExpExecArray | null;
   while ((matched = re.exec(answer)) !== null) {
@@ -517,28 +522,34 @@ function splitAnswerSentences(answer: string): Array<{
     if (!text.trim()) {
       continue;
     }
-    const narrativePointers = [...(matched[2] ?? "").matchAll(/\[片段(\d+)\]/g)].map(
+    // 指针不限于句尾（bug-00037：句号前指针同样归属本句），从整句正文提取
+    const narrativePointers = [...text.matchAll(/\[片段(\d+)\]/g)].map(
       (m) => `片段${m[1]}`
     );
-    sentences.push({ text, narrativePointers });
+    const quotePointers = [...text.matchAll(/\[Q(\d+)\]/g)].map(
+      (m) => `Q${m[1]}`
+    );
+    sentences.push({ text, narrativePointers, quotePointers });
   }
   return sentences;
 }
 
-/** 低重叠叙述句（边界语义复核候选）：带 [片段N] 且与所引片段重叠率 < 阈值。 */
+/** 低重叠叙述句（边界语义复核候选）：带 [片段N] 或与注入片段低重叠的叙述句，重叠率 < 阈值。 */
 export interface LowOverlapSentence {
-  /** 整句原始文本（含 [片段N] 指针） */
+  /** 整句原始文本（含 [片段N] / [Qn] 指针） */
   text: string;
-  /** 该句引用的叙述段指针（如 片段5） */
+  /** 该句引用的叙述段指针（如 片段5）；无指针叙述句为空数组 */
   pointers: string[];
-  /** 各指针片段重叠率的最大值（仍 < SENTENCE_OVERLAP_THRESHOLD） */
+  /** 候选片段重叠率的最大值（仍 < SENTENCE_OVERLAP_THRESHOLD；无注入片段时为 0） */
   bestOverlap: number;
-  /** 重叠率最高指针对应的片段原文（复核参考文本；指针缺失时为 null） */
+  /** 重叠率最高片段原文（复核参考文本；无注入片段时为 null） */
   bestFragmentText: string | null;
 }
 
-/** 结构门第三条·低重叠句挑选（纯函数）：返回带 [片段N] 且重叠率低于阈值的叙述句。
- * 句子引用多个片段时取最大重叠率；调用方对每个候选句做边界语义复核后，按判定结果
+/** 结构门第三条·低重叠句挑选（纯函数）：返回需要边界语义复核的叙述句。
+ * 带 [片段N] 的句子取其引用片段的最大重叠率；无指针叙述句（bug-00037：结论句不带指针、
+ * 指针挂在引文句时，结论断言会逃过本门）对全部注入片段取最大重叠率。引语句（[Qn]）
+ * 不受本门约束（服务端渲染）；重叠率低于阈值即列为复核候选，由调用方按判定结果
  * 用 stripAnswerSentences 放行（不裁剪）或裁剪。 */
 export function findLowOverlapSentences(
   answer: string,
@@ -547,6 +558,27 @@ export function findLowOverlapSentences(
   const low: LowOverlapSentence[] = [];
   for (const sentence of splitAnswerSentences(answer)) {
     if (sentence.narrativePointers.length === 0) {
+      // bug-00037：引语句（[Qn]，服务端渲染）不受重叠门约束；纯无指针叙述句纳入全片段重叠检查
+      if (sentence.quotePointers.length > 0) {
+        continue;
+      }
+      let bestOverlap = 0;
+      let bestFragment: RenderedQuote | undefined;
+      for (const fragment of view.fragments.values()) {
+        const overlap = sentenceFragmentOverlap(sentence.text, fragment.text);
+        if (bestFragment === undefined || overlap > bestOverlap) {
+          bestOverlap = overlap;
+          bestFragment = fragment;
+        }
+      }
+      if (bestOverlap < SENTENCE_OVERLAP_THRESHOLD) {
+        low.push({
+          text: sentence.text,
+          pointers: [],
+          bestOverlap,
+          bestFragmentText: bestFragment?.text ?? null,
+        });
+      }
       continue;
     }
     let bestOverlap = 0;

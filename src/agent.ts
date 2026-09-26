@@ -895,6 +895,8 @@ export class Agent {
       // novel_boundary_check，正常样本不出现）：supported → 放行整句，unsupported → 裁剪；
       // 全部裁剪无留存 → 拒答「演义中未涉及」+ citations []（拒答口径与缓存规则不变）。
       // 引语句（[Qn]）不受此门约束（沿用服务端渲染）。
+      // bug-00037（4d7a408a）：结论句不带指针、指针挂引文句时，结论断言原样逃过本门——现
+      // 无指针叙述句也纳入重叠检查（对全部注入片段取最高重叠），低重叠同样走边界语义复核。
       let filtered = cleaned;
       const lowOverlap = findLowOverlapSentences(cleaned, view);
       if (lowOverlap.length > 0) {

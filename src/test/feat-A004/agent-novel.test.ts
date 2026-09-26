@@ -935,3 +935,82 @@ test("㉔ 单轮·边界复核部分裁剪：低重叠句复核 unsupported 被�
   assert.equal(modelCallCount, 2, "生成轮 + 低重叠句边界语义复核各一次");
   assert.equal(checkCallCount, 1, "仅低重叠句（袁绍句）触发一次复核，unsupported → 裁剪");
 });
+
+test("㉕ 单轮·边界复核·负例 bug-00037：结论句不带指针、指针挂引文句 → 结论断言纳入全片段重叠检查，复核 unsupported 裁剪（trace 4d7a408a 复刻）", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0073:c0003",
+      text: "封关羽、张飞、赵云、马超、黄忠为五虎大将。玄德既为汉中王，遂修表一道，差人赍赴许都。表曰：臣昔与车骑将军董承，图谋讨操，机事不密，承见陷害。",
+      chapter: 73,
+      title: "玄德进位汉中王　云长攻拔襄阳郡",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  let checkCallCount = 0;
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      return textResponse("unsupported"); // 片段中车骑将军属董承、无司隶校尉/西乡侯，张飞之封为片段外先验 → 不支撑
+    }
+    return textResponse("刘备登基后，张飞被封为车骑将军、领司隶校尉，进封西乡侯。\n\n[片段1] 封关羽、张飞、赵云、马超、黄忠为五虎大将。玄德既为汉中王，遂修表一道，差人赍赴许都。表曰：臣昔与车骑将军董承，图谋讨操，机事不密，承见陷害。");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "张飞被封为车骑将军",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("刘备登基后，张飞被封为什么", "sango-novel");
+  assert.doesNotMatch(data.answer, /领司隶校尉|进封西乡侯|被封为车骑将军/, "无指针结论断言（车骑将军/司隶校尉/西乡侯）与注入片段不支撑 → 裁剪");
+  assert.equal(checkCallCount, 1, "无指针结论句触发一次边界复核");
+  assert.equal(modelCallCount, 2, "生成轮 + 边界语义复核各一次");
+  assert.equal(data.citations.length, 1, "引文句保留并渲染");
+  assert.ok(data.answer.includes("玄德既为汉中王"), "引用句（片段原文）保留");
+});
+
+test("㉖ 单轮·边界复核·正例：无指针改述结论句与片段语义支撑 → supported 放行整句（防过度裁剪）", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0069:c0009",
+      text: "孙权遣人至荆州，欲结亲于关羽。关羽大怒曰：吾虎女安肯嫁犬子乎！遂不允婚事。",
+      chapter: 69,
+      title: "刘备进位汉中王　关羽水淹七军",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  let checkCallCount = 0;
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      return textResponse("supported"); // 片段含「关羽大怒…不允婚事」：语义支撑改述 → 放行
+    }
+    return textResponse("关羽怒斥孙权使者，拒绝联姻。\n\n[片段1] 孙权遣人至荆州，欲结亲于关羽。关羽大怒曰：吾虎女安肯嫁犬子乎！遂不允婚事。");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "关羽拒婚",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("孙权向关羽求亲，关羽怎么回复", "sango-novel");
+  assert.ok(data.answer.includes("关羽怒斥孙权使者，拒绝联姻"), "无指针改述结论句语义支撑 → supported 放行");
+  assert.equal(checkCallCount, 1, "无指针结论句触发一次边界复核");
+  assert.equal(modelCallCount, 2, "生成轮 + 边界语义复核各一次");
+  assert.equal(data.citations.length, 1, "引文句保留并渲染");
+});
