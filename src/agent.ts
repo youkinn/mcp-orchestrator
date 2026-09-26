@@ -26,7 +26,8 @@ import {
   pickBestFallbackFragment,
   renderAnswerWithCitations,
   scanRecallPersonIds,
-  stripLowOverlapSentences,
+  findLowOverlapSentences,
+  stripAnswerSentences,
   stripOverlongModelQuotes,
   toRecallFragments,
   validateQuotePointers,
@@ -49,7 +50,8 @@ export type { ChatData } from "./citation.js";
 
 // feat-A007 埋点辅助（旁路静默）：序列化失败兜底 String，统一 8000 截断
 // feat-A011：auto 首轮从「带工具自主决策（routing）」改为「无 tools 轻量分类（classify）」，枚举同步
-type LlmStage = "classify" | "generation";
+// bug-00032/33/34：novel_boundary_check = 低重叠句边界语义复核（独立 stage，正常样本不出现）
+type LlmStage = "classify" | "generation" | "novel_boundary_check";
 
 interface ModelCallOptions {
   disableThinking?: boolean;
@@ -192,6 +194,7 @@ export const SANGO_NOVEL_DOMAIN_PROMPT = [
   "6. 片段外信息不写不补：只依据注入片段作答，片段没有的内容一律不写、不以先验 / 史实补全。",
   "7. 必须直接回答用户问题本身：答案须针对问题核心作答，答非所问（如问结局却答过程）视为不合格。",
   "8. 用户问题携带的事件前提若与演义记载不符（如时间、人物、人物关系、事件归属等矛盾）：先按片段载明的演义事实说明并校正问题前提，再作答；禁止顺着错误前提硬凑答案，也禁止拒答。",
+  "9. 结论允许对片段做语义等价的改述，但不得改变片段中的人名、动作方向、受事者、结果；改述句必须由所引片段语义支撑，引用指针必须指向该支撑片段。",
 ].join("\n");
 
 /** fengyunsanguo 域提示（§2.4）：题库快路径 / 分类编号 2 的生成轮 system 提示词 */
@@ -237,6 +240,18 @@ export function parseClassifyRouteId(content: unknown): 1 | 2 | 99 {
 // feat-A004：引用硬校验的兜底结论归纳提示词（校验 / 格式不过时调用）
 const CITATION_FALLBACK_CONCLUSION_PROMPT =
   "根据给定的《三国演义》原文片段，用一句话归纳结论，以「按原文，」开头；结论必须先回答用户问题的主体（例如用户问“谁”，就要写出对应人物），再写事件，禁止只复述事件。如果用户只是问名字，只回答名字即可。只依据片段内容作答，不得补充片段之外的信息，不得评价、纠正、对比原文。引用的原文片段长度以10字内为佳，最长不得超过20汉字。";
+
+// bug-00032/33/34：结构门第三条「低重叠 → 边界语义复核」提示词（独立 stage novel_boundary_check，
+// 正常样本不触发）。输入 = 用户问题 + 模型结论句 + 指向片段原文；只输出 supported / unsupported。
+// 语义裁决必须走 LLM，不引入任何词表 / 关键词规则（bug-00028 复盘否决）。
+export const NOVEL_BOUNDARY_CHECK_PROMPT = [
+  "你是《三国演义》原著引用的边界审查员。",
+  "给定：用户问题、模型结论句、片段原文。结论句中的 [片段N] 是服务端编号标记，不属于正文。",
+  "判断：结论句的核心断言（人物、事件、结局、因果的事实归属）是否由该片段原文支撑。",
+  "允许对片段做语义等价的改述：不改变片段中的人名、动作方向、受事者、结果，且片段原文足以推出或印证该断言 → supported。",
+  "片段原文不足以支撑该断言（如结论来自先验知识、常识或个人判断），或改动了片段中的人名、动作方向、受事者、结果 → unsupported。",
+  "只输出一个词：supported 或 unsupported，不要任何解释、标点或多余文字。",
+].join("\n");
 
 /** 路由目标（docs/sango-mcp-routing-design.md §二）：天气能力已下线（feat-A011），仅剩两能力域与 auto */
 export type RouteTarget = "fengyunsanguo" | "sango-novel" | "auto";
@@ -781,6 +796,47 @@ export class Agent {
       .trim();
   }
 
+  /** bug-00032/33/34：低重叠句边界语义复核（独立 stage novel_boundary_check，正常样本不触发）。
+   * 输入 = 用户问题 + 结论句 + 指向片段原文；supported → 放行整句，其余（unsupported /
+   * 解析失败 / 复核调用异常）→ 裁剪。复核不可用时回落字面门口径（旧确定性裁剪），保险丝不失效；
+   * 判定结果经现有 LLM 明细落库（stage=novel_boundary_check，responseSummary 即 verdict）。 */
+  private async checkNovelBoundarySupport(
+    query: string,
+    sentence: string,
+    fragmentText: string
+  ): Promise<"supported" | "unsupported"> {
+    const content = [
+      `用户问题：${query}`,
+      `模型结论句：${sentence}`,
+      `片段原文：${fragmentText}`,
+    ].join("\n");
+    try {
+      // bug-00018 口径：只做二选一判定 → 关闭思考 + temperature 0，保证输出稳定
+      const response = await this.invokeModel(
+        [
+          { role: "system", content: NOVEL_BOUNDARY_CHECK_PROMPT },
+          { role: "user", content },
+        ],
+        [],
+        "novel_boundary_check",
+        { disableThinking: true, temperature: 0 }
+      );
+      const text = response.content
+        .filter((item) => item.type === "text")
+        .map((item) => item.text!)
+        .join("\n")
+        .trim();
+      const verdict = text.toLowerCase();
+      // 注意顺序：unsupported 字面包含 supported 子串，必须先判 unsupported
+      if (verdict.includes("unsupported")) {
+        return "unsupported";
+      }
+      return verdict.includes("supported") ? "supported" : "unsupported";
+    } catch {
+      return "unsupported";
+    }
+  }
+
   /**
    * feat-A004/A006：引用硬校验（本地别名表扫描，0 次 LLM）+ 指针校验 + 服务端渲染引文与 citations。
    * 模型只输出「结论 + 指针」（`[Qn]`）：指针合法（∈ 本次注入的 qid）且断言人物 ⊆ 召回人物 →
@@ -831,10 +887,35 @@ export class Agent {
     if (pointer.ok && check.ok) {
       // bug-00028 单轮方案：复核轮（第二次 LLM 调用）已整体删除（负责人否决：token 与延迟翻倍）。
       // 语义裁决收进生成轮通用指令（SANGO_NOVEL_DOMAIN_PROMPT 第 6~8 条），规则层只留结构门；
-      // 本步是第三条结构门「句-片段文本重叠」（零 LLM，citation.ts）：带 [片段N] 的叙述句与片段
-      // n-gram 重叠率低于阈值 → 裁剪整句；无留存句 → 拒答「演义中未涉及」+ citations []（拒答类
-      // 不写缓存规则不变，见 cache.ts record）。引语句（[Qn]）不受此门约束（沿用服务端渲染）。
-      const filtered = stripLowOverlapSentences(cleaned, view);
+      // 本步是第三条结构门「句-片段文本重叠」。
+      // bug-00032/33/34（A016 验收三票，根因同源）：重叠门由「字面一票否决」改为「低重叠 →
+      // 边界语义复核」——字面 n-gram 分不清「语义支撑的改述结论」与「先验断言」（两类重叠都低），
+      // 把正确的改述结论句误裁（c549084b / ca7d9c6a / 275551c3 实证）。重叠 ≥ 阈值正常放行
+      // （零额外调用）；重叠 < 阈值的待裁叙述句触发一次轻量 LLM 语义支撑复核（独立 stage
+      // novel_boundary_check，正常样本不出现）：supported → 放行整句，unsupported → 裁剪；
+      // 全部裁剪无留存 → 拒答「演义中未涉及」+ citations []（拒答口径与缓存规则不变）。
+      // 引语句（[Qn]）不受此门约束（沿用服务端渲染）。
+      let filtered = cleaned;
+      const lowOverlap = findLowOverlapSentences(cleaned, view);
+      if (lowOverlap.length > 0) {
+        const unsupported: string[] = [];
+        for (const sentence of lowOverlap) {
+          const verdict =
+            sentence.bestFragmentText === null
+              ? "unsupported"
+              : await this.checkNovelBoundarySupport(
+                  query,
+                  sentence.text,
+                  sentence.bestFragmentText
+                );
+          if (verdict !== "supported") {
+            unsupported.push(sentence.text);
+          }
+        }
+        if (unsupported.length > 0) {
+          filtered = stripAnswerSentences(cleaned, new Set(unsupported));
+        }
+      }
       if (!filtered.trim()) {
         return {
           data: { answer: NOVEL_NO_HIT_ANSWER, citations: [] },
