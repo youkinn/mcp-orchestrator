@@ -1053,3 +1053,55 @@ test("㉗ 单轮·边界复核·负例 bug-00038：结论句判 unsupported 裁�
   assert.equal(checkCallCount, 1, "仅结论句触发一次边界复核；裸 [片段1] 行（无正文）不进复核候选");
   assert.equal(modelCallCount, 2, "生成轮 + 一次边界语义复核");
 });
+
+test("㉘ 单轮·边界复核循环上限 bug-00039：4 句低重叠 → 复核恰好 3 次（MAX_BOUNDARY_REVIEWS），第 4 句超限不复核、直接按 unsupported 裁剪", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0065:c0007",
+      text: "马超与张飞在葭萌关前大战，玄德在城上观战。自白日战至夜，不分胜负。",
+      chapter: 65,
+      title: "马超大战葭萌关　刘备自领益州牧",
+      type: "narration",
+      quotes: [],
+    },
+    {
+      id: "sanguo-yanyi:0009:c0003",
+      text: "袁绍聚众官于帐中，商议起兵。",
+      chapter: 9,
+      title: "除暴凶吕布助司徒　犯长安李傕听贾诩",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  let checkCallCount = 0;
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      return textResponse("supported"); // 前三句本可放行——第 4 句被裁是因超限而非语义不支撑
+    }
+    return textResponse("马超与张飞战于葭萌关，不分胜负。[片段1] 葭萌关一役马超鏖战张飞。玄德立于城楼观战。刘备观战暗自赞叹。两将力战至夜未分胜败。");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "马超与张飞不分胜负",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("马超与张飞战况如何", "sango-novel");
+  assert.ok(data.answer.includes("葭萌关一役马超鏖战张飞"), "第 1 句低重叠句复核 supported → 放行");
+  assert.ok(data.answer.includes("玄德立于城楼观战"), "第 2 句低重叠句复核 supported → 放行");
+  assert.ok(data.answer.includes("刘备观战暗自赞叹"), "第 3 句低重叠句复核 supported → 放行");
+  assert.doesNotMatch(data.answer, /两将力战至夜未分胜败/, "第 4 句超复核上限 → 不复核直接按 unsupported 裁剪");
+  assert.equal(checkCallCount, 3, "复核恰为 MAX_BOUNDARY_REVIEWS=3 次，第 4 句不再串行调模型");
+  assert.equal(modelCallCount, 4, "生成轮 1 次 + 边界复核 3 次（第 4 句零 LLM 调用）");
+  assert.equal(data.citations.length, 1, "只收保留句引用的片段");
+  assert.ok(data.citations[0].text.includes("葭萌关"), "保留片段为片段1（葭萌关段）");
+  assert.ok(data.answer.includes("¹"), "指针渲染上标角标");
+});

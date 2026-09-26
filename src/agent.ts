@@ -23,6 +23,7 @@ import {
   buildInjectionView,
   extractCitePointers,
   loadAliasTable,
+  MAX_BOUNDARY_REVIEWS,
   pickBestFallbackFragment,
   renderAnswerWithCitations,
   scanRecallPersonIds,
@@ -901,8 +902,17 @@ export class Agent {
       let filtered = cleaned;
       const lowOverlap = findLowOverlapSentences(cleaned, view);
       if (lowOverlap.length > 0) {
+        // bug-00039：低重叠句复核循环加上限——逐句复核是串行 LLM 调用（trace ba5bb4ec
+        // 实测单次约 1s），模型一次输出多句低重叠结论时用户要等 N 秒。只复核前
+        // MAX_BOUNDARY_REVIEWS 个低重叠句，超限句按 unsupported（=裁剪）处理：保守防
+        // 无支撑内容放行；提示词约束答案「一句结论」，正常路径 1~2 句根本不触发上限，
+        // 它只是格式越界时的安全网（拒答口径与 4bea3ab 一致：全部裁剪后判空 → 拒答）。
         const unsupported: string[] = [];
-        for (const sentence of lowOverlap) {
+        for (const [index, sentence] of lowOverlap.entries()) {
+          if (index >= MAX_BOUNDARY_REVIEWS) {
+            unsupported.push(sentence.text);
+            continue;
+          }
           const verdict =
             sentence.bestFragmentText === null
               ? "unsupported"

@@ -459,6 +459,8 @@ export function stripOverlongModelQuotes(answer: string): string {
 export const SENTENCE_OVERLAP_THRESHOLD = 0.5;
 /** 句-片段重叠的字符 n-gram 长度 */
 export const SENTENCE_OVERLAP_NGRAM = 2;
+/** bug-00039：低重叠句边界语义复核循环的上限（复核为逐句串行 LLM，实测单次约 1s）；超限句不再复核、直接按 unsupported 裁剪 */
+export const MAX_BOUNDARY_REVIEWS = 3;
 
 /** 重叠归一化：剔除引语（引号内容不参与本门判定）、全角数字转半角、剔除空白与标点 */
 function normalizeOverlapText(text: string): string {
