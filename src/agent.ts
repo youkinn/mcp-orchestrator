@@ -21,6 +21,7 @@ import {
   SANGO_NOVEL_SEARCH_TOOL,
   buildFallback,
   buildInjectionView,
+  computeDraftbenchDiff,
   extractCitePointers,
   loadAliasTable,
   pickBestFallbackFragment,
@@ -32,6 +33,8 @@ import {
   validateQuotePointers,
   verifyCitation,
   type ChatData,
+  type Citation,
+  type DraftbenchDiff,
   type InjectionView,
   type RecallFragment,
 } from "./citation.js";
@@ -45,7 +48,7 @@ import {
 } from "./recallDiagnostics.js";
 import type { CacheLookupResult, CacheManager } from "./cache.js";
 
-export type { ChatData } from "./citation.js";
+export type { ChatData, DraftbenchDiff } from "./citation.js";
 
 // feat-A007 埋点辅助（旁路静默）：序列化失败兜底 String，统一 8000 截断
 // feat-A011：auto 首轮从「带工具自主决策（routing）」改为「无 tools 轻量分类（classify）」，枚举同步
@@ -246,6 +249,31 @@ export type RouteTarget = "fengyunsanguo" | "sango-novel" | "auto";
 export interface RouteDecision {
   route: RouteTarget;
   source: "label" | "keyword" | null;
+}
+
+/** feat-A017 草稿台：发送清单条目（§3.2 chunks[]；text 必填，chunkId / chapter / title 可选） */
+export interface DraftbenchChunk {
+  chunkId?: string;
+  text: string;
+  chapter?: number;
+  title?: string;
+}
+
+/** feat-A017 草稿台：本次请求级参数覆盖（§4.2；全部有默认，零配置改动） */
+export interface DraftbenchParams {
+  temperature: number;
+  topK: number;
+  guarantee: number;
+  budget: number;
+}
+
+/** feat-A017 草稿台：发送结果（§3.2 响应 answer/citations/diff + 本次生效参数 + 被引用下标） */
+export interface DraftbenchResult {
+  data: ChatData;
+  params: DraftbenchParams;
+  diff: DraftbenchDiff;
+  /** 生成管线判定的被引用片段清单下标（0 基），随草稿台记录落库供详情重算 diff */
+  citedIndexes: number[];
 }
 
 /** L3 向量匹配注入点：只做风云三国高置信正向识别，命中返回 fengyunsanguo */
@@ -795,11 +823,16 @@ export class Agent {
     query: string,
     view: InjectionView | null,
     chunkMeta: NovelTracking["chunkMeta"] | null = null
-  ): Promise<{ data: ChatData; citedChunkIds: Set<string> }> {
+  ): Promise<{
+    data: ChatData;
+    citedChunkIds: Set<string>;
+    citedFragmentKeys: Set<string>;
+  }> {
     if (fragments.length === 0 || !view) {
       return {
         data: { answer: NOVEL_NO_HIT_ANSWER, citations: [] },
         citedChunkIds: new Set(),
+        citedFragmentKeys: new Set(),
       };
     }
     const aliasTable = this.getAliasTable();
@@ -815,7 +848,11 @@ export class Agent {
       /\[片段\d+\]/.test(answer) ||
       /按原文，/.test(answer);
     if (!isNovelAnswer) {
-      return { data: { answer, citations: [] }, citedChunkIds: new Set() };
+      return {
+        data: { answer, citations: [] },
+        citedChunkIds: new Set(),
+        citedFragmentKeys: new Set(),
+      };
     }
     // H4 长引语安全网：模型输出里的超长「…」是违规抄写，直接丢弃；原文改由指针 + 字段渲染提供。
     // 断言扫描对象是丢弃违规抄写后的答案正文人名（抄写内容不参与断言）
@@ -839,7 +876,19 @@ export class Agent {
         return {
           data: { answer: NOVEL_NO_HIT_ANSWER, citations: [] },
           citedChunkIds: new Set(),
+          citedFragmentKeys: new Set(),
         };
+      }
+      // feat-A017：渲染期已知每个引用归属的注入片段（[片段N] / ⟨Qn⟩ → 片段映射），
+      // diff 与被引用 chunkId 同一数据源、单一实现点（§4.4）
+      const citedFragmentKeys = new Set<string>();
+      for (const ref of extractCitePointers(filtered)) {
+        const fragmentKey = ref.startsWith("Q")
+          ? view.quoteFragments.get(ref)
+          : ref;
+        if (fragmentKey && /^片段\d+$/.test(fragmentKey)) {
+          citedFragmentKeys.add(fragmentKey);
+        }
       }
       return {
         data: renderAnswerWithCitations(filtered, view),
@@ -849,9 +898,12 @@ export class Agent {
           fragments,
           chunkMeta
         ),
+        citedFragmentKeys,
       };
     }
     const conclusion = await this.concludeFallback(fragments, query);
+    const fallbackTop = pickBestFallbackFragment(fragments, query, conclusion);
+    const fallbackIndex = fragments.indexOf(fallbackTop);
     return {
       data: buildFallback(fragments, conclusion, query),
       citedChunkIds: this.computeFallbackCitedChunkIds(
@@ -860,6 +912,10 @@ export class Agent {
         conclusion,
         chunkMeta
       ),
+      citedFragmentKeys:
+        fallbackIndex >= 0
+          ? new Set([`片段${fallbackIndex + 1}`])
+          : new Set(),
     };
   }
 
@@ -1160,6 +1216,87 @@ export class Agent {
     // feat-A013：最终 ChatData 就绪后统一调 record（写缓存内部判定，§1.4；旁路静默）
     this.recordNovelCache(query, cacheLookup, data);
     return data;
+  }
+
+  /**
+   * feat-A017 草稿台：手动发送（§3.2）。
+   * 与生产 sango-novel 域生成 / 校验管线同源：清单 → buildInjectionView（请求级 topK/guarantee/budget
+   * 覆盖）→ 生成轮（temperature 覆盖；有注入即 disableThinking）→ 引用闸门 → answer + citations + diff。
+   * 硬规则：不检索（不经 sango_novel_search）、不查 / 不写语义缓存（命中生产缓存会返回缓存答案使注入实验
+   * 失真；草稿台结果也不得污染生产缓存）。生产内建兜底（attempt=2 变参重试 / 兜底结论轮）随管线一并保留
+   * （§10 决策 1）。
+   */
+  async processDraftbench(
+    query: string,
+    chunks: DraftbenchChunk[],
+    params: DraftbenchParams
+  ): Promise<DraftbenchResult> {
+    // topK 取代 INJECT_FRAGMENT_LIMIT 作截断上限（chunks.slice(0, topK) 保序）；guarantee / budget 同口径
+    const sliced = chunks.slice(0, params.topK);
+    const fragments: RecallFragment[] = sliced.map((chunk) => ({
+      text: chunk.text,
+      source: "draftbench",
+      chapter: chunk.chapter,
+      title: chunk.title,
+    }));
+    const view = buildInjectionView(fragments, query.trim(), {
+      topK: params.topK,
+      guarantee: params.guarantee,
+      budget: params.budget,
+    });
+    const hasInjection = view.text.trim().length > 0;
+
+    const messages: any[] = [
+      { role: "system", content: SANGO_NOVEL_DOMAIN_PROMPT },
+      { role: "user", content: query.trim() },
+    ];
+    if (hasInjection) {
+      messages.push({ role: "system", content: view.text });
+    }
+    const currentResponse = await this.invokeModel(
+      messages,
+      [],
+      "generation",
+      {
+        temperature: params.temperature,
+        disableThinking: hasInjection,
+      }
+    );
+    const answer = currentResponse.content
+      .filter((item) => item.type === "text")
+      .map((item) => item.text!)
+      .join("\n")
+      .trim();
+
+    const guarded = await this.applyNovelCitationGuard(
+      answer,
+      fragments,
+      query.trim(),
+      view,
+      // 合成 chunkMeta：片段序 == 清单序（topK 截断保序），draftbench:N 即清单下标 N；
+      // 仅承载 diff 判定，不落检索诊断（草稿台不检索）
+      fragments.map((_, index) => ({
+        chunkId: `draftbench:${index}`,
+        kind: "fastpath" as const,
+      }))
+    );
+    const citedIndexes = [...guarded.citedFragmentKeys]
+      .map((key) => {
+        const match = /^片段(\d+)$/.exec(key);
+        return match ? Number(match[1]) - 1 : -1;
+      })
+      .filter((index) => index >= 0 && index < fragments.length);
+    const diff = computeDraftbenchDiff(
+      citedIndexes,
+      chunks.length,
+      guarded.data.citations
+    );
+    return {
+      data: guarded.data,
+      params,
+      diff,
+      citedIndexes: [...new Set(citedIndexes)].sort((a, b) => a - b),
+    };
   }
 
   /** feat-A013：sango-novel 域路由判定完成后、检索预调前查询语义缓存。

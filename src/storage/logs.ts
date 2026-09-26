@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
   answer               TEXT,
   citations            TEXT,
   route_source         TEXT,
+  request_source       TEXT,
   created_at           INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_request_logs_received ON request_logs(server_received_at);
@@ -140,6 +141,20 @@ CREATE TABLE IF NOT EXISTS cache_hit_line_changes (
   current    REAL NOT NULL,
   changed_at INTEGER NOT NULL
 );
+-- feat-A017 草稿台：发送记录表（trace_id 主键；params/chunks 快照；保留期与 request_logs 同随 30 天轮转）
+CREATE TABLE IF NOT EXISTS draftbench_records (
+  trace_id      TEXT PRIMARY KEY,
+  time          INTEGER NOT NULL,
+  query         TEXT NOT NULL,
+  params        TEXT,
+  chunks        TEXT,
+  cited_indexes TEXT,
+  status        TEXT NOT NULL,
+  error_message TEXT NOT NULL DEFAULT '',
+  result        TEXT,
+  created_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_draftbench_records_time ON draftbench_records(time);
 `;
 
 /** feat-A012：输入分段 token 估算（本地启发式，见接口文档 §2.3）；history/tools 为保留字段当前恒 0 */
@@ -221,6 +236,8 @@ export interface ListQuery {
   status?: string;
   responseCode?: number;
   keyword?: string;
+  /** feat-A017：来源筛选（缺省按 production 处理 —— request_source IS NULL 的历史 / 生产行）；仅 draftbench 显式传值 */
+  source?: 'production' | 'draftbench';
 }
 
 export interface LogListItem {
@@ -247,6 +264,8 @@ export interface LogListItem {
   routeSource: RouteSource | null;
   /** feat-A012：该 trace 是否存在 attempt=2 调用（重试角标数据源）；历史行 false */
   hasRetry: boolean;
+  /** feat-A017：请求来源（request_logs.request_source；NULL=历史 / 生产行按 production 展示） */
+  source: 'production' | 'draftbench';
 }
 
 export interface LogDetailLog {
@@ -256,6 +275,8 @@ export interface LogDetailLog {
   domain: string | null;
   /** feat-A012：请求路由来源；历史行 / 未完成路由判定为 null */
   routeSource: RouteSource | null;
+  /** feat-A017：请求来源（NULL=历史 / 生产行按 production 展示） */
+  source: 'production' | 'draftbench';
   status: 'success' | 'failed';
   responseCode: number;
   errorMessage: string;
@@ -318,6 +339,179 @@ export interface LogDetail {
   log: LogDetailLog;
   llmCalls: LlmCallLog[];
   toolCalls: ToolCallLog[];
+}
+
+/** feat-A017：草稿台发送记录（draftbench_records） */
+export interface DraftbenchRecordParams {
+  temperature: number;
+  topK: number;
+  guarantee: number;
+  budget: number;
+}
+
+export interface DraftbenchRecordChunk {
+  chunkId: string | null;
+  text: string | null;
+  chapter: number | null;
+  title: string | null;
+}
+
+export interface DraftbenchRecordResult {
+  answer: string;
+  citations: Array<{ text: string; chapter?: number; title?: string }>;
+}
+
+export interface DraftbenchRecordListItem {
+  traceId: string;
+  time: number;
+  query: string;
+  status: 'success' | 'failed';
+  errorMessage: string;
+  params: DraftbenchRecordParams | null;
+  chunkCount: number;
+  result: { answer: string | null; citationCount: number } | null;
+}
+
+export interface DraftbenchRecordDetail {
+  traceId: string;
+  time: number;
+  query: string;
+  status: 'success' | 'failed';
+  errorMessage: string;
+  params: DraftbenchRecordParams | null;
+  chunks: DraftbenchRecordChunk[];
+  /** 服务端生成管线判定出的被引用片段清单下标（0 基），供详情页按 §4.4 单一实现点重算 diff */
+  citedIndexes: number[];
+  result: DraftbenchRecordResult | null;
+}
+
+/** draftbench_records 行（存储内部） */
+interface DraftbenchRecordRow {
+  trace_id: string;
+  time: number;
+  query: string;
+  params: string | null;
+  chunks: string | null;
+  cited_indexes: string | null;
+  status: string;
+  error_message: string;
+  result: string | null;
+  created_at: number;
+}
+
+/** JSON 快照解析（非法 / 形状不符一律 null/空，前端不推断，仿 attempt 先例） */
+function parseDraftbenchParams(raw: string | null): DraftbenchRecordParams | null {
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (
+      typeof parsed.temperature !== 'number' ||
+      typeof parsed.topK !== 'number' ||
+      typeof parsed.guarantee !== 'number' ||
+      typeof parsed.budget !== 'number'
+    ) {
+      return null;
+    }
+    return {
+      temperature: parsed.temperature,
+      topK: parsed.topK,
+      guarantee: parsed.guarantee,
+      budget: parsed.budget,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseDraftbenchResult(raw: string | null): DraftbenchRecordResult | null {
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof parsed.answer !== 'string') {
+      return null;
+    }
+    return {
+      answer: parsed.answer,
+      citations: Array.isArray(parsed.citations) ? (parsed.citations as DraftbenchRecordResult['citations']) : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseDraftbenchChunks(raw: string | null): DraftbenchRecordChunk[] {
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.map((entry) => {
+      const record = (entry ?? {}) as Record<string, unknown>;
+      return {
+        chunkId: typeof record.chunkId === 'string' ? record.chunkId : null,
+        text: typeof record.text === 'string' ? record.text : null,
+        chapter: typeof record.chapter === 'number' ? record.chapter : null,
+        title: typeof record.title === 'string' ? record.title : null,
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+function parseDraftbenchCitedIndexes(raw: string | null): number[] {
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter(
+      (value) => Number.isInteger(value) && (value as number) >= 0
+    ) as number[];
+  } catch {
+    return [];
+  }
+}
+
+function parseDraftbenchRecordListItem(row: DraftbenchRecordRow): DraftbenchRecordListItem {
+  const result = parseDraftbenchResult(row.result);
+  return {
+    traceId: row.trace_id,
+    time: row.time,
+    query: row.query,
+    status: row.status === 'failed' ? 'failed' : 'success',
+    errorMessage: row.error_message,
+    params: parseDraftbenchParams(row.params),
+    chunkCount: parseDraftbenchChunks(row.chunks).length,
+    result:
+      result === null
+        ? null
+        : { answer: result.answer, citationCount: result.citations.length },
+  };
+}
+
+function parseDraftbenchRecordDetail(row: DraftbenchRecordRow): DraftbenchRecordDetail {
+  return {
+    traceId: row.trace_id,
+    time: row.time,
+    query: row.query,
+    status: row.status === 'failed' ? 'failed' : 'success',
+    errorMessage: row.error_message,
+    params: parseDraftbenchParams(row.params),
+    chunks: parseDraftbenchChunks(row.chunks),
+    citedIndexes: parseDraftbenchCitedIndexes(row.cited_indexes),
+    result: parseDraftbenchResult(row.result),
+  };
 }
 
 export interface TokenBucket {
@@ -530,7 +724,9 @@ export interface LogStore {
     userInput: string | null,
     domain: string | null,
     receivedAt: number,
-    clientSentAt?: number | null
+    clientSentAt?: number | null,
+    /** feat-A017：来源标记（'draftbench' / 其余按 NULL 落库，历史与生产行不区分） */
+    source?: string | null
   ): void;
   markHandled(traceId: string, handleStartedAt: number): void;
   markResponded(
@@ -556,7 +752,28 @@ export interface LogStore {
     startAt: number;
     endAt: number;
     granularity: 'day' | 'hour';
+    /** feat-A017：来源筛选（缺省按 production 处理 —— llm 行 JOIN request_logs 限定 request_source IS NULL） */
+    source?: 'production' | 'draftbench';
   }): TokenStatsResult;
+  // ===== feat-A017：草稿台发送记录（draftbench_records；直写不经 A007 写缓冲，失败旁路静默） =====
+  saveDraftbenchRecord(payload: {
+    traceId: string;
+    time: number;
+    query: string;
+    params: DraftbenchRecordParams | null;
+    chunks: DraftbenchRecordChunk[] | null;
+    citedIndexes: number[];
+    status: 'success' | 'failed';
+    errorMessage: string;
+    result: DraftbenchRecordResult | null;
+  }): void;
+  queryDraftbenchRecords(
+    pageNo: number,
+    pageSize: number
+  ): { list: DraftbenchRecordListItem[]; total: number };
+  queryDraftbenchRecord(traceId: string): DraftbenchRecordDetail | null;
+  /** 生成轮（stage='generation'）末次成功 LLM 调用的温度实参；无生成轮（缓存命中 / 失败 / 运维）→ null */
+  queryGenerationTemperature(traceId: string): number | null;
   // ===== feat-A013：缓存存储（cache_logs / cache_entries；均同步直写，不经 A007 写缓冲） =====
   /** 判定审计落库：命中 / 未命中一律一行（旁路静默；trace_id 唯一，重复调用 OR IGNORE 跳过） */
   appendCacheLog(traceId: string, payload: CacheLogPayload): void;
@@ -635,6 +852,7 @@ interface RequestLogRow {
   answer: string | null;
   citations: string | null;
   route_source: string | null;
+  request_source: string | null;
   created_at: number;
 }
 
@@ -866,6 +1084,10 @@ function createNoopStore(): LogStore {
       endAt: query.endAt,
       buckets: [],
     }),
+    saveDraftbenchRecord: noopWrite,
+    queryDraftbenchRecords: () => ({ list: [], total: 0 }),
+    queryDraftbenchRecord: () => null,
+    queryGenerationTemperature: () => null,
   };
 }
 
@@ -920,6 +1142,13 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
     } catch {
       // 旁路：duplicate column 等忽略
     }
+    // feat-A017 旧库迁移：request_logs 增 request_source（来源标记；NULL=历史 / 生产行按 production 展示）；
+    // 新库建表已含该列，重复执行忽略，幂等。
+    try {
+      db.exec(`ALTER TABLE request_logs ADD COLUMN request_source TEXT`);
+    } catch {
+      // 旁路：duplicate column 等忽略（新库 / 已迁移库）
+    }
     // bug-00019 旧库迁移：既有 tool_call_logs 缺 caller（调用方）/ stage（发起阶段）两列，补列；
     // 历史行保持 NULL 不回填（无法事后推断发起方）。新库建表已含两列，重复执行忽略，幂等。
     for (const column of ["caller", "stage"]) {
@@ -944,8 +1173,8 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   const insertSkeleton = db.prepare(`
     INSERT OR IGNORE INTO request_logs
       (trace_id, log_type, user_input, domain, status, response_code, error_message,
-       client_sent_at, server_received_at, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       client_sent_at, server_received_at, request_source, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const markHandledStmt = db.prepare(
     `UPDATE request_logs SET handle_started_at = ? WHERE trace_id = ?`
@@ -994,6 +1223,10 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   `);
   const deleteExpiredStmt = db.prepare(
     `DELETE FROM request_logs WHERE created_at < ?`
+  );
+  /** feat-A017 §10 决策 5：草稿台记录随 30 天保留轮转，与 request_logs 同周期清理 */
+  const deleteExpiredDraftbenchStmt = db.prepare(
+    `DELETE FROM draftbench_records WHERE time < ?`
   );
   // ===== feat-A013：缓存存储准备语句（全部同步直写，不经 pendingOps 写缓冲） =====
   const insertCacheLogStmt = db.prepare(`
@@ -1080,6 +1313,8 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   const runRetentionCleanup = (): void => {
     try {
       deleteExpiredStmt.run(Date.now() - retentionDays * DAY_MS);
+      // feat-A017 §10 决策 5：草稿台记录随 30 天保留轮转，与 request_logs 同周期
+      deleteExpiredDraftbenchStmt.run(Date.now() - retentionDays * DAY_MS);
     } catch (error) {
       console.error('Failed to cleanup expired logs:', error);
     }
@@ -1095,7 +1330,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
     SELECT
       r.trace_id, r.log_type, r.user_input, r.domain, r.status, r.response_code, r.error_message,
       r.client_sent_at, r.server_received_at, r.handle_started_at, r.server_responded_at,
-      r.client_received_at, r.created_at, r.route_source,
+      r.client_received_at, r.created_at, r.route_source, r.request_source,
       (SELECT COUNT(*) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS llm_count,
       (SELECT SUM(l.response_at - l.request_at) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS llm_duration,
       (SELECT SUM(l.prompt_tokens) FROM llm_call_logs l WHERE l.trace_id = r.trace_id) AS input_tokens,
@@ -1116,11 +1351,38 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   const queryRetrievalStmt = db.prepare(
     `SELECT diagnostics FROM tool_retrieval_logs WHERE trace_id = ? AND seq = ?`
   );
+  // feat-A017：token 统计按来源隔离（生产 = request_source IS NULL / 历史行；草稿台 = 'draftbench'）
   const queryTokenRowsStmt = db.prepare(
-    `SELECT request_at, prompt_tokens, completion_tokens, cached_tokens
-     FROM llm_call_logs WHERE request_at >= ? AND request_at <= ?`
+    `SELECT l.request_at, l.prompt_tokens, l.completion_tokens, l.cached_tokens
+     FROM llm_call_logs l JOIN request_logs r ON r.trace_id = l.trace_id
+     WHERE l.request_at >= ? AND l.request_at <= ? AND r.request_source IS NULL`
   );
-
+  const queryTokenRowsDraftbenchStmt = db.prepare(
+    `SELECT l.request_at, l.prompt_tokens, l.completion_tokens, l.cached_tokens
+     FROM llm_call_logs l JOIN request_logs r ON r.trace_id = l.trace_id
+     WHERE l.request_at >= ? AND l.request_at <= ? AND r.request_source = 'draftbench'`
+  );
+  // feat-A017：生成轮末次成功温度（stage='generation' AND status='success'，按 seq 取最后一条）
+  const queryGenerationTemperatureStmt = db.prepare(
+    `SELECT temperature FROM llm_call_logs
+     WHERE trace_id = ? AND stage = 'generation' AND status = 'success'
+     ORDER BY seq DESC LIMIT 1`
+  );
+  // feat-A017：草稿台发送记录（直写，不经 A007 写缓冲；trace_id 主键，重复 OR IGNORE 跳过）
+  const insertDraftbenchRecordStmt = db.prepare(`
+    INSERT OR IGNORE INTO draftbench_records
+      (trace_id, time, query, params, chunks, cited_indexes, status, error_message, result, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const queryDraftbenchRecordsStmt = db.prepare(
+    `SELECT * FROM draftbench_records ORDER BY time DESC LIMIT ? OFFSET ?`
+  );
+  const countDraftbenchRecordsStmt = db.prepare(
+    `SELECT COUNT(*) AS total FROM draftbench_records`
+  );
+  const queryDraftbenchRecordStmt = db.prepare(
+    `SELECT * FROM draftbench_records WHERE trace_id = ?`
+  );
   const store: LogStore = {
     ensureSkeleton(
       logType,
@@ -1128,7 +1390,8 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
       userInput,
       domain,
       receivedAt,
-      clientSentAt = null
+      clientSentAt = null,
+      source = null
     ): void {
       enqueue(() => {
         insertSkeleton.run(
@@ -1141,6 +1404,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           SKELETON_ERROR_MESSAGE,
           clientSentAt ?? null,
           receivedAt,
+          source === 'draftbench' ? 'draftbench' : null,
           receivedAt
         );
       });
@@ -1291,6 +1555,59 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
       enqueue(() => reportFrontendEndStmt.run(clientReceivedAt, traceId));
     },
 
+    // ===== feat-A017：草稿台发送记录（直写、旁路静默 —— 失败 console.error 告警，绝不影响 /api/chat 主流程） =====
+    saveDraftbenchRecord(payload): void {
+      try {
+        insertDraftbenchRecordStmt.run(
+          payload.traceId,
+          payload.time,
+          payload.query,
+          payload.params === null
+            ? null
+            : JSON.stringify(payload.params),
+          payload.chunks === null ? null : JSON.stringify(payload.chunks),
+          JSON.stringify(payload.citedIndexes),
+          payload.status,
+          payload.errorMessage ?? '',
+          payload.result === null ? null : JSON.stringify(payload.result),
+          payload.time
+        );
+      } catch (error) {
+        console.error('Failed to save draftbench record (bypass):', error);
+      }
+    },
+
+    queryDraftbenchRecords(pageNo, pageSize): { list: DraftbenchRecordListItem[]; total: number } {
+      const total = (countDraftbenchRecordsStmt.get() as { total: number }).total;
+      const rows = queryDraftbenchRecordsStmt.all(
+        pageSize,
+        (pageNo - 1) * pageSize
+      ) as DraftbenchRecordRow[];
+      return {
+        total,
+        list: rows.map(parseDraftbenchRecordListItem),
+      };
+    },
+
+    queryDraftbenchRecord(traceId): DraftbenchRecordDetail | null {
+      const row = queryDraftbenchRecordStmt.get(traceId) as
+        | DraftbenchRecordRow
+        | undefined;
+      return row === undefined ? null : parseDraftbenchRecordDetail(row);
+    },
+
+    queryGenerationTemperature(traceId): number | null {
+      try {
+        const row = queryGenerationTemperatureStmt.get(traceId) as
+          | { temperature: number | null }
+          | undefined;
+        return row && typeof row.temperature === 'number' ? row.temperature : null;
+      } catch (error) {
+        console.error('Failed to query generation temperature (bypass):', error);
+        return null;
+      }
+    },
+
     queryList(query): { list: LogListItem[]; total: number } {
       const where: string[] = [];
       const params: Array<string | number> = [];
@@ -1325,6 +1642,13 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
       if (query.keyword !== undefined && query.keyword !== '') {
         where.push("r.user_input LIKE '%' || ? || '%'");
         params.push(query.keyword);
+      }
+      // feat-A017：来源筛选（缺省仅生产 —— request_source IS NULL 的历史 / 生产行；草稿台显式 'draftbench'）
+      const source = query.source ?? 'production';
+      if (source === 'draftbench') {
+        where.push("r.request_source = 'draftbench'");
+      } else {
+        where.push('r.request_source IS NULL');
       }
       const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
 
@@ -1388,6 +1712,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
                 : { input: row.input_tokens, output: row.output_tokens },
             routeSource: row.route_source as RouteSource | null,
             hasRetry: row.max_attempt === 2,
+            source: row.request_source === 'draftbench' ? 'draftbench' : 'production',
           };
         }),
       };
@@ -1458,6 +1783,7 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
           userInput: row.user_input,
           domain: row.domain,
           routeSource: row.route_source as RouteSource | null,
+          source: row.request_source === 'draftbench' ? 'draftbench' : 'production',
           status: row.status as 'success' | 'failed',
           responseCode: row.response_code,
           errorMessage: row.error_message,
@@ -1477,7 +1803,12 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
 
     queryTokenStats(query): TokenStatsResult {
       const granularity = effectiveGranularity(query.granularity, query.startAt, query.endAt);
-      const rows = queryTokenRowsStmt.all(query.startAt, query.endAt) as Array<{
+      // feat-A017：统计按来源隔离（缺省仅生产；草稿台显式 'draftbench'）
+      const tokenRows =
+        (query.source ?? 'production') === 'draftbench'
+          ? queryTokenRowsDraftbenchStmt.all(query.startAt, query.endAt)
+          : queryTokenRowsStmt.all(query.startAt, query.endAt);
+      const rows = tokenRows as Array<{
         request_at: number;
         prompt_tokens: number | null;
         completion_tokens: number | null;
@@ -1987,9 +2318,26 @@ export function ensureSkeleton(
   userInput: string | null,
   domain: string | null,
   receivedAt: number,
-  clientSentAt?: number | null
+  clientSentAt?: number | null,
+  source?: string | null
 ): void {
-  getLogStore().ensureSkeleton(logType, traceId, userInput, domain, receivedAt, clientSentAt);
+  getLogStore().ensureSkeleton(logType, traceId, userInput, domain, receivedAt, clientSentAt, source);
+}
+
+/** feat-A017：草稿台发送记录落库（旁路静默，失败不影响 /api/chat） */
+export function saveDraftbenchRecord(payload: Parameters<LogStore['saveDraftbenchRecord']>[0]): void {
+  getLogStore().saveDraftbenchRecord(payload);
+}
+
+export function queryDraftbenchRecords(
+  pageNo: number,
+  pageSize: number
+): { list: DraftbenchRecordListItem[]; total: number } {
+  return getLogStore().queryDraftbenchRecords(pageNo, pageSize);
+}
+
+export function queryDraftbenchRecord(traceId: string): DraftbenchRecordDetail | null {
+  return getLogStore().queryDraftbenchRecord(traceId);
 }
 
 export function markHandled(traceId: string, handleStartedAt: number): void {

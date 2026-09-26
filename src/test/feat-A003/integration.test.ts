@@ -714,7 +714,7 @@ test('旧字段 scenario / service 一律 400，请求完全不触达 Agent 与�
   assert.deepEqual(legacyOne.body, {
     code: 400,
     data: null,
-    message: '请求体只支持 message、domain 字段，收到无效字段：scenario',
+    message: '请求体只支持 message、domain、source、chunks、params 字段，收到无效字段：scenario',
   });
 
   const legacyTwo = await postJson(baseUrl, '/api/chat', {
@@ -725,7 +725,7 @@ test('旧字段 scenario / service 一律 400，请求完全不触达 Agent 与�
   assert.equal(legacyTwo.status, 400);
   assert.equal(
     legacyTwo.body.message,
-    '请求体只支持 message、domain 字段，收到无效字段：scenario、service'
+    '请求体只支持 message、domain、source、chunks、params 字段，收到无效字段：scenario、service'
   );
 
   assert.equal(model.calls.length, 0);
