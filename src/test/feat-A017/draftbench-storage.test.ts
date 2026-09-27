@@ -1,6 +1,6 @@
 // feat-A017 草稿台存储测试（测试即文档）：
 // 覆盖：request_logs 来源列（生产 NULL / 草稿台 'draftbench'，列表 / 详情 / token-stats 同口径筛选）、
-// 草稿台记录表 round-trip（params/chunks/result 快照 + cited_indexes 解析）、生成温度读取、
+// 草稿台记录表 round-trip（params/chunks/result 快照 + cited_indexes 解析）、记录删除（物理删行 / 日志链路保留）、生成温度读取、
 // 30 天轮转同周期清理（§10 决策 5）、迁移幂等（重复建库 ALTER 忽略）。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -113,6 +113,35 @@ test('storage: 草稿台记录 round-trip（快照 + cited_indexes + 结果摘�
   assert.deepEqual(detail.citedIndexes, [0, 1]);
   assert.equal(detail.result?.answer, '答案');
   assert.equal(store.queryDraftbenchRecord('9f7c0000-0000-4000-8000-000000000099'), null);
+  store.close();
+});
+
+test('storage: 删除草稿台记录（物理删行，返回是否删到；request_logs 链路保留）', () => {
+  const store = createLogStore({ dbPath: ':memory:' });
+  store.ensureSkeleton('chat', TRACE_DRAFT, '草稿台问题', 'sango-novel', 1789884009000, null, 'draftbench');
+  store.saveDraftbenchRecord({
+    traceId: TRACE_DRAFT,
+    time: 1789884009000,
+    query: '草稿台问题',
+    params: null,
+    chunks: null,
+    citedIndexes: [],
+    status: 'success',
+    errorMessage: '',
+    result: null,
+  });
+  store.flush();
+
+  // 不存在 → false，不误删
+  assert.equal(store.deleteDraftbenchRecord('9f7c0000-0000-4000-8000-000000000099'), false);
+  // 存在 → true，draftbench_records 该行物理删除
+  assert.equal(store.deleteDraftbenchRecord(TRACE_DRAFT), true);
+  assert.equal(store.queryDraftbenchRecord(TRACE_DRAFT), null);
+  assert.equal(store.queryDraftbenchRecords(1, 20).total, 0);
+  // 日志链路保留：主表 request_logs 行仍在（日志页正常展示的前提）
+  assert.equal(store.queryDetail(TRACE_DRAFT)?.log.source, 'draftbench');
+  // 重复删除 → false（幂等）
+  assert.equal(store.deleteDraftbenchRecord(TRACE_DRAFT), false);
   store.close();
 });
 

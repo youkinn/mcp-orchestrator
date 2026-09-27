@@ -1,6 +1,7 @@
 // feat-A017 草稿台 HTTP 接口测试（测试即文档）：
 // 覆盖：source/chunks/params 400 明细（§4.1 / §4.2）、生产请求行为不变、来源筛选隔离（缺省仅生产，验收 7）、
 // 草稿台发送成功 / 失败落记录、记录列表 / 详情 + diff 重算、trace 拉取（候选映射 + preview 合成 + 温度带出）、
+// 记录删除（物理删除 / 404 / 400 / 删除后列表与详情不可见 / 日志链路保留）、
 // 差异三态边界（空清单 400 / 拒答缺省 / extra 非空不吞）。
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -163,6 +164,11 @@ async function post(
     body: await response.json(),
     traceId: response.headers.get('X-Trace-Id') ?? '',
   };
+}
+
+async function del(baseUrl: string, path: string): Promise<{ status: number; body: any }> {
+  const response = await fetch(`${baseUrl}${path}`, { method: 'DELETE' });
+  return { status: response.status, body: await response.json() };
 }
 
 function newHarness(t: TestContext): {
@@ -468,6 +474,76 @@ test('draftbench: 记录详情载入 + diff 按 §4.4 重算（单一实现点�
   assert.deepEqual(res.body.data.diff, { consistent: [1, 3], missing: [2], extra: [] });
   assert.equal(res.body.data.result.answer, '答案');
   assert.equal(res.body.data.result.citations.length, 2);
+});
+
+// ===== 记录删除（§3.6） =====
+
+test('draftbench: 删除记录 200（物理删除）+ 删除后列表 / 详情不可见 + 日志链路保留', async (t) => {
+  const h = newHarness(t);
+  const traceId = '9f7c0000-0000-4000-8000-0000000000e1';
+  // 同 traceId 同时存在主表日志行与草稿台记录行（删除只动草稿台行）
+  seedDraftbenchTrace(h.logStore, traceId);
+  h.logStore.saveDraftbenchRecord({
+    traceId,
+    time: 1789884009000,
+    query: '草稿台手动问题',
+    params: { temperature: 0.5, topK: 3, guarantee: 2, budget: 500 },
+    chunks: [{ chunkId: 'x', text: '文本', chapter: 5, title: '回目' }],
+    citedIndexes: [0],
+    status: 'success',
+    errorMessage: '',
+    result: { answer: '草稿答案', citations: [{ text: '引用' }] },
+  });
+  h.logStore.flush();
+  const baseUrl = await startServer(t, h.logStore, h.agent, h.transport);
+
+  const res = await del(baseUrl, `/api/v1/draftbench/records/${traceId}`);
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body, { code: 200, data: { deleted: true }, message: '' });
+
+  // 删除后：记录列表与详情均不可见
+  const records = await get(baseUrl, '/api/v1/draftbench/records');
+  assert.equal(records.body.code, 200);
+  assert.equal(records.body.data.total, 0);
+  const detail = await get(baseUrl, `/api/v1/draftbench/records/${traceId}`);
+  assert.equal(detail.status, 404);
+  assert.equal(detail.body.message, '草稿台记录不存在');
+
+  // 物理删除范围：日志链路保留，日志页该 traceId 仍按正常日志展示（来源=draftbench）
+  const logDetail = await get(baseUrl, `/api/v1/logs/${traceId}`);
+  assert.equal(logDetail.status, 200);
+  assert.equal(logDetail.body.data.log.source, 'draftbench');
+});
+
+test('draftbench: 删除不存在 404 / traceId 格式非法 400，未命中的记录不误删', async (t) => {
+  const h = newHarness(t);
+  seedDraftbenchTrace(h.logStore, TRACE_DRAFT);
+  h.logStore.saveDraftbenchRecord({
+    traceId: TRACE_DRAFT,
+    time: 1789884009000,
+    query: '草稿台手动问题',
+    params: null,
+    chunks: null,
+    citedIndexes: [],
+    status: 'success',
+    errorMessage: '',
+    result: null,
+  });
+  h.logStore.flush();
+  const baseUrl = await startServer(t, h.logStore, h.agent, h.transport);
+
+  const bad = await del(baseUrl, '/api/v1/draftbench/records/not-a-uuid');
+  assert.equal(bad.status, 400);
+  assert.equal(bad.body.message, 'traceId 格式非法');
+
+  const missing = await del(baseUrl, '/api/v1/draftbench/records/9f7c0000-0000-4000-8000-000000000099');
+  assert.equal(missing.status, 404);
+  assert.equal(missing.body.message, '草稿台记录不存在');
+
+  // 未命中删除不影响既有记录
+  const records = await get(baseUrl, '/api/v1/draftbench/records');
+  assert.equal(records.body.code, 200);
+  assert.equal(records.body.data.total, 1);
 });
 
 // ===== trace 拉取（§3.1） =====

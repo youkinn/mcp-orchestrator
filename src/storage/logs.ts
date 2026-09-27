@@ -772,6 +772,8 @@ export interface LogStore {
     pageSize: number
   ): { list: DraftbenchRecordListItem[]; total: number };
   queryDraftbenchRecord(traceId: string): DraftbenchRecordDetail | null;
+  /** 物理删除草稿台记录（仅删 draftbench_records 该行；request_logs / llm_call_logs 等日志链路保留）；返回是否删到 */
+  deleteDraftbenchRecord(traceId: string): boolean;
   /** 生成轮（stage='generation'）末次成功 LLM 调用的温度实参；无生成轮（缓存命中 / 失败 / 运维）→ null */
   queryGenerationTemperature(traceId: string): number | null;
   // ===== feat-A013：缓存存储（cache_logs / cache_entries；均同步直写，不经 A007 写缓冲） =====
@@ -1087,6 +1089,7 @@ function createNoopStore(): LogStore {
     saveDraftbenchRecord: noopWrite,
     queryDraftbenchRecords: () => ({ list: [], total: 0 }),
     queryDraftbenchRecord: () => null,
+    deleteDraftbenchRecord: () => false,
     queryGenerationTemperature: () => null,
   };
 }
@@ -1383,6 +1386,9 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   const queryDraftbenchRecordStmt = db.prepare(
     `SELECT * FROM draftbench_records WHERE trace_id = ?`
   );
+  const deleteDraftbenchRecordStmt = db.prepare(
+    `DELETE FROM draftbench_records WHERE trace_id = ?`
+  );
   const store: LogStore = {
     ensureSkeleton(
       logType,
@@ -1594,6 +1600,10 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
         | DraftbenchRecordRow
         | undefined;
       return row === undefined ? null : parseDraftbenchRecordDetail(row);
+    },
+
+    deleteDraftbenchRecord(traceId): boolean {
+      return deleteDraftbenchRecordStmt.run(traceId).changes > 0;
     },
 
     queryGenerationTemperature(traceId): number | null {
@@ -2338,6 +2348,10 @@ export function queryDraftbenchRecords(
 
 export function queryDraftbenchRecord(traceId: string): DraftbenchRecordDetail | null {
   return getLogStore().queryDraftbenchRecord(traceId);
+}
+
+export function deleteDraftbenchRecord(traceId: string): boolean {
+  return getLogStore().deleteDraftbenchRecord(traceId);
 }
 
 export function markHandled(traceId: string, handleStartedAt: number): void {

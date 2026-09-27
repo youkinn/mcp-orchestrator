@@ -6,6 +6,8 @@
 //   tailFallback 只读）。
 // GET /records —— 草稿台发送记录列表（仅 source=draftbench，时间倒序，分页口径同 /api/v1/logs）。
 // GET /records/:traceId —— 记录详情（载入 + diff 按 §4.4 重算，单一实现点 computeDraftbenchDiff）。
+// DELETE /records/:traceId —— 物理删除该条草稿台记录（仅删 draftbench_records 行；request_logs / llm_call_logs
+//   等日志链路保留，删除后日志页仍按正常日志展示该 traceId）。
 // 本组接口自身不落日志（防递归，同 /api/v1/logs*）。
 import { Router, type Request, type Response } from 'express';
 import type { MCPTransport } from '../../transport.js';
@@ -29,6 +31,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const TRACE_NOT_FOUND_MESSAGE = '请求记录不存在';
 const RECORD_NOT_FOUND_MESSAGE = '草稿台记录不存在';
 const QUERY_ERROR_MESSAGE = '查询草稿台记录失败，请稍后重试';
+const DELETE_ERROR_MESSAGE = '删除草稿台记录失败，请稍后重试';
 const PREVIEW_MAX_LENGTH = 120;
 const DEFAULT_TEMPERATURE = 0.7;
 /** §4.2 参数缺省（与生产注入常量同值；记录 / 校验失败行 params 快照缺失时展示用） */
@@ -318,6 +321,25 @@ export function createDraftbenchApi(
     } catch (error) {
       console.error('Failed to query draftbench record detail:', error);
       sendError(response, 500, QUERY_ERROR_MESSAGE);
+    }
+  });
+
+  // DELETE /api/v1/draftbench/records/:traceId —— 物理删除发送记录（§3.6；仅草稿台行，日志链路保留）
+  router.delete('/records/:traceId', (request: Request, response: Response) => {
+    try {
+      const traceId = request.params.traceId;
+      if (typeof traceId !== 'string' || !UUID_PATTERN.test(traceId)) {
+        sendError(response, 400, 'traceId 格式非法');
+        return;
+      }
+      if (!logStore.deleteDraftbenchRecord(traceId)) {
+        sendError(response, 404, RECORD_NOT_FOUND_MESSAGE);
+        return;
+      }
+      response.json({ code: 200, data: { deleted: true }, message: '' });
+    } catch (error) {
+      console.error('Failed to delete draftbench record:', error);
+      sendError(response, 500, DELETE_ERROR_MESSAGE);
     }
   });
 
