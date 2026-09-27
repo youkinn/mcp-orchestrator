@@ -32,6 +32,15 @@ function parseQueryString(raw: unknown): string | undefined {
   return typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : undefined;
 }
 
+/** feat-A017 §3.5：来源筛选参数（缺省 production = 仅生产 / 历史行；非法 400） */
+function parseSource(raw: unknown): 'production' | 'draftbench' {
+  const value = parseQueryString(raw) ?? 'production';
+  if (value !== 'production' && value !== 'draftbench') {
+    throw new Error('INVALID_SOURCE');
+  }
+  return value;
+}
+
 /** feat-A013 §3.10：命中解释对象（明细 data.cache；cache_logs 无行时为 null）。cacheLogId = cache_logs.id（契约补充，Coco 已批准）。 */
 interface CacheTraceInfo {
   cacheLogId: number;
@@ -103,6 +112,15 @@ export function createLogsApi(logStore: LogStore): Router {
         return;
       }
 
+      // feat-A017：来源筛选（缺省仅生产，验收 7 数据隔离；非法 400）
+      let source: 'production' | 'draftbench' = 'production';
+      try {
+        source = parseSource(request.query.source);
+      } catch {
+        sendError(response, 400, 'source 只支持 production/draftbench');
+        return;
+      }
+
       const domain = parseQueryString(request.query.domain);
       if (domain !== undefined && domain !== 'weather' && domain !== 'fengyunsanguo' && domain !== 'sango-novel') {
         sendError(response, 400, 'domain 只支持 weather/fengyunsanguo/sango-novel');
@@ -124,6 +142,7 @@ export function createLogsApi(logStore: LogStore): Router {
         responseCode: responseCodeRaw,
         keyword: parseQueryString(request.query.keyword),
         domain,
+        source,
       });
 
       response.json({
@@ -163,6 +182,15 @@ export function createLogsApi(logStore: LogStore): Router {
         return;
       }
 
+      // feat-A017 §10 决策 3：统计类接口同口径来源筛选（缺省仅生产、非法 400）
+      let source: 'production' | 'draftbench' = 'production';
+      try {
+        source = parseSource(request.query.source);
+      } catch {
+        sendError(response, 400, 'source 只支持 production/draftbench');
+        return;
+      }
+
       const granularityRaw = parseQueryString(request.query.granularity) ?? 'day';
       if (granularityRaw !== 'day' && granularityRaw !== 'hour') {
         sendError(response, 400, 'granularity 只支持 day/hour');
@@ -173,6 +201,7 @@ export function createLogsApi(logStore: LogStore): Router {
         startAt,
         endAt,
         granularity: granularityRaw,
+        source,
       });
       response.json({ code: 200, data, message: '' });
     } catch (error) {

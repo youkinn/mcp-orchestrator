@@ -116,12 +116,13 @@ test('GET /api/v1/logs：成功信封 + 列表项字段 + durations/tokens 派�
     Object.keys(item).sort(),
     [
       'cacheHit', 'domain', 'durations', 'errorMessage', 'hasRetry', 'logType', 'responseCode',
-      'routeSource', 'serverReceivedAt', 'status', 'tokens', 'traceId', 'userInput',
+      'routeSource', 'serverReceivedAt', 'source', 'status', 'tokens', 'traceId', 'userInput',
     ]
   );
   assert.equal(item.traceId, TRACE_A);
   assert.equal(item.logType, 'chat');
   assert.equal(item.domain, 'sango-novel');
+  assert.equal(item.source, 'production', 'feat-A017 §3.5：历史 / 生产行按 production 展示');
   assert.equal(item.cacheHit, null, 'feat-A013 §3.10：无 cache_logs 行（A013 前历史行）→ null');
   assert.equal(item.status, 'success');
   assert.equal(item.responseCode, 200);
