@@ -6,8 +6,8 @@
 //   tailFallback 只读）。
 // GET /records —— 草稿台发送记录列表（仅 source=draftbench，时间倒序，分页口径同 /api/v1/logs）。
 // GET /records/:traceId —— 记录详情（载入 + diff 按 §4.4 重算，单一实现点 computeDraftbenchDiff）。
-// DELETE /records/:traceId —— 物理删除该条草稿台记录（仅删 draftbench_records 行；request_logs / llm_call_logs
-//   等日志链路保留，删除后日志页仍按正常日志展示该 traceId）。
+// DELETE /records/:traceId —— 物理删除该条草稿台记录，同 traceId 日志链路（request_logs / llm_call_logs /
+//   tool_call_logs / tool_retrieval_logs / cache_logs）一并物理删除；删除后日志页不再出现该 traceId 记录。
 // 本组接口自身不落日志（防递归，同 /api/v1/logs*）。
 import { Router, type Request, type Response } from 'express';
 import type { MCPTransport } from '../../transport.js';
@@ -324,7 +324,7 @@ export function createDraftbenchApi(
     }
   });
 
-  // DELETE /api/v1/draftbench/records/:traceId —— 物理删除发送记录（§3.6；仅草稿台行，日志链路保留）
+  // DELETE /api/v1/draftbench/records/:traceId —— 物理删除发送记录（§3.6；草稿台行 + 日志链路事务内一并删）
   router.delete('/records/:traceId', (request: Request, response: Response) => {
     try {
       const traceId = request.params.traceId;
@@ -332,7 +332,7 @@ export function createDraftbenchApi(
         sendError(response, 400, 'traceId 格式非法');
         return;
       }
-      if (!logStore.deleteDraftbenchRecord(traceId)) {
+      if (!logStore.deleteDraftbenchRecord(traceId).hit) {
         sendError(response, 404, RECORD_NOT_FOUND_MESSAGE);
         return;
       }

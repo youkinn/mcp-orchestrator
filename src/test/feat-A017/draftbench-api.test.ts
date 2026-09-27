@@ -1,7 +1,7 @@
 // feat-A017 草稿台 HTTP 接口测试（测试即文档）：
 // 覆盖：source/chunks/params 400 明细（§4.1 / §4.2）、生产请求行为不变、来源筛选隔离（缺省仅生产，验收 7）、
 // 草稿台发送成功 / 失败落记录、记录列表 / 详情 + diff 重算、trace 拉取（候选映射 + preview 合成 + 温度带出）、
-// 记录删除（物理删除 / 404 / 400 / 删除后列表与详情不可见 / 日志链路保留）、
+// 记录删除（物理删除含日志链路 / 404 / 400 / 删除后列表与详情不可见 / 日志页不再出现该 traceId）、
 // 差异三态边界（空清单 400 / 拒答缺省 / extra 非空不吞）。
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -478,11 +478,40 @@ test('draftbench: 记录详情载入 + diff 按 §4.4 重算（单一实现点�
 
 // ===== 记录删除（§3.6） =====
 
-test('draftbench: 删除记录 200（物理删除）+ 删除后列表 / 详情不可见 + 日志链路保留', async (t) => {
+test('draftbench: 删除记录 200（物理删除含日志链路）+ 删除后列表 / 详情不可见 + 日志页查不到', async (t) => {
   const h = newHarness(t);
   const traceId = '9f7c0000-0000-4000-8000-0000000000e1';
-  // 同 traceId 同时存在主表日志行与草稿台记录行（删除只动草稿台行）
+  // 同 traceId 同时存在草稿台记录行与完整日志链路（LLM / 工具 / 检索 / 缓存判定行；删除应一并物理删除）
   seedDraftbenchTrace(h.logStore, traceId);
+  h.logStore.appendLlmCall(traceId, {
+    stage: 'generation',
+    model: 'mock-model',
+    requestAt: 1789884009100,
+    status: 'success',
+    errorMessage: '',
+  });
+  const seq = h.logStore.appendToolCall(traceId, {
+    mcpServer: 'sango',
+    toolName: SANGO_NOVEL_SEARCH_TOOL,
+    callSentAt: 1789884009200,
+    status: 'success',
+    caller: 'server',
+    stage: 'fastpath',
+  });
+  if (seq !== null) {
+    h.logStore.appendRetrievalLog(traceId, seq, {
+      funnel: { injected: 1, cited: 1 },
+      candidates: [],
+    });
+  }
+  h.logStore.appendCacheLog(traceId, {
+    userQuery: '草稿台手动问题',
+    nearestQuery: null,
+    similarity: 0.9,
+    hitLine: 0.8,
+    hit: false,
+    tieHits: 0,
+  });
   h.logStore.saveDraftbenchRecord({
     traceId,
     time: 1789884009000,
@@ -497,6 +526,11 @@ test('draftbench: 删除记录 200（物理删除）+ 删除后列表 / 详情�
   h.logStore.flush();
   const baseUrl = await startServer(t, h.logStore, h.agent, h.transport);
 
+  // 删除前：日志页该 traceId 按正常日志可见（来源=draftbench）
+  const before = await get(baseUrl, `/api/v1/logs/${traceId}`);
+  assert.equal(before.status, 200);
+  assert.equal(before.body.data.log.source, 'draftbench');
+
   const res = await del(baseUrl, `/api/v1/draftbench/records/${traceId}`);
   assert.equal(res.status, 200);
   assert.deepEqual(res.body, { code: 200, data: { deleted: true }, message: '' });
@@ -509,10 +543,10 @@ test('draftbench: 删除记录 200（物理删除）+ 删除后列表 / 详情�
   assert.equal(detail.status, 404);
   assert.equal(detail.body.message, '草稿台记录不存在');
 
-  // 物理删除范围：日志链路保留，日志页该 traceId 仍按正常日志展示（来源=draftbench）
+  // 物理删除范围含日志链路：日志页来源=草稿台不再出现该 traceId（详情 404）
   const logDetail = await get(baseUrl, `/api/v1/logs/${traceId}`);
-  assert.equal(logDetail.status, 200);
-  assert.equal(logDetail.body.data.log.source, 'draftbench');
+  assert.equal(logDetail.status, 404);
+  assert.equal(logDetail.body.message, '日志不存在');
 });
 
 test('draftbench: 删除不存在 404 / traceId 格式非法 400，未命中的记录不误删', async (t) => {

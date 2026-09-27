@@ -385,6 +385,17 @@ export interface DraftbenchRecordDetail {
   result: DraftbenchRecordResult | null;
 }
 
+/** feat-A017：删除草稿台记录结果（hit = draftbench_records 命中；其余为各日志表连带物理删除行数） */
+export interface DeleteDraftbenchRecordResult {
+  /** draftbench_records 是否命中该 traceId（未命中 → 404，日志链路不动） */
+  hit: boolean;
+  requestLogs: number;
+  llmCallLogs: number;
+  toolCallLogs: number;
+  toolRetrievalLogs: number;
+  cacheLogs: number;
+}
+
 /** draftbench_records 行（存储内部） */
 interface DraftbenchRecordRow {
   trace_id: string;
@@ -772,8 +783,8 @@ export interface LogStore {
     pageSize: number
   ): { list: DraftbenchRecordListItem[]; total: number };
   queryDraftbenchRecord(traceId: string): DraftbenchRecordDetail | null;
-  /** 物理删除草稿台记录（仅删 draftbench_records 该行；request_logs / llm_call_logs 等日志链路保留）；返回是否删到 */
-  deleteDraftbenchRecord(traceId: string): boolean;
+  /** 物理删除草稿台记录（draftbench_records 该行 + 同 traceId 日志链路各表，事务内一并删除）；返回是否命中 + 各表删除行数 */
+  deleteDraftbenchRecord(traceId: string): DeleteDraftbenchRecordResult;
   /** 生成轮（stage='generation'）末次成功 LLM 调用的温度实参；无生成轮（缓存命中 / 失败 / 运维）→ null */
   queryGenerationTemperature(traceId: string): number | null;
   // ===== feat-A013：缓存存储（cache_logs / cache_entries；均同步直写，不经 A007 写缓冲） =====
@@ -1089,7 +1100,7 @@ function createNoopStore(): LogStore {
     saveDraftbenchRecord: noopWrite,
     queryDraftbenchRecords: () => ({ list: [], total: 0 }),
     queryDraftbenchRecord: () => null,
-    deleteDraftbenchRecord: () => false,
+    deleteDraftbenchRecord: () => ({ hit: false, requestLogs: 0, llmCallLogs: 0, toolCallLogs: 0, toolRetrievalLogs: 0, cacheLogs: 0 }),
     queryGenerationTemperature: () => null,
   };
 }
@@ -1389,6 +1400,39 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
   const deleteDraftbenchRecordStmt = db.prepare(
     `DELETE FROM draftbench_records WHERE trace_id = ?`
   );
+  // feat-A017：日志链路各表删除（含 trace_id 列的表逐个覆盖，子表先删不依赖 FK 级联；
+  // cache_entries / cache_settings / cache_hit_line_changes 无 trace_id 不涉及）
+  const deleteToolRetrievalLogsByTraceStmt = db.prepare(
+    `DELETE FROM tool_retrieval_logs WHERE trace_id = ?`
+  );
+  const deleteLlmCallLogsByTraceStmt = db.prepare(
+    `DELETE FROM llm_call_logs WHERE trace_id = ?`
+  );
+  const deleteToolCallLogsByTraceStmt = db.prepare(
+    `DELETE FROM tool_call_logs WHERE trace_id = ?`
+  );
+  const deleteCacheLogsByTraceStmt = db.prepare(
+    `DELETE FROM cache_logs WHERE trace_id = ?`
+  );
+  const deleteRequestLogByTraceStmt = db.prepare(
+    `DELETE FROM request_logs WHERE trace_id = ?`
+  );
+  /** feat-A017：删除草稿台记录 —— 物理删除该 traceId 的草稿台行 + 全部含 trace_id 的日志链路行，
+   * 单事务一并删除（负责人改口径：物理删除含日志链路）；draftbench_records 未命中 → 不动任何日志行（404 语义保持） */
+  const deleteDraftbenchRecordTx = db.transaction(
+    (traceId: string): DeleteDraftbenchRecordResult => {
+      const hit = deleteDraftbenchRecordStmt.run(traceId).changes > 0;
+      if (!hit) {
+        return { hit: false, requestLogs: 0, llmCallLogs: 0, toolCallLogs: 0, toolRetrievalLogs: 0, cacheLogs: 0 };
+      }
+      const toolRetrievalLogs = deleteToolRetrievalLogsByTraceStmt.run(traceId).changes;
+      const llmCallLogs = deleteLlmCallLogsByTraceStmt.run(traceId).changes;
+      const toolCallLogs = deleteToolCallLogsByTraceStmt.run(traceId).changes;
+      const cacheLogs = deleteCacheLogsByTraceStmt.run(traceId).changes;
+      const requestLogs = deleteRequestLogByTraceStmt.run(traceId).changes;
+      return { hit: true, requestLogs, llmCallLogs, toolCallLogs, toolRetrievalLogs, cacheLogs };
+    }
+  );
   const store: LogStore = {
     ensureSkeleton(
       logType,
@@ -1602,8 +1646,8 @@ export function createLogStore(options: LogStoreOptions = {}): LogStore {
       return row === undefined ? null : parseDraftbenchRecordDetail(row);
     },
 
-    deleteDraftbenchRecord(traceId): boolean {
-      return deleteDraftbenchRecordStmt.run(traceId).changes > 0;
+    deleteDraftbenchRecord(traceId): DeleteDraftbenchRecordResult {
+      return deleteDraftbenchRecordTx(traceId);
     },
 
     queryGenerationTemperature(traceId): number | null {
@@ -2350,7 +2394,7 @@ export function queryDraftbenchRecord(traceId: string): DraftbenchRecordDetail |
   return getLogStore().queryDraftbenchRecord(traceId);
 }
 
-export function deleteDraftbenchRecord(traceId: string): boolean {
+export function deleteDraftbenchRecord(traceId: string): DeleteDraftbenchRecordResult {
   return getLogStore().deleteDraftbenchRecord(traceId);
 }
 

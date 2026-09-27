@@ -1,6 +1,6 @@
 // feat-A017 草稿台存储测试（测试即文档）：
 // 覆盖：request_logs 来源列（生产 NULL / 草稿台 'draftbench'，列表 / 详情 / token-stats 同口径筛选）、
-// 草稿台记录表 round-trip（params/chunks/result 快照 + cited_indexes 解析）、记录删除（物理删行 / 日志链路保留）、生成温度读取、
+// 草稿台记录表 round-trip（params/chunks/result 快照 + cited_indexes 解析）、记录删除（物理删行 + 日志链路一并物理删除）、生成温度读取、
 // 30 天轮转同周期清理（§10 决策 5）、迁移幂等（重复建库 ALTER 忽略）。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -116,9 +116,38 @@ test('storage: 草稿台记录 round-trip（快照 + cited_indexes + 结果摘�
   store.close();
 });
 
-test('storage: 删除草稿台记录（物理删行，返回是否删到；request_logs 链路保留）', () => {
+test('storage: 删除草稿台记录（物理删行 + 日志链路各表事务内一并删，返回命中与各表删除行数）', () => {
   const store = createLogStore({ dbPath: ':memory:' });
   store.ensureSkeleton('chat', TRACE_DRAFT, '草稿台问题', 'sango-novel', 1789884009000, null, 'draftbench');
+  store.appendLlmCall(TRACE_DRAFT, {
+    stage: 'generation',
+    model: 'm',
+    requestAt: 1789884009100,
+    status: 'success',
+    errorMessage: '',
+  });
+  const seq = store.appendToolCall(TRACE_DRAFT, {
+    mcpServer: 'sango',
+    toolName: 'sango_novel_search',
+    callSentAt: 1789884009200,
+    status: 'success',
+    caller: 'server',
+    stage: 'fastpath',
+  });
+  if (seq !== null) {
+    store.appendRetrievalLog(TRACE_DRAFT, seq, {
+      funnel: { injected: 1, cited: 1 },
+      candidates: [],
+    });
+  }
+  store.appendCacheLog(TRACE_DRAFT, {
+    userQuery: '草稿台问题',
+    nearestQuery: null,
+    similarity: 0.85,
+    hitLine: 0.8,
+    hit: false,
+    tieHits: 0,
+  });
   store.saveDraftbenchRecord({
     traceId: TRACE_DRAFT,
     time: 1789884009000,
@@ -131,17 +160,35 @@ test('storage: 删除草稿台记录（物理删行，返回是否删到；reque
     result: null,
   });
   store.flush();
+  // 删除前：日志链路各表均有该 traceId 行（详情 / 缓存判定可见）
+  assert.equal(store.queryDetail(TRACE_DRAFT)?.log.source, 'draftbench');
+  assert.ok(store.queryCacheLogByTrace(TRACE_DRAFT));
 
-  // 不存在 → false，不误删
-  assert.equal(store.deleteDraftbenchRecord('9f7c0000-0000-4000-8000-000000000099'), false);
-  // 存在 → true，draftbench_records 该行物理删除
-  assert.equal(store.deleteDraftbenchRecord(TRACE_DRAFT), true);
+  // 不存在（非草稿台记录）→ hit=false，日志链路不动
+  assert.deepEqual(store.deleteDraftbenchRecord('9f7c0000-0000-4000-8000-000000000099'), {
+    hit: false,
+    requestLogs: 0,
+    llmCallLogs: 0,
+    toolCallLogs: 0,
+    toolRetrievalLogs: 0,
+    cacheLogs: 0,
+  });
+  assert.ok(store.queryDetail(TRACE_DRAFT));
+  // 存在 → hit=true，draftbench_records 该行物理删除，日志链路各表（含 trace_id 列）一并删除
+  const deleted = store.deleteDraftbenchRecord(TRACE_DRAFT);
+  assert.equal(deleted.hit, true);
+  assert.equal(deleted.requestLogs, 1);
+  assert.equal(deleted.llmCallLogs, 1);
+  assert.equal(deleted.toolCallLogs, 1);
+  assert.equal(deleted.toolRetrievalLogs, 1);
+  assert.equal(deleted.cacheLogs, 1);
   assert.equal(store.queryDraftbenchRecord(TRACE_DRAFT), null);
   assert.equal(store.queryDraftbenchRecords(1, 20).total, 0);
-  // 日志链路保留：主表 request_logs 行仍在（日志页正常展示的前提）
-  assert.equal(store.queryDetail(TRACE_DRAFT)?.log.source, 'draftbench');
-  // 重复删除 → false（幂等）
-  assert.equal(store.deleteDraftbenchRecord(TRACE_DRAFT), false);
+  // 日志链路一并删除：详情 / 缓存判定均不可见
+  assert.equal(store.queryDetail(TRACE_DRAFT), null);
+  assert.equal(store.queryCacheLogByTrace(TRACE_DRAFT), null);
+  // 重复删除 → hit=false（幂等）
+  assert.equal(store.deleteDraftbenchRecord(TRACE_DRAFT).hit, false);
   store.close();
 });
 
