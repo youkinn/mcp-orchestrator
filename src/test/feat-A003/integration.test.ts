@@ -10,6 +10,7 @@ import {
   SANGO_NOVEL_DOMAIN_PROMPT,
 } from '../../agent.js';
 import { createServer } from '../../server.js';
+import { createLogStore } from '../../storage/logs.js';
 import { MCPTransport } from '../../transport.js';
 import type {
   LLMConfig,
@@ -447,7 +448,11 @@ async function startApp(
     modelCaller: model.respond,
   });
 
-  const app = createServer(agent, transport, { port: 0, allowedOrigin: '*' });
+  const app = createServer(agent, transport, {
+    port: 0,
+    allowedOrigin: '*',
+    logStore: createLogStore({ dbPath: ':memory:' }),
+  });
   const server = app.listen(0);
   await once(server, 'listening');
   const address = server.address() as AddressInfo;
@@ -709,7 +714,7 @@ test('旧字段 scenario / service 一律 400，请求完全不触达 Agent 与�
   assert.deepEqual(legacyOne.body, {
     code: 400,
     data: null,
-    message: '请求体只支持 message、domain 字段，收到无效字段：scenario',
+    message: '请求体只支持 message、domain、source、chunks、params 字段，收到无效字段：scenario',
   });
 
   const legacyTwo = await postJson(baseUrl, '/api/chat', {
@@ -720,7 +725,7 @@ test('旧字段 scenario / service 一律 400，请求完全不触达 Agent 与�
   assert.equal(legacyTwo.status, 400);
   assert.equal(
     legacyTwo.body.message,
-    '请求体只支持 message、domain 字段，收到无效字段：scenario、service'
+    '请求体只支持 message、domain、source、chunks、params 字段，收到无效字段：scenario、service'
   );
 
   assert.equal(model.calls.length, 0);

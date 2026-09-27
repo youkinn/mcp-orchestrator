@@ -361,25 +361,44 @@ function markQuotesInWindow(
  * 注入策略（2026-09-20 定稿）：前 INJECT_HEAD_GUARANTEE 段整段保底、不裁剪、不占预算；
  * 第 6 段起仅在开关开启且预算内整段纳入，超预算丢整段、绝不段内裁剪；整段注入下引语
  * 完整可见，编号连续无空洞（不再需要「并入首条引语」等窗口补偿逻辑）。
+ * feat-A017：草稿台请求级参数覆盖 —— options.topK / guarantee / budget 取代同名生产常量
+ * （仅本次请求内生效，不改生产默认路径）；options 传布尔保留旧 tailFallback 调用兼容。
  */
+export interface InjectionViewOptions {
+  /** 注入条数上限，取代 INJECT_FRAGMENT_LIMIT（草稿台 topK）；缺省用生产常量 */
+  topK?: number;
+  /** 保底段数，取代 INJECT_HEAD_GUARANTEE（草稿台 guarantee）；缺省用生产常量 */
+  guarantee?: number;
+  /** 总预算（字），取代 INJECT_TOTAL_BUDGET（草稿台 budget）；缺省用生产常量 */
+  budget?: number;
+  /** 尾部兜底开关；缺省 INJECT_TAIL_FALLBACK_ENABLED（草稿台恒真，只读不可覆盖） */
+  tailFallback?: boolean;
+}
+
 export function buildInjectionView(
   fragments: RecallFragment[],
   query = "",
-  tailFallback = INJECT_TAIL_FALLBACK_ENABLED
+  options: InjectionViewOptions | boolean = {}
 ): InjectionView {
+  const opts: InjectionViewOptions =
+    typeof options === "boolean" ? { tailFallback: options } : options;
+  const limit = opts.topK ?? INJECT_FRAGMENT_LIMIT;
+  const guarantee = opts.guarantee ?? INJECT_HEAD_GUARANTEE;
+  const budget = opts.budget ?? INJECT_TOTAL_BUDGET;
+  const tailFallback = opts.tailFallback ?? INJECT_TAIL_FALLBACK_ENABLED;
   const quotes = new Map<string, RenderedQuote>();
   const targets = new Map<string, RenderedQuote>();
   const quoteFragments = new Map<string, string>();
   const parts: string[] = [];
   let next = 1;
-  const injected = fragments.slice(0, INJECT_FRAGMENT_LIMIT);
+  const injected = fragments.slice(0, limit);
   // 前 INJECT_HEAD_GUARANTEE 段保底整段注入（不参与预算竞争）；
   // tailFallback=false 时固定只注入前 5 段；开启时第 6+ 段整段在预算内依次纳入，超预算丢整段。
-  const picked = injected.slice(0, INJECT_HEAD_GUARANTEE);
+  const picked = injected.slice(0, guarantee);
   if (tailFallback) {
     let used = picked.reduce((sum, fragment) => sum + fragment.text.length, 0);
-    for (const fragment of injected.slice(INJECT_HEAD_GUARANTEE)) {
-      if (used + fragment.text.length > INJECT_TOTAL_BUDGET) {
+    for (const fragment of injected.slice(guarantee)) {
+      if (used + fragment.text.length > budget) {
         break;
       }
       picked.push(fragment);
@@ -822,4 +841,44 @@ export function buildFallback(
       },
     ],
   };
+}
+
+/** feat-A017 差异三态（§4.4）：
+ * - consistent：发送清单中被结果引用的条目序号（1 基，对应 chunks 下标 + 1）；
+ * - missing：清单中未被引用的条目序号；
+ * - extra：结果引用但不属于清单的引用（正常恒空；非空即异常信号，页面高亮 / CLI 打 ! 标注，不作静默吞掉）。
+ * 单一实现点：判定在服务端生成管线内完成（引用归属片段已知，无需事后文本比对）。
+ */
+export interface DraftbenchDiff {
+  consistent: number[];
+  missing: number[];
+  extra: Citation[];
+}
+
+/**
+ * 由「已引用片段的清单下标（0 基）」重算差异三态；citations 与已归属片段数不齐（渲染失配等异常）
+ * 时，尾部引用归入 extra 而非静默吞掉。
+ */
+export function computeDraftbenchDiff(
+  citedIndexes: Iterable<number>,
+  listLength: number,
+  citations: Citation[]
+): DraftbenchDiff {
+  const cited = new Set<number>();
+  for (const raw of citedIndexes) {
+    if (Number.isInteger(raw) && raw >= 0 && raw < listLength) {
+      cited.add(raw);
+    }
+  }
+  const consistent = [...cited].sort((a, b) => a - b).map((index) => index + 1);
+  const missing: number[] = [];
+  for (let index = 0; index < listLength; index++) {
+    if (!cited.has(index)) {
+      missing.push(index + 1);
+    }
+  }
+  const attributable = cited.size;
+  const extra =
+    citations.length > attributable ? citations.slice(attributable) : [];
+  return { consistent, missing, extra };
 }

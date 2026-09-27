@@ -6,6 +6,7 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import type { Agent } from '../../agent.js';
 import { createServer } from '../../server.js';
+import { createLogStore } from '../../storage/logs.js';
 import type { MCPTransport } from '../../transport.js';
 import {
   ToolExecutionError,
@@ -268,6 +269,7 @@ async function startServer(
   const app = createServer(asAgent(agent), quiz, {
     port: 0,
     allowedOrigin: '*',
+    logStore: createLogStore({ dbPath: ':memory:' }),
   });
 
   const server = app.listen(0);
@@ -334,19 +336,19 @@ test('⑦ /api/chat 携带 scenario / service / sessionId → 400，无效字段
   const cases: Array<[Record<string, unknown>, string]> = [
     [
       { message: '你好', scenario: 'weather' },
-      '请求体只支持 message、domain 字段，收到无效字段：scenario',
+      '请求体只支持 message、domain、source、chunks、params 字段，收到无效字段：scenario',
     ],
     [
       { message: '你好', service: 'random' },
-      '请求体只支持 message、domain 字段，收到无效字段：service',
+      '请求体只支持 message、domain、source、chunks、params 字段，收到无效字段：service',
     ],
     [
       { message: '你好', sessionId: 'sid' },
-      '请求体只支持 message、domain 字段，收到无效字段：sessionId',
+      '请求体只支持 message、domain、source、chunks、params 字段，收到无效字段：sessionId',
     ],
     [
       { message: '你好', scenario: 'sango', service: 'random' },
-      '请求体只支持 message、domain 字段，收到无效字段：scenario、service',
+      '请求体只支持 message、domain、source、chunks、params 字段，收到无效字段：scenario、service',
     ],
   ];
 
