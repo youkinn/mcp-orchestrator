@@ -4,6 +4,7 @@ import {
   CLASSIFY_SYSTEM_PROMPT,
   FENGYUNSANGUO_DOMAIN_PROMPT,
   FREE_CHAT_SYSTEM_PROMPT,
+  NOVEL_BOUNDARY_CHECK_PROMPT,
   SANGO_NOVEL_DOMAIN_PROMPT,
 } from "../../agent.js";
 
@@ -38,6 +39,21 @@ test("② sango-novel 域提示：§2.4 原文照录，含指针 / 片段 / 兜�
 test("②a 演义域生成轮含事件结构方向校验（bug-00023：主宾反转 / 错误前提）", () => {
   assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /施事者=.*动作=.*受事者=/);
   assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /方向是否一致.*禁止用该文档回答/);
+});
+
+test("②b 演义域生成轮含改述口径（bug-00032/33/34）：允许语义等价改述，禁改四要素，指针须指向支撑片段", () => {
+  assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /结论允许对片段做语义等价的改述/);
+  assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /不得改变片段中的人名、动作方向、受事者、结果/);
+  assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /改述句必须由所引片段语义支撑/);
+  assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /引用指针必须指向该支撑片段/);
+});
+
+test("②c 边界复核提示词与域提示改述口径一致（judge 同口径校准）", () => {
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /语义等价的改述/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /不改变片段中的人名、动作方向、受事者、结果/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /片段原文足以推出或印证该断言 → supported/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /片段原文不足以支撑该断言/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /改动了片段中的人名、动作方向、受事者、结果 → unsupported/);
 });
 
 test("③ fengyunsanguo 域提示：§2.4 原文照录，含固定话术与未召回兜底", () => {
