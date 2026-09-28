@@ -525,7 +525,7 @@ export function stripPointerMarkers(text: string): string {
 }
 
 /** 把答案切成句（句末标点 / 指针为边界），[Qn] / [片段N] 指针并入所属句子 */
-function splitAnswerSentences(answer: string): Array<{
+export function splitAnswerSentences(answer: string): Array<{
   text: string;
   narrativePointers: string[];
   quotePointers: string[];
@@ -543,6 +543,27 @@ function splitAnswerSentences(answer: string): Array<{
     }
     const text = (matched[1] ?? "") + (matched[2] ?? "");
     if (!text.trim()) {
+      continue;
+    }
+    // bug-00044：模型输出「结论句。\n\n[片段N]」会被正则切成「结论句」+ 独立指针行
+    // （trace 46dbc882：结论句无指针 → 对全部注入片段错配无关片段作复核参考 → 误裁拒答）。
+    // 后处理：纯指针行（去掉 [Qn]/[片段N] 后正文为空）且前面存在有正文句子时，拼到前句末尾，
+    // 指针随文本归属前句（本函数从整句文本提取 narrativePointers/quotePointers，拼接后自然生效）；
+    // 前面没有有正文句子的孤儿指针行保持原样（bug-00038 拒答路径不受影响）。
+    const last = sentences[sentences.length - 1];
+    if (
+      last !== undefined &&
+      stripPointerMarkers(text).trim() === "" &&
+      stripPointerMarkers(last.text).trim() !== ""
+    ) {
+      const mergedText = last.text + text;
+      last.text = mergedText;
+      last.narrativePointers = [...mergedText.matchAll(/\[片段(\d+)\]/g)].map(
+        (m) => `片段${m[1]}`
+      );
+      last.quotePointers = [...mergedText.matchAll(/\[Q(\d+)\]/g)].map(
+        (m) => `Q${m[1]}`
+      );
       continue;
     }
     // 指针不限于句尾（bug-00037：句号前指针同样归属本句），从整句正文提取

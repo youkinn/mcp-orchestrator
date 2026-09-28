@@ -1,7 +1,7 @@
 // feat-A012 编排侧埋点测试（测试即文档）：
 // 覆盖 attempt 两轮各自成行 / 单轮 attempt=1 / route_source 五分支各一例
 // （label / keyword / vector / classify / free）/ input_breakdown 分段与折算口径 /
-// max_tokens 落库 / temperature 落库（默认 0.7 / 变参重试 0 / 请求异常失败行）/ reasoning_tokens 的 null 语义。
+// max_tokens 落库 / temperature 落库（默认 0.1 / 变参重试 0 / 请求异常失败行）/ reasoning_tokens 的 null 语义。
 // 走真实 Agent.callModel 代码路径（fake OpenAI 客户端），日志经 runWithTraceId 落临时库；
 // route_source 经 processQueryData 真实组合 + reportRouteSource 回填。
 import { after, before, test } from 'node:test';
@@ -157,7 +157,7 @@ test('attempt：首轮空答案 → failed attempt=1 + 重试成功 attempt=2 �
   assert.equal(detail.llmCalls[0]!.status, 'failed', '首轮空答案行状态 failed');
   assert.equal(detail.llmCalls[1]!.attempt, 2, '重试成功行 attempt=2');
   assert.equal(detail.llmCalls[1]!.status, 'success', '重试行状态 success');
-  assert.equal(detail.llmCalls[0]!.temperature, 0.7, '首轮失败行落库默认温度');
+  assert.equal(detail.llmCalls[0]!.temperature, 0.1, '首轮失败行落库默认温度');
   assert.equal(detail.llmCalls[1]!.temperature, 0, '变参重试行落库 temperature=0');
 });
 
@@ -266,7 +266,7 @@ test('maxTokens：落库 = 调用点 params.max_tokens 原值（MAX_TOKENS=1000�
   assert.equal(detail.llmCalls[0]!.maxTokens, 1000, '落库 max_tokens=1000');
 });
 
-test('temperature：落库 = 调用点生效温度原值（默认 0.7，与 params 同源）', async () => {
+test('temperature：落库 = 调用点生效温度原值（默认 0.1，与 params 同源）', async () => {
   const { openai, requests } = scriptedOpenAI([
     { content: '你好', finishReason: 'stop' },
   ]);
@@ -278,11 +278,11 @@ test('temperature：落库 = 调用点生效温度原值（默认 0.7，与 para
     [{ role: 'user', content: '你好' }]
   );
 
-  assert.equal(requests[0]!.temperature, 0.7, '请求参数与落库同源');
-  assert.equal(detail.llmCalls[0]!.temperature, 0.7, '落库 temperature=0.7');
+  assert.equal(requests[0]!.temperature, 0.1, '请求参数与落库同源');
+  assert.equal(detail.llmCalls[0]!.temperature, 0.1, '落库 temperature=0.1');
 });
 
-test('temperature：请求异常（catch 分支）失败行同样落库本次生效温度 0.7', async () => {
+test('temperature：请求异常（catch 分支）失败行同样落库本次生效温度 0.1', async () => {
   const openai = {
     chat: {
       completions: {
@@ -311,7 +311,7 @@ test('temperature：请求异常（catch 分支）失败行同样落库本次生
   assert.equal(detail.llmCalls[0]!.status, 'failed');
   assert.equal(
     detail.llmCalls[0]!.temperature,
-    0.7,
+    0.1,
     'catch 分支失败行同样落库本次生效温度'
   );
 });

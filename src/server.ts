@@ -37,7 +37,7 @@ const CHAT_ALLOWED_SOURCES = ['production', 'draftbench'] as const;
 const DRAFTBENCH_CHUNK_LIMIT = 20;
 const DRAFTBENCH_CHUNK_TEXT_LIMIT = 2000;
 const DRAFTBENCH_BUDGET_LIMIT = 20000;
-const DEFAULT_TEMPERATURE = 0.7;
+const DEFAULT_TEMPERATURE = 0.1;
 
 interface ParsedBody {
   message: string;
@@ -97,7 +97,7 @@ function validateDraftbenchChunks(
   return { ok: true, value: chunks };
 }
 
-/** §4.2 本次参数校验：字段缺省 = 生产常量（temperature 0.7 / topK 10 / guarantee 5 / budget 2000；
+/** §4.2 本次参数校验：字段缺省 = 生产常量（temperature 0.1 / topK 10 / guarantee 5 / budget 2000；
  * guarantee 缺省在 topK 覆写小于 5 时按 min(5, topK) 收敛，避免 0~topK 自相矛盾）；
  * budget 上限 20000（§10 决策 4）。非法全部 400 明细。 */
 function validateDraftbenchParams(

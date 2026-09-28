@@ -436,7 +436,7 @@ test('draftbench: records 列表仅草稿台、时间倒序、分页形状', asy
   assert.equal(res.body.data.list[0].errorMessage, '发送清单不能为空');
   assert.equal(res.body.data.list[0].result, null);
   // 校验失败行 params 快照缺失 → 服务端带出生产缺省（§4.2）
-  assert.deepEqual(res.body.data.list[0].params, { temperature: 0.7, topK: 10, guarantee: 5, budget: 2000 });
+  assert.deepEqual(res.body.data.list[0].params, { temperature: 0.1, topK: 10, guarantee: 5, budget: 2000 });
   assert.equal(res.body.data.list[1].result.citationCount, 1);
 
   const bad = await get(baseUrl, '/api/v1/draftbench/records/not-a-uuid');
@@ -624,7 +624,7 @@ test('draftbench: trace 拉取候选映射 + preview 合成 + 生成温度带出
   assert.ok(typeof candidate.preview === 'string' && candidate.preview.length <= 120);
 });
 
-test('draftbench: 无生成轮温度缺省 0.7；章节通道故障时 preview 降级 null 不拖垮拉取', async (t) => {
+test('draftbench: 无生成轮温度缺省 0.1；章节通道故障时 preview 降级 null 不拖垮拉取', async (t) => {
   const h = newHarness(t);
   seedProductionTrace(h.logStore, TRACE_PROD);
   h.transport.chapterFail = true;
@@ -632,7 +632,7 @@ test('draftbench: 无生成轮温度缺省 0.7；章节通道故障时 preview �
 
   const res = await get(baseUrl, `/api/v1/draftbench/trace/${TRACE_PROD}`);
   assert.equal(res.body.code, 200);
-  assert.equal(res.body.data.params.temperature, 0.7);
+  assert.equal(res.body.data.params.temperature, 0.1);
   assert.equal(res.body.data.chunks.candidates.length, 0);
   assert.equal(res.body.data.chunks.injectedCount, 0);
 });

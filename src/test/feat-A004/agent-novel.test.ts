@@ -1148,3 +1148,46 @@ test("㉙ 单轮·边界复核预算·引语片段句豁免 bug-00040：[Q1] 引
   assert.equal(data.citations.length, 1, "引文指针对应片段收进 citations");
   assert.ok(data.citations[0].text.includes("吾虎女安肯嫁犬子乎"), "citation 为该引语所在片段整段原文");
 });
+
+test("㉚ 单轮·边界复核·正例 bug-00044：结论句 + 换行独立 [片段1] 行 → 指针并入结论句，复核 supported → 结论保留且引用渲染正常（trace 46dbc882 修复）", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0073:c0008",
+      text: "权遣使至荆州，为其子求娶关羽之女。关公大怒，曰：“虎女焉能嫁犬子！”遂不允婚，使者惭退。",
+      chapter: 73,
+      title: "玄德进位汉中王　云长攻拔襄阳郡",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let modelCallCount = 0;
+  let checkCallCount = 0;
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      return textResponse("supported"); // 片段含「大怒…不允婚」：语义支撑 → 放行
+    }
+    return textResponse("关羽怒斥来使，拒绝联姻。\n\n[片段1]"); // 结论句 + 换行独立 [片段1] 行（46dbc882 形态）
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "关羽拒绝联姻",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("孙权遣人向关羽求亲，关羽是怎么回复使者的", "sango-novel");
+  assert.notEqual(data.answer, "演义中未涉及", "低重叠结论复核 supported 放行，不得误裁拒答");
+  assert.ok(data.answer.includes("关羽怒斥来使，拒绝联姻"), "结论句保留");
+  assert.ok(data.answer.endsWith("¹"), "换行独立成行的 [片段1] 随文本归属结论句并渲染上标角标");
+  assert.equal(data.citations.length, 1, "只收所引片段");
+  assert.ok(data.citations[0].text.includes("不允婚"), "citation 为片段原文");
+  assert.equal(checkCallCount, 1, "合并后仅结论句 1 个低重叠候选 → 恰 1 次复核（预算不变）");
+  assert.equal(modelCallCount, 2, "生成轮 + 边界语义复核各一次（LLM 调用预算不变）");
+});
+

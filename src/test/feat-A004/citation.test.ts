@@ -10,11 +10,13 @@ import {
   SENTENCE_OVERLAP_THRESHOLD,
   buildFallback,
   buildInjectionView,
+  findLowOverlapSentences,
   loadAliasTable,
   pickBestFallbackFragment,
   renderAnswerWithCitations,
   scanRecallPersonIds,
   sentenceFragmentOverlap,
+  splitAnswerSentences,
   stripLowOverlapSentences,
   stripOverlongModelQuotes,
   toRecallFragments,
@@ -900,3 +902,63 @@ test("⑳.3 结构门·阈值常量：0.5 默认从严（低于裁剪 / 高于�
   assert.equal(SENTENCE_OVERLAP_THRESHOLD, 0.5, "阈值常量默认 0.5（Coco 定稿，先从严测边界）");
   assert.equal(SENTENCE_OVERLAP_NGRAM, 2, "n-gram 长度默认 2（可对比 3-gram 调参）");
 });
+
+// ===== bug-00044 结构门缺陷：结论句 + 换行 [片段N] 被误裁拒答（trace 46dbc882）=====
+// 根因：splitAnswerSentences 把「结论句。\n\n[片段7]」切成结论句（无指针）+ 独立指针行；
+// 独立指针行被 bug-00038 豁免剔除 → 结论句变无指针叙述句 → 对全部注入片段取字面重叠最高者
+// 作复核参考（错配成无关片段）→ judge 误判 unsupported → 整句裁剪 → 拒答。修复：切句后
+// 后处理——纯指针行并入前一句，指针随文本归属前句；孤儿指针行（无前正文）保持原样。
+
+test("⑳.4 结构门·bug-00044 切句后处理：结论句 + 换行 [片段N] 合并为一句且指针随文本归属前句", () => {
+  const sentences = splitAnswerSentences(
+    "黄巾起义是张角兄弟发动的、以黄巾裹头为标志的民变。\n\n[片段7]"
+  );
+  assert.equal(sentences.length, 1, "结论句 + 独立指针行合并为 1 句，不再切成无指针句 + 指针行");
+  assert.deepEqual(sentences[0].narrativePointers, ["片段7"], "指针随文本归属前句（从合并后整句文本提取）");
+  assert.deepEqual(sentences[0].quotePointers, [], "无引语指针");
+  assert.equal(
+    sentences[0].text,
+    "黄巾起义是张角兄弟发动的、以黄巾裹头为标志的民变。\n\n[片段7]",
+    "合并仅拼接原文本，不改写正文"
+  );
+});
+
+test("⑳.5 结构门·bug-00044 孤儿指针行：无前正文的纯指针行保持原样（bug-00038 拒答路径不变）", () => {
+  const sentences = splitAnswerSentences("\n[片段7]");
+  assert.equal(sentences.length, 1, "孤儿指针行仍为独立 1 句");
+  assert.deepEqual(sentences[0].narrativePointers, ["片段7"], "仍是带指针的句子");
+  assert.equal(sentences[0].text, "\n[片段7]", "文本原样，不并入、不删除");
+  const view = buildInjectionView([
+    {
+      text: "张角传檄四方，旬日之间，天下响应，兵至数十万。",
+      source: "sanguo-yanyi",
+    },
+  ]);
+  assert.deepEqual(findLowOverlapSentences("\n[片段7]", view), [], "纯指针句不进复核候选（正文判空路径不变）");
+  assert.equal(stripLowOverlapSentences("\n[片段7]", view), "\n[片段7]", "字面裁剪不对孤儿指针行动手");
+});
+
+test("⑳.6 结构门·bug-00044 低重叠结论复核参考：合并后 bestFragmentText 取结论所引片段原文，不再错配无关片段", () => {
+  // 注入 7 段：片段4 是与结论字面重叠最高的干扰段（旧逻辑错配成复核参考），
+  // 片段7 才是结论实际所引的片段（低重叠）——合并后只按所引指针取参考
+  const view = buildInjectionView([
+    { text: "曹操于官渡大破袁绍，尽收冀州之地。", source: "sanguo-yanyi" },
+    { text: "刘备三顾茅庐，诸葛亮隆中对策。", source: "sanguo-yanyi" },
+    { text: "周瑜火烧赤壁，曹军大败北还。", source: "sanguo-yanyi" },
+    { text: "黄巾起义，以黄巾裹头为号。", source: "sanguo-yanyi" },
+    { text: "关羽千里走单骑，过五关斩六将。", source: "sanguo-yanyi" },
+    { text: "赵云长坂坡七进七出，救出阿斗。", source: "sanguo-yanyi" },
+    { text: "张角传檄四方，旬日之间，天下响应，兵至数十万。", source: "sanguo-yanyi" },
+  ]);
+  const answer = "黄巾起义是张角兄弟发动的、以黄巾裹头为标志的民变。\n\n[片段7]";
+  const low = findLowOverlapSentences(answer, view);
+  assert.equal(low.length, 1, "合并后仅结论句 1 个低重叠候选（指针行已并入，不再单独成句）");
+  assert.deepEqual(low[0].pointers, ["片段7"], "候选带所引片段指针");
+  assert.ok(low[0].bestOverlap < SENTENCE_OVERLAP_THRESHOLD, "与所引片段仍低重叠 → 走边界语义复核路径");
+  assert.equal(
+    low[0].bestFragmentText,
+    "张角传檄四方，旬日之间，天下响应，兵至数十万。",
+    "复核参考取结论所引片段（片段7）原文，而非字面重叠最高的无关片段（片段4）"
+  );
+});
+

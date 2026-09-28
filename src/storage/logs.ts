@@ -193,7 +193,7 @@ export interface LlmCallPayload {
   inputBreakdown?: InputBreakdown | null;
   /** feat-A012：本次调用输出上限（取调用点 params.max_tokens 原值）；历史行 / 缺省为 null */
   maxTokens?: number | null;
-  /** feat-A013：本次调用温度实参（调用点 callOptions.temperature ?? 0.7 原值）；历史行 / 采集未接入为 null，前端不推断（参照 attempt 先例） */
+  /** feat-A013：本次调用温度实参（调用点 callOptions.temperature ?? 0.1 原值）；历史行 / 采集未接入为 null，前端不推断（参照 attempt 先例） */
   temperature?: number | null;
   finishReason?: string | null;
   status: 'success' | 'failed';

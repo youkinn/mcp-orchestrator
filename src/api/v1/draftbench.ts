@@ -2,7 +2,7 @@
 // GET /trace/:traceId —— 反查该请求候选 / 注入 chunks（tool_retrieval_logs.diagnostics + request_logs 链路）；
 //   preview / segFrom / segTo 由本文按 chunkId 经既有 sango_novel_chapter 通道合成（§10 决策 2，多回合并
 //   多次通道调用属实现细节；通道失败按 best-effort 回 null，不因预览降级拖垮拉取主数据）；params 默认带出
-//   线上实际值（temperature = llm_call_logs 生成轮末次成功值，缺省 0.7；topK/guarantee/budget = 注入常量；
+//   线上实际值（temperature = llm_call_logs 生成轮末次成功值，缺省 0.1；topK/guarantee/budget = 注入常量；
 //   tailFallback 只读）。
 // GET /records —— 草稿台发送记录列表（仅 source=draftbench，时间倒序，分页口径同 /api/v1/logs）。
 // GET /records/:traceId —— 记录详情（载入 + diff 按 §4.4 重算，单一实现点 computeDraftbenchDiff）。
@@ -33,7 +33,7 @@ const RECORD_NOT_FOUND_MESSAGE = '草稿台记录不存在';
 const QUERY_ERROR_MESSAGE = '查询草稿台记录失败，请稍后重试';
 const DELETE_ERROR_MESSAGE = '删除草稿台记录失败，请稍后重试';
 const PREVIEW_MAX_LENGTH = 120;
-const DEFAULT_TEMPERATURE = 0.7;
+const DEFAULT_TEMPERATURE = 0.1;
 /** §4.2 参数缺省（与生产注入常量同值；记录 / 校验失败行 params 快照缺失时展示用） */
 const DEFAULT_PARAMS: DraftbenchRecordParams = {
   temperature: DEFAULT_TEMPERATURE,

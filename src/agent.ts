@@ -502,7 +502,7 @@ export class Agent {
     }> => {
       const requestAt = Date.now();
       // feat-A013：本次调用生效温度（params / 返回 / catch 落库同源，仅算一次）
-      const temperature = callOptions.temperature ?? 0.7;
+      const temperature = callOptions.temperature ?? 0.1;
       let response: OpenAI.Chat.Completions.ChatCompletion;
       try {
         const params: Record<string, unknown> = {
@@ -620,7 +620,7 @@ export class Agent {
       }
     };
 
-    // 首轮：按调用点口径（options 缺省 = 保留思考 + temperature 0.7）
+    // 首轮：按调用点口径（options 缺省 = 保留思考 + temperature 0.1）
     const first = await callOnce(
       {
         disableThinking: options?.disableThinking,
