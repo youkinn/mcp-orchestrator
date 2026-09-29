@@ -248,7 +248,7 @@ async function draftbenchSendCommand(args: string[]): Promise<void> {
   const query = flagValue(args, "--query") ?? editFile.query;
   const params = {
     temperature: Number(
-      flagValue(args, "--temperature") ?? editFile.params?.temperature ?? 0.7
+      flagValue(args, "--temperature") ?? editFile.params?.temperature ?? 0.1
     ),
     topK: Number(flagValue(args, "--topK") ?? editFile.params?.topK ?? 10),
     guarantee: Number(

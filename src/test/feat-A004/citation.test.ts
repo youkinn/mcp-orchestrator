@@ -10,11 +10,15 @@ import {
   SENTENCE_OVERLAP_THRESHOLD,
   buildFallback,
   buildInjectionView,
+  buildSourceLine,
+  findChapterLeakSentences,
+  findLowOverlapSentences,
   loadAliasTable,
   pickBestFallbackFragment,
   renderAnswerWithCitations,
   scanRecallPersonIds,
   sentenceFragmentOverlap,
+  splitAnswerSentences,
   stripLowOverlapSentences,
   stripOverlongModelQuotes,
   toRecallFragments,
@@ -157,7 +161,16 @@ test("⑬ 注入视图只给纯原文 + 服务端编号：片段带 [片段N]、
   assert.match(view.text, /\[片段1\]/);
   assert.match(view.text, /⟨Q1⟩“特来求结两家之好/);
   assert.match(view.text, /⟨Q2⟩“吾虎女安肯嫁犬子乎！”/);
-  assert.doesNotMatch(view.text, /第73回/, "注入不回目，模型无从抄写出处");
+  assert.match(
+    view.text,
+    /〔出处1〕第73回 玄德进位汉中王　云长攻拔襄阳郡/,
+    "结构化出处行放出回号+回目名（bug-00004 方案 C）"
+  );
+  assert.doesNotMatch(
+    view.text.replace(/〔出处\d+〕第\d+回[^\n]*/g, ""),
+    /第73回/,
+    "正文仍为纯原文：回号只出现在结构化出处行"
+  );
   assert.doesNotMatch(view.text, /·\s*段\d/, "注入不带段号");
   assert.doesNotMatch(view.text, /分数|score/i, "注入不带分数");
   assert.equal(view.quotes.size, 2, "指针表应含两条可见引语");
@@ -758,10 +771,14 @@ test("⑲.1 同 chunk 内引语文本重复：按 offset 各就各位（修正 i
       ],
     },
   ]);
-  assert.equal(
-    view.text,
-    "[片段1] 布曰：⟨Q1⟩“某愿往。”布又曰：⟨Q2⟩“某愿往。”",
+  assert.ok(
+    view.text.startsWith("[片段1] 布曰：⟨Q1⟩“某愿往。”布又曰：⟨Q2⟩“某愿往。”"),
     "两条同名引语各标各的位置，不挤在同一处"
+  );
+  assert.match(
+    view.text,
+    /〔出处1〕第3回 议温明董卓叱丁原　馈金珠李肃说吕布/,
+    "结构化出处行放出回号+回目名（bug-00004 方案 C）"
   );
   assert.equal(view.quotes.get("Q1")!.text, "某愿往。");
   assert.equal(view.quotes.get("Q2")!.text, "某愿往。");
@@ -796,10 +813,16 @@ test("⑲.2 非法 / 越界 offset、len：只跳过该条，不崩、不插错�
   assert.equal(entry.quotes?.length, 2, "只跳过非法定位，合法引语照常保留");
   const view = buildInjectionView([entry]);
   assert.deepEqual([...view.quotes.keys()], ["Q1", "Q2"], "编号从 1 起连续、无空洞");
-  assert.equal(
-    view.text,
-    "[片段1] 瑾曰：⟨Q1⟩“特来求结两家之好，请君侯思之。”云长勃然大怒曰：⟨Q2⟩“吾虎女安肯嫁犬子乎！”",
+  assert.ok(
+    view.text.startsWith(
+      "[片段1] 瑾曰：⟨Q1⟩“特来求结两家之好，请君侯思之。”云长勃然大怒曰：⟨Q2⟩“吾虎女安肯嫁犬子乎！”"
+    ),
     "非法定位不插标记，合法引语的标记落在开引号前"
+  );
+  assert.match(
+    view.text,
+    /〔出处1〕第73回 玄德进位汉中王　云长攻拔襄阳郡/,
+    "结构化出处行放出回号+回目名（bug-00004 方案 C）"
   );
   const direct = buildInjectionView([
     {
@@ -899,4 +922,161 @@ test("⑳.2 结构门·裁剪边界：重叠 ≥ 阈值保留、< 阈值整句�
 test("⑳.3 结构门·阈值常量：0.5 默认从严（低于裁剪 / 高于放行的分界），n-gram 取 2", () => {
   assert.equal(SENTENCE_OVERLAP_THRESHOLD, 0.5, "阈值常量默认 0.5（Coco 定稿，先从严测边界）");
   assert.equal(SENTENCE_OVERLAP_NGRAM, 2, "n-gram 长度默认 2（可对比 3-gram 调参）");
+});
+
+// ===== bug-00044 结构门缺陷：结论句 + 换行 [片段N] 被误裁拒答（trace 46dbc882）=====
+// 根因：splitAnswerSentences 把「结论句。\n\n[片段7]」切成结论句（无指针）+ 独立指针行；
+// 独立指针行被 bug-00038 豁免剔除 → 结论句变无指针叙述句 → 对全部注入片段取字面重叠最高者
+// 作复核参考（错配成无关片段）→ judge 误判 unsupported → 整句裁剪 → 拒答。修复：切句后
+// 后处理——纯指针行并入前一句，指针随文本归属前句；孤儿指针行（无前正文）保持原样。
+
+test("⑳.4 结构门·bug-00044 切句后处理：结论句 + 换行 [片段N] 合并为一句且指针随文本归属前句", () => {
+  const sentences = splitAnswerSentences(
+    "黄巾起义是张角兄弟发动的、以黄巾裹头为标志的民变。\n\n[片段7]"
+  );
+  assert.equal(sentences.length, 1, "结论句 + 独立指针行合并为 1 句，不再切成无指针句 + 指针行");
+  assert.deepEqual(sentences[0].narrativePointers, ["片段7"], "指针随文本归属前句（从合并后整句文本提取）");
+  assert.deepEqual(sentences[0].quotePointers, [], "无引语指针");
+  assert.equal(
+    sentences[0].text,
+    "黄巾起义是张角兄弟发动的、以黄巾裹头为标志的民变。\n\n[片段7]",
+    "合并仅拼接原文本，不改写正文"
+  );
+});
+
+test("⑳.5 结构门·bug-00044 孤儿指针行：无前正文的纯指针行保持原样（bug-00038 拒答路径不变）", () => {
+  const sentences = splitAnswerSentences("\n[片段7]");
+  assert.equal(sentences.length, 1, "孤儿指针行仍为独立 1 句");
+  assert.deepEqual(sentences[0].narrativePointers, ["片段7"], "仍是带指针的句子");
+  assert.equal(sentences[0].text, "\n[片段7]", "文本原样，不并入、不删除");
+  const view = buildInjectionView([
+    {
+      text: "张角传檄四方，旬日之间，天下响应，兵至数十万。",
+      source: "sanguo-yanyi",
+    },
+  ]);
+  assert.deepEqual(findLowOverlapSentences("\n[片段7]", view), [], "纯指针句不进复核候选（正文判空路径不变）");
+  assert.equal(stripLowOverlapSentences("\n[片段7]", view), "\n[片段7]", "字面裁剪不对孤儿指针行动手");
+});
+
+test("⑳.6 结构门·bug-00044 低重叠结论复核参考：合并后 bestFragmentText 取结论所引片段原文，不再错配无关片段", () => {
+  // 注入 7 段：片段4 是与结论字面重叠最高的干扰段（旧逻辑错配成复核参考），
+  // 片段7 才是结论实际所引的片段（低重叠）——合并后只按所引指针取参考
+  const view = buildInjectionView([
+    { text: "曹操于官渡大破袁绍，尽收冀州之地。", source: "sanguo-yanyi" },
+    { text: "刘备三顾茅庐，诸葛亮隆中对策。", source: "sanguo-yanyi" },
+    { text: "周瑜火烧赤壁，曹军大败北还。", source: "sanguo-yanyi" },
+    { text: "黄巾起义，以黄巾裹头为号。", source: "sanguo-yanyi" },
+    { text: "关羽千里走单骑，过五关斩六将。", source: "sanguo-yanyi" },
+    { text: "赵云长坂坡七进七出，救出阿斗。", source: "sanguo-yanyi" },
+    { text: "张角传檄四方，旬日之间，天下响应，兵至数十万。", source: "sanguo-yanyi" },
+  ]);
+  const answer = "黄巾起义是张角兄弟发动的、以黄巾裹头为标志的民变。\n\n[片段7]";
+  const low = findLowOverlapSentences(answer, view);
+  assert.equal(low.length, 1, "合并后仅结论句 1 个低重叠候选（指针行已并入，不再单独成句）");
+  assert.deepEqual(low[0].pointers, ["片段7"], "候选带所引片段指针");
+  assert.ok(low[0].bestOverlap < SENTENCE_OVERLAP_THRESHOLD, "与所引片段仍低重叠 → 走边界语义复核路径");
+  assert.equal(
+    low[0].bestFragmentText,
+    "张角传檄四方，旬日之间，天下响应，兵至数十万。",
+    "复核参考取结论所引片段（片段7）原文，而非字面重叠最高的无关片段（片段4）"
+  );
+});
+
+// ===== bug-00004 方案 C：结构化出处行（回号类问句放开回号+回目名，段号仍不放）=====
+
+test("㉑ bug-00004 buildSourceLine：仅 chapter/title 齐全时输出〔出处N〕第N回 回目名，否则 null", () => {
+  assert.equal(
+    buildSourceLine("片段1", 73, "玄德进位汉中王　云长攻拔襄阳郡"),
+    "〔出处1〕第73回 玄德进位汉中王　云长攻拔襄阳郡",
+    "编号 N 与片段号一致，形态与 [片段N]/⟨Qn⟩ 互不混淆"
+  );
+  assert.equal(buildSourceLine("片段1", undefined, "回目"), null, "缺 chapter 不输出");
+  assert.equal(buildSourceLine("片段1", 73, undefined), null, "缺 title 不输出");
+  assert.equal(buildSourceLine("片段X", 73, "回目"), null, "非 片段N 键不输出");
+});
+
+test("㉑.1 bug-00004 buildInjectionView：多片段各附结构化出处行，正文仍为纯原文（回号只出现在结构化行）", () => {
+  const view = buildInjectionView([
+    {
+      text: "玄德遂与关、张二人结为兄弟，誓同生死。",
+      source: "sanguo-yanyi",
+      chapter: 1,
+      title: "宴桃园豪杰三结义　斩黄巾英雄首立功",
+    },
+    {
+      text: "吕布出阵搦战，张飞挺矛直取，关羽舞刀夹攻，玄德掣双股剑助战。",
+      source: "sanguo-yanyi",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+    },
+    {
+      text: "孔明奄然归天，姜维等悲恸不已。",
+      source: "sanguo-yanyi",
+      // 无 chapter/title：不出结构化行，正文照常注入
+    },
+  ]);
+  assert.match(
+    view.text,
+    /\[片段1\] 玄德遂与关、张二人结为兄弟，誓同生死。\n〔出处1〕第1回 宴桃园豪杰三结义　斩黄巾英雄首立功/,
+    "片段1 附出处行（回号+回目名）"
+  );
+  assert.match(
+    view.text,
+    /〔出处2〕第5回 发矫诏诸镇应曹公　破关兵三英战吕布/,
+    "片段2 附出处行（回号+回目名）"
+  );
+  assert.ok(!view.text.includes("〔出处3〕"), "无 chapter/title 的片段不出结构化行");
+  const body = view.text.replace(/〔出处\d+〕第\d+回[^\n]*/g, "");
+  assert.doesNotMatch(body, /第1回|第5回/, "正文仍为纯原文：回号只出现在结构化出处行");
+  assert.doesNotMatch(body, /宴桃园豪杰三结义|三英战吕布/, "正文不含回目名");
+});
+
+test("㉑.2 bug-00004 findChapterLeakSentences：非回号类问句结论含「第N回」或回目名 → 确定性裁剪候选（0 LLM）", () => {
+  const view = buildInjectionView([
+    {
+      text: "玄德遂与关、张二人结为兄弟，誓同生死。",
+      source: "sanguo-yanyi",
+      chapter: 1,
+      title: "宴桃园豪杰三结义　斩黄巾英雄首立功",
+    },
+  ]);
+  assert.deepEqual(
+    findChapterLeakSentences("关羽的武器是青龙偃月刀。", view),
+    [],
+    "普通结论不含回号/回目名 → 不裁剪"
+  );
+  assert.deepEqual(
+    findChapterLeakSentences("关羽的武器是青龙偃月刀，出自第一回。[片段1]", view),
+    ["关羽的武器是青龙偃月刀，出自第一回。[片段1]"],
+    "结论含中文回号 → 命中（整句连同指针）"
+  );
+  assert.deepEqual(
+    findChapterLeakSentences("这个说法见于第104回。[片段1]", view),
+    ["这个说法见于第104回。[片段1]"],
+    "结论含阿拉伯回号 → 命中"
+  );
+  assert.deepEqual(
+    findChapterLeakSentences("关羽的武器是青龙偃月刀，见宴桃园豪杰三结义斩黄巾英雄首立功一回。[片段1]", view),
+    ["关羽的武器是青龙偃月刀，见宴桃园豪杰三结义斩黄巾英雄首立功一回。[片段1]"],
+    "结论含回目名（去空白匹配）→ 命中"
+  );
+});
+
+test("㉑.3 bug-00004 低重叠复核候选 bestSourceLine：回号类问句复核参考可并入结构化出处行", () => {
+  const view = buildInjectionView([
+    {
+      text: "玄德遂与关、张二人结为兄弟，誓同生死。",
+      source: "sanguo-yanyi",
+      chapter: 1,
+      title: "宴桃园豪杰三结义　斩黄巾英雄首立功",
+    },
+  ]);
+  const low = findLowOverlapSentences("刘备第一次出场在第一回。\n\n[片段1]", view);
+  assert.equal(low.length, 1, "回号类结论句与片段正文低重叠 → 进复核候选");
+  assert.equal(
+    low[0].bestSourceLine,
+    "〔出处1〕第1回 宴桃园豪杰三结义　斩黄巾英雄首立功",
+    "候选携带最佳片段的结构化出处行，复核参考 = 片段原文 + 出处行"
+  );
 });

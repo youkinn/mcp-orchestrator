@@ -7,6 +7,7 @@ import {
   EMBEDDING_BYTES,
   ENTRY_STRUCTURE_BYTES,
   SANGO_QUERY_EMBED_TOOL,
+  hasChapterFocus,
   type CacheEntry,
   type CacheEntryMirror,
   type CacheLogPayload,
@@ -937,4 +938,12 @@ test("lookup：工具归一化不放大不相关文本相似度（孔明 vs 池�
   assert.equal(result?.hit, false, "工具归一化后仍与池内不相关 → 不命中（归一化不放大相似度）");
   assert.equal(result?.reason, "miss-low");
   assert.equal(result?.similarity, 0);
+});
+
+test("bug-00004 hasChapterFocus：§1.2.1 chapter 焦点词表零 LLM 回号类问句识别", () => {
+  assert.equal(hasChapterFocus("三英战吕布是第几回"), true, "第几回 → chapter");
+  assert.equal(hasChapterFocus("刘备第一次出场时第几回"), true, "第几回 → chapter");
+  assert.equal(hasChapterFocus("诸葛亮死于第几回"), true, "第几回 → chapter");
+  assert.equal(hasChapterFocus("关羽的武器叫什么"), false, "非回号类 → 不命中");
+  assert.equal(hasChapterFocus("关银屏是第几回"), true, "负样本问句本身是回号类（拒答靠检索无命中）");
 });
