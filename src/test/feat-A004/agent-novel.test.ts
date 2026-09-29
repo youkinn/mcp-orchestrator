@@ -1198,7 +1198,7 @@ test("㉚ 单轮·边界复核·正例 bug-00044：结论句 + 换行独立 [片
 // ===== bug-00004 方案 C：回号类问句（含「第几回」）放开回号/回目名（负责人 2026-09-29 追加口径：
 // 不只登场类，凡问句提及「第几回」类回号问法（含死亡类等）一律放行）=====
 
-test("㉛ bug-00004 回号类正样本·登场类：三英战吕布是第几回 → 复核参考并入〔出处N〕行判 supported → 答案含回号、citations 非空", async () => {
+test("㉛ bug-00004 回号类正样本·登场类：三英战吕布是第几回 → 结论回号（第五回）=〔出处1〕第5回一致 → 确定性核对 supported（0 LLM）→ 答案含回号、citations 非空", async () => {
   const entries = [
     {
       id: "sanguo-yanyi:0005:c0001",
@@ -1210,12 +1210,10 @@ test("㉛ bug-00004 回号类正样本·登场类：三英战吕布是第几回 
     },
   ];
   let checkCallCount = 0;
-  let reviewUserContent = "";
   const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
     if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
       checkCallCount += 1;
-      reviewUserContent = String(messages[1]?.content ?? "");
-      return textResponse("supported"); // 复核参考含〔出处1〕第5回：回号结论受支撑
+      return textResponse("supported");
     }
     return textResponse("三英战吕布在第五回。\n\n[片段1]"); // 生成轮：回号结论 + 换行指针
   };
@@ -1233,11 +1231,10 @@ test("㉛ bug-00004 回号类正样本·登场类：三英战吕布是第几回 
   const data = await agent.processQueryData("三英战吕布是第几回", "sango-novel");
   assert.ok(data.answer.includes("第五回"), "回号类问句答案含回号，不再答「演义中未涉及」");
   assert.equal(data.citations.length, 1, "citations 非空：渲染片段出处");
-  assert.equal(checkCallCount, 1, "低重叠回号结论触发一次复核（预算不变）");
-  assert.ok(reviewUserContent.includes("〔出处1〕第5回 发矫诏诸镇应曹公　破关兵三英战吕布"), "复核参考并入结构化出处行，不再因片段原文无回号误判");
+  assert.equal(checkCallCount, 0, "结论回号=出处行回号 → 确定性核对 supported（0 LLM），不触发复核 LLM");
 });
 
-test("㉛.1 bug-00004 回号类正样本·死亡类（负责人追加口径）：关羽是第几回死的 → 放行回号+回目，citations 非空", async () => {
+test("㉛.1 bug-00004 回号类正样本·死亡类（负责人追加口径）：关羽是第几回死的 → 结论回号（第七十六回）=〔出处1〕第76回一致 → 确定性 supported（0 LLM）→ 放行回号+回目，citations 非空", async () => {
   const entries = [
     {
       id: "sanguo-yanyi:0076:c0001",
@@ -1249,16 +1246,14 @@ test("㉛.1 bug-00004 回号类正样本·死亡类（负责人追加口径）�
     },
   ];
   let checkCallCount = 0;
-  let reviewUserContent = "";
   // 片段正文用「关公」，stub 别名表补「关公→P002」才能过人物断言走复核路径（生产别名表本就含该别名）
   const aliasTable = new Map([...ALIAS_TABLE, ["关公", "P002"]]);
   const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
     if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
       checkCallCount += 1;
-      reviewUserContent = String(messages[1]?.content ?? "");
       return textResponse("supported");
     }
-    return textResponse("关羽在第七十六回身亡。\n\n[片段1]"); // 与片段正文零重叠 → 触发复核
+    return textResponse("关羽在第七十六回身亡。\n\n[片段1]"); // 生成轮：回号结论（与片段正文零重叠）
   };
   const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
     tools: [NOVEL_TOOL],
@@ -1274,8 +1269,7 @@ test("㉛.1 bug-00004 回号类正样本·死亡类（负责人追加口径）�
   const data = await agent.processQueryData("关羽是第几回死的", "sango-novel");
   assert.ok(data.answer.includes("第七十六回"), "死亡类回号问句答案含回号");
   assert.equal(data.citations.length, 1, "citations 非空");
-  assert.equal(checkCallCount, 1, "低重叠回号结论触发一次复核");
-  assert.ok(reviewUserContent.includes("〔出处1〕第76回 徐公明大战沔水　关云长败走麦城"), "复核参考并入死亡类片段出处行");
+  assert.equal(checkCallCount, 0, "结论回号=出处行回号 → 确定性核对 supported（0 LLM），不触发复核 LLM");
 });
 
 test("㉛.2 bug-00004 反向用例：非回号类问句（关羽的武器叫什么）结论含「第N回」→ 确定性裁剪（0 LLM），不输出回目", async () => {
@@ -1333,3 +1327,119 @@ test("㉛.3 bug-00004 负样本：回号类问句检索无命中仍答「演义�
   assert.deepEqual(data.citations, [], "citations 空");
 });
 
+// ===== bug-00004 未闭环（复核侧误裁，trace 2a05a6ae / 4fd7a7a6）：极值问句（最早/初次登场）结论回号
+// 与〔出处N〕行回号一致，复核仍误判 unsupported → 落库「演义中未涉及」。负责人 2026-09-29 拍板：
+// 复核判据显式放行（回号一致 → supported、极值问法是问句口径不要求单段证明），不得放宽非回号类 =====
+
+test("㉛.4 bug-00004 未闭环正例·极值问句：吕布最早登场于哪一回 → 结论回号（第3回）=〔出处1〕第3回一致 → 确定性 supported（0 LLM）→ 答案保留回号、citations 非空（复刻 trace 2a05a6ae）", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0003:c0001",
+      text: "董卓视之，乃荆州刺史丁原也。时李儒见丁原背后吕布，生得器宇轩昂，威风凛凛，手执方天画戟，怒目而视。",
+      chapter: 3,
+      title: "议温明董卓叱丁原　馈金珠李肃说吕布",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let checkCallCount = 0;
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      return textResponse("supported");
+    }
+    return textResponse("吕布最早登场于第3回。\n\n[片段1]"); // 生成轮：极值问句回号结论（与片段正文低重叠）
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "吕布最早登场于第3回",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("吕布最早登场于哪一回", "sango-novel");
+  assert.ok(data.answer.includes("第3回"), "极值问句结论回号=出处行回号 → 确定性 supported 放行，不得误裁拒答");
+  assert.notEqual(data.answer, "演义中未涉及", "极值问句不再落库「演义中未涉及」");
+  assert.equal(data.citations.length, 1, "citations 非空：渲染片段出处");
+  assert.equal(checkCallCount, 0, "结论回号=〔出处1〕第3回一致 → 确定性核对 supported（0 LLM），不触发复核 LLM");
+});
+
+test("㉛.5 bug-00004 未闭环反例·回号不一致：结论回号（第43回）≠〔出处1〕第29回 → 确定性 unsupported（0 LLM）→ 结论裁剪拒答（判据否定侧）", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0029:c0001",
+      text: "却说鲁肃、孔明辞了玄德、刘琦，登舟望柴桑郡来。",
+      chapter: 29,
+      title: "小霸王怒斩于吉　碧眼儿坐领江东",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let checkCallCount = 0;
+  const aliasTable = new Map([...ALIAS_TABLE, ["鲁肃", "P099"], ["子敬", "P099"]]);
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      return textResponse("unsupported");
+    }
+    return textResponse("鲁肃初次登场是在第43回。\n\n[片段1]"); // 生成轮：结论回号与出处行回号不一致
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "鲁肃初次登场是在第43回",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("鲁肃初次登场是在哪一回", "sango-novel");
+  assert.equal(data.answer, "演义中未涉及", "结论回号与〔出处1〕行回号不一致 → 确定性 unsupported → 结论裁剪拒答");
+  assert.deepEqual(data.citations, [], "citations 空（结论被裁，无留存）");
+  assert.equal(checkCallCount, 0, "结论回号第43回 ≠ 出处行第29回 → 确定性 unsupported（0 LLM），不触发复核 LLM");
+});
+
+test("㉛.6 bug-00004 未闭环兜底·结论无回号：回号类问句但结论只写回目名（无「第N回」）→ 确定性核对无法取回号 → 交复核 LLM（prompt 判据兜底）判 supported → 答案保留", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0003:c0001",
+      text: "董卓视之，乃荆州刺史丁原也。时李儒见丁原背后吕布，生得器宇轩昂，威风凛凛，手执方天画戟，怒目而视。",
+      chapter: 3,
+      title: "议温明董卓叱丁原　馈金珠李肃说吕布",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let checkCallCount = 0;
+  let reviewUserContent = "";
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      reviewUserContent = String(messages[1]?.content ?? "");
+      return textResponse("supported"); // 兜底：复核 LLM 按 prompt 判据（〔出处1〕行回号可核对）判放行
+    }
+    return textResponse("吕布在议温明董卓叱丁原一回登场。\n\n[片段1]"); // 只写回目名、无「第N回」→ 确定性核对无法取回号
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "吕布在议温明董卓叱丁原一回登场",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("吕布最早登场于哪一回", "sango-novel");
+  assert.ok(data.answer.includes("议温明董卓叱丁原"), "结论无回号时复核 LLM 兜底 supported → 答案保留回目名");
+  assert.equal(data.citations.length, 1, "citations 非空：渲染片段出处");
+  assert.ok(reviewUserContent.includes("〔出处1〕第3回 议温明董卓叱丁原　馈金珠李肃说吕布"), "复核输入仍含结构化出处行供核对");
+  assert.equal(checkCallCount, 1, "结论无回号 → 确定性核对回落，触发一次复核 LLM（预算不变）");
+});

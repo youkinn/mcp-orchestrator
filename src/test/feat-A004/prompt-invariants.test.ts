@@ -56,6 +56,24 @@ test("②c 边界复核提示词与域提示改述口径一致（judge 同口径
   assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /改动了片段中的人名、动作方向、受事者、结果 → unsupported/);
 });
 
+test("②d 边界复核提示词含回号/回目类判据（bug-00004 未闭环）：回号一致 → supported、不一致 → unsupported、极值问法是问句口径、非回号类不放宽", () => {
+  // 判据显式放行：结论回号与〔出处N〕行回号一致 → supported（正文无回号不代表不受支撑）
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /回号\/回目类判据/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /结论回号与所引〔出处N〕行回号一致 → supported/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /正文未出现回号不代表结论不受支撑/);
+  // 反例：回号不一致（第43回 vs 第29回）→ unsupported
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /结论回号与〔出处N〕行回号不一致/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /第43回/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /第29回 → 回号不一致 → unsupported/);
+  // 极值问法（首次/最初/最早）是用户问句自带口径，不要求单段原文证明极值
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /首次 \/ 最初 \/ 最早 \/ 初次/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /不要求单段原文证明极值/);
+  // 非回号类问句的结论仍严禁输出回目/出处/段号（本判据不放宽）
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /非回号\/回目类问句/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /仍严禁输出回目、出处、段号/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /不得援引本回号判据放行/);
+});
+
 test("③ fengyunsanguo 域提示：§2.4 原文照录，含固定话术与未召回兜底", () => {
   assert.match(FENGYUNSANGUO_DOMAIN_PROMPT, /当前为「风云三国题库」场景/);
   assert.match(FENGYUNSANGUO_DOMAIN_PROMPT, /不要再调用检索工具/);

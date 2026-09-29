@@ -21,6 +21,7 @@ import {
   SANGO_NOVEL_SEARCH_TOOL,
   buildFallback,
   buildInjectionView,
+  chapterConsistencyVerdict,
   computeDraftbenchDiff,
   extractCitePointers,
   findChapterLeakSentences,
@@ -251,10 +252,21 @@ const CITATION_FALLBACK_CONCLUSION_PROMPT =
 // bug-00032/33/34：结构门第三条「低重叠 → 边界语义复核」提示词（独立 stage novel_boundary_check，
 // 正常样本不触发）。输入 = 用户问题 + 模型结论句 + 指向片段原文；只输出 supported / unsupported。
 // 语义裁决必须走 LLM，不引入任何词表 / 关键词规则（bug-00028 复盘否决）。
+// bug-00004 未闭环（复核侧误裁，trace 2a05a6ae / 4fd7a7a6）：生成轮已正确答回号（结论回号与
+// 〔出处N〕行回号一致），复核员仍判 unsupported → 落库「演义中未涉及」。修复：判据显式放行
+// —— 回号/回目类问句结论回号与〔出处N〕行回号一致即 supported；「首次/最初/最早」是问句自带
+// 口径，不要求单段原文证明极值；补正反例示例。非回号类问句仍严禁回目/出处/段号（护栏另有
+// findChapterLeakSentences 确定性裁剪兜底，本判据不放宽）。
 export const NOVEL_BOUNDARY_CHECK_PROMPT = [
   "你是《三国演义》原著引用的边界审查员。",
   "给定：用户问题、模型结论句、片段原文。结论句中的 [片段N] 是服务端编号标记，不属于正文。",
-  "片段原文末尾的〔出处N〕行（如〔出处1〕第73回 玄德进位汉中王　云长攻拔襄阳郡）是服务端注入的结构化出处行，不是正文；回号/回目类结论（如「第几回」「哪一回」）可据此行核对，正文未出现回号不代表结论不受支撑。",
+  "片段原文末尾的〔出处N〕行（如〔出处1〕第73回 玄德进位汉中王　云长攻拔襄阳郡）是服务端注入的结构化出处行，不是正文；正文未出现回号不代表结论不受支撑。",
+  "回号/回目类判据：结论主体是回号/回目（问句含「第几回 / 哪一回 / 第几回登场」等回号类问法）时，结论回号与所引〔出处N〕行回号一致 → supported；结论回号与〔出处N〕行回号不一致（如结论写第43回、〔出处1〕行是第29回）→ unsupported。",
+  "「首次 / 最初 / 最早 / 初次」等极值问法是用户问句自带口径，不要求单段原文证明极值；只要结论回号与所引〔出处N〕行回号一致即 supported。",
+  "判定示例：",
+  "正例：用户问「吕布最早登场于哪一回」，结论「吕布最早登场于第3回。[片段1]」，〔出处1〕第3回 → 回号一致 → supported（「最早」是问句口径，不要求单段证明极值）。",
+  "反例：用户问「某事件发生于哪一回」，结论「发生在第43回。[片段1]」，〔出处1〕第29回 → 回号不一致 → unsupported。",
+  "非回号/回目类问句（如问人物、事件、原因）的结论仍严禁输出回目、出处、段号，不得援引本回号判据放行。",
   "判断：结论句的核心断言（人物、事件、结局、因果的事实归属）是否由该片段原文支撑。",
   "允许对片段做语义等价的改述：不改变片段中的人名、动作方向、受事者、结果，且片段原文足以推出或印证该断言 → supported。",
   "片段原文不足以支撑该断言（如结论来自先验知识、常识或个人判断），或改动了片段中的人名、动作方向、受事者、结果 → unsupported。",
@@ -970,8 +982,19 @@ export class Agent {
             bestSentence = sentence;
           }
         }
+        // bug-00004 未闭环（复核侧误裁，trace 2a05a6ae / 4fd7a7a6）：回号/回目类问句复核判据
+        // 显式放行（负责人 2026-09-29 拍板）——结论回号与〔出处N〕结构化出处行回号一致 → supported
+        // （「首次/最初/最早」是问句自带口径，不要求单段原文证明极值）。flash 复核对 prompt 判据
+        // 不可靠（真实链路实测仍误裁），故回号类问句先做确定性核对（0 LLM）短路；结论无回号
+        // （如只写回目名）才交复核 LLM（prompt 已补判据 + 正反例兜底）。非回号类问句不受影响，
+        // 仍走既有确定性裁剪（findChapterLeakSentences）+ 低重叠复核。
+        const chapterVerdict =
+          isChapterQuestion && bestSentence.bestSourceLine
+            ? chapterConsistencyVerdict(bestSentence.text, bestSentence.bestSourceLine)
+            : null;
         const verdict =
-          bestSentence.bestFragmentText === null
+          chapterVerdict ??
+          (bestSentence.bestFragmentText === null
             ? "unsupported"
             : await this.checkNovelBoundarySupport(
                 query,
@@ -979,7 +1002,7 @@ export class Agent {
                 isChapterQuestion && bestSentence.bestSourceLine
                   ? `${bestSentence.bestFragmentText}\n${bestSentence.bestSourceLine}`
                   : bestSentence.bestFragmentText
-              );
+              ));
         if (verdict !== "supported") {
           unsupported.push(bestSentence.text);
         }

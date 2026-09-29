@@ -11,6 +11,8 @@ import {
   buildFallback,
   buildInjectionView,
   buildSourceLine,
+  chapterConsistencyVerdict,
+  extractChapterNumber,
   findChapterLeakSentences,
   findLowOverlapSentences,
   loadAliasTable,
@@ -1079,4 +1081,26 @@ test("㉑.3 bug-00004 低重叠复核候选 bestSourceLine：回号类问句复�
     "〔出处1〕第1回 宴桃园豪杰三结义　斩黄巾英雄首立功",
     "候选携带最佳片段的结构化出处行，复核参考 = 片段原文 + 出处行"
   );
+});
+
+test("㉛.7 bug-00004 未闭环·extractChapterNumber：回号提取与归一（阿拉伯 / 全角 / 中文数字）", () => {
+  assert.equal(extractChapterNumber("吕布最早登场于第3回。"), 3, "阿拉伯数字");
+  assert.equal(extractChapterNumber("吕布最早登场于第三回。"), 3, "中文数字");
+  assert.equal(extractChapterNumber("发生在第４３回。"), 43, "全角阿拉伯数字");
+  assert.equal(extractChapterNumber("发生在第43回。"), 43, "多位阿拉伯");
+  assert.equal(extractChapterNumber("〔出处1〕第29回 小霸王怒斩于吉　碧眼儿坐领江东"), 29, "出处行回号");
+  assert.equal(extractChapterNumber("一百二十回"), null, "无「第」前缀不算回号");
+  assert.equal(extractChapterNumber("吕布在议温明董卓叱丁原一回登场。"), null, "只写回目名（无第N回）→ null");
+  assert.equal(extractChapterNumber(""), null, "空串 → null");
+});
+
+test("㉛.8 bug-00004 未闭环·chapterConsistencyVerdict：结论回号=出处行回号 → supported；不一致 → unsupported；结论无回号 → null", () => {
+  const source3 = "〔出处1〕第3回 议温明董卓叱丁原　馈金珠李肃说吕布";
+  const source29 = "〔出处1〕第29回 小霸王怒斩于吉　碧眼儿坐领江东";
+  assert.equal(chapterConsistencyVerdict("吕布最早登场于第3回。", source3), "supported", "回号一致 → supported");
+  assert.equal(chapterConsistencyVerdict("吕布最早登场于第三回。", source3), "supported", "中文数字归一后一致 → supported");
+  assert.equal(chapterConsistencyVerdict("鲁肃初次登场是在第43回。", source29), "unsupported", "回号不一致（第43 vs 第29）→ unsupported");
+  assert.equal(chapterConsistencyVerdict("吕布在议温明董卓叱丁原一回登场。", source3), null, "结论无第N回（只写回目名）→ null（交复核 LLM）");
+  assert.equal(chapterConsistencyVerdict("吕布最早登场于第3回。", null), null, "无出处行 → null");
+  assert.equal(chapterConsistencyVerdict("", source3), null, "空结论 → null");
 });

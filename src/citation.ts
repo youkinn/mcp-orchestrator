@@ -750,6 +750,68 @@ export function findChapterLeakSentences(
   return leaked;
 }
 
+/** 回号一致性核对（bug-00004 未闭环，负责人 2026-09-29 拍板）：
+ * 回号/回目类问句复核判据显式放行——结论回号与所引〔出处N〕结构化出处行回号一致 → supported
+ * （「首次/最初/最早」是问句自带口径，不要求单段原文证明极值）。确定性核对 0 LLM；
+ * 结论句无回号（如只写回目名）→ 交复核 LLM（prompt 已补判据 + 示例兜底）。
+ * 中文数字 / 阿拉伯数字 / 全角数字统一归一到 int 比较。 */
+
+const CN_NUM_DIGITS: Record<string, number> = {
+  零: 0, 〇: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+};
+
+/** 中文数字 → int（回号 1~120 范围够用；不在此范围的输入返回 null） */
+function chineseNumberToInt(text: string): number | null {
+  let total = 0;
+  let current = 0;
+  for (const ch of text) {
+    if (ch === "十") {
+      total += (current || 1) * 10;
+      current = 0;
+    } else if (ch === "百") {
+      total += (current || 1) * 100;
+      current = 0;
+    } else if (ch in CN_NUM_DIGITS) {
+      current = CN_NUM_DIGITS[ch];
+    } else {
+      return null;
+    }
+  }
+  return total + current;
+}
+
+/** 提取句中首个回号「第N回」并归一到 int；无回号 / 无法解析返回 null。
+ * 全角阿拉伯转半角后走 Number；中文数字走 chineseNumberToInt。 */
+export function extractChapterNumber(text: string): number | null {
+  const match = /第([0-9０-９一二三四五六七八九十百千零〇]+)回/.exec(text);
+  if (!match) {
+    return null;
+  }
+  const raw = match[1];
+  if (/^[0-9０-９]+$/.test(raw)) {
+    const n = Number(raw.replace(/[０-９]/g, (d) => String.fromCharCode(d.charCodeAt(0) - 0xfee0)));
+    return Number.isInteger(n) && n > 0 ? n : null;
+  }
+  return chineseNumberToInt(raw);
+}
+
+/** 回号一致性判据：结论回号 == 〔出处N〕行回号 → "supported"；两者都可提取但不相等 → "unsupported"；
+ * 任一侧无回号（如结论只写回目名）→ null（交复核 LLM 兜底）。 */
+export function chapterConsistencyVerdict(
+  sentence: string,
+  sourceLine: string | null
+): "supported" | "unsupported" | null {
+  if (!sourceLine) {
+    return null;
+  }
+  const sentenceChapter = extractChapterNumber(sentence);
+  const sourceChapter = extractChapterNumber(sourceLine);
+  if (sentenceChapter === null || sourceChapter === null) {
+    return null;
+  }
+  return sentenceChapter === sourceChapter ? "supported" : "unsupported";
+}
+
 /** 结构门第三条·字面裁剪（零 LLM 兼容口径，保留给纯函数用例 / 复核不可用时的保守回落）：
  * 直接裁剪所有低重叠叙述句。返回裁剪后答案（调用方按空串 → 拒答「演义中未涉及」+ citations []）。 */
 export function stripLowOverlapSentences(
