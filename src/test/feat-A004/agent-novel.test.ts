@@ -488,7 +488,11 @@ test("⑥ 快路径注入策略：前 5 段整段保底注入（不裁剪），�
     "前 5 段整段保底：无关长段也完整注入"
   );
   assert.ok(capturedUser.includes("桃园结义无关内容。".repeat(40)), "前 5 段整段注入，不做窗口裁剪");
-  assert.ok(!capturedUser.includes("第73回"), "注入不带回目：模型无从抄写出处");
+  assert.ok(capturedUser.includes("〔出处1〕第73回"), "结构化出处行放出回号+回目名（bug-00004 方案 C）");
+  assert.ok(
+    !capturedUser.replace(/〔出处\d+〕第\d+回[^\n]*/g, "").includes("第73回"),
+    "注入正文仍为纯原文：回号只出现在结构化出处行"
+  );
   assert.ok(!capturedUser.includes("· 段"), "注入不带段号");
   assert.match(capturedUser, /\[片段1\]/, "片段带服务端编号，模型据此定位");
 });
@@ -1189,5 +1193,143 @@ test("㉚ 单轮·边界复核·正例 bug-00044：结论句 + 换行独立 [片
   assert.ok(data.citations[0].text.includes("不允婚"), "citation 为片段原文");
   assert.equal(checkCallCount, 1, "合并后仅结论句 1 个低重叠候选 → 恰 1 次复核（预算不变）");
   assert.equal(modelCallCount, 2, "生成轮 + 边界语义复核各一次（LLM 调用预算不变）");
+});
+
+// ===== bug-00004 方案 C：回号类问句（含「第几回」）放开回号/回目名（负责人 2026-09-29 追加口径：
+// 不只登场类，凡问句提及「第几回」类回号问法（含死亡类等）一律放行）=====
+
+test("㉛ bug-00004 回号类正样本·登场类：三英战吕布是第几回 → 复核参考并入〔出处N〕行判 supported → 答案含回号、citations 非空", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0005:c0001",
+      text: "吕布出阵搦战，张飞挺矛直取，关羽舞刀夹攻，玄德掣双股剑助战，吕布遮拦不住，拍马回阵。",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let checkCallCount = 0;
+  let reviewUserContent = "";
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      reviewUserContent = String(messages[1]?.content ?? "");
+      return textResponse("supported"); // 复核参考含〔出处1〕第5回：回号结论受支撑
+    }
+    return textResponse("三英战吕布在第五回。\n\n[片段1]"); // 生成轮：回号结论 + 换行指针
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "三英战吕布在第五回",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("三英战吕布是第几回", "sango-novel");
+  assert.ok(data.answer.includes("第五回"), "回号类问句答案含回号，不再答「演义中未涉及」");
+  assert.equal(data.citations.length, 1, "citations 非空：渲染片段出处");
+  assert.equal(checkCallCount, 1, "低重叠回号结论触发一次复核（预算不变）");
+  assert.ok(reviewUserContent.includes("〔出处1〕第5回 发矫诏诸镇应曹公　破关兵三英战吕布"), "复核参考并入结构化出处行，不再因片段原文无回号误判");
+});
+
+test("㉛.1 bug-00004 回号类正样本·死亡类（负责人追加口径）：关羽是第几回死的 → 放行回号+回目，citations 非空", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0076:c0001",
+      text: "关公被擒，权欲留之，左右曰不可，乃命推出斩之，关公父子皆遇害。",
+      chapter: 76,
+      title: "徐公明大战沔水　关云长败走麦城",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let checkCallCount = 0;
+  let reviewUserContent = "";
+  // 片段正文用「关公」，stub 别名表补「关公→P002」才能过人物断言走复核路径（生产别名表本就含该别名）
+  const aliasTable = new Map([...ALIAS_TABLE, ["关公", "P002"]]);
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      reviewUserContent = String(messages[1]?.content ?? "");
+      return textResponse("supported");
+    }
+    return textResponse("关羽在第七十六回身亡。\n\n[片段1]"); // 与片段正文零重叠 → 触发复核
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "关羽在第七十六回遇害",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("关羽是第几回死的", "sango-novel");
+  assert.ok(data.answer.includes("第七十六回"), "死亡类回号问句答案含回号");
+  assert.equal(data.citations.length, 1, "citations 非空");
+  assert.equal(checkCallCount, 1, "低重叠回号结论触发一次复核");
+  assert.ok(reviewUserContent.includes("〔出处1〕第76回 徐公明大战沔水　关云长败走麦城"), "复核参考并入死亡类片段出处行");
+});
+
+test("㉛.2 bug-00004 反向用例：非回号类问句（关羽的武器叫什么）结论含「第N回」→ 确定性裁剪（0 LLM），不输出回目", async () => {
+  const entries = [
+    {
+      id: "sanguo-yanyi:0001:c0001",
+      text: "云长舞动青龙偃月刀，护定玄德。",
+      chapter: 1,
+      title: "宴桃园豪杰三结义　斩黄巾英雄首立功",
+      type: "narration",
+      quotes: [],
+    },
+  ];
+  let checkCallCount = 0;
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      return textResponse("supported");
+    }
+    return textResponse("关羽的武器是青龙偃月刀。\n\n[片段1] 这句出自第一回。"); // 模型违规输出回号
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "关羽的武器是青龙偃月刀",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("关羽的武器叫什么", "sango-novel");
+  assert.doesNotMatch(data.answer, /第[0-9〇零一二三四五六七八九十百千]+回/, "非回号类问句结论不得含回号");
+  assert.doesNotMatch(data.answer, /宴桃园豪杰三结义|斩黄巾英雄首立功/, "非回号类问句结论不得含回目名");
+  assert.ok(data.answer.includes("青龙偃月刀"), "合规句保留，不误伤正常结论");
+  assert.ok(checkCallCount <= 1, "确定性裁剪违规句不占复核预算；合规句低重叠至多一次既有复核");
+});
+
+test("㉛.3 bug-00004 负样本：回号类问句检索无命中仍答「演义中未涉及」，不编造回号", async () => {
+  const modelCaller = async (): Promise<ModelResponse> =>
+    textResponse("关银屏在第五回出场。[片段1]"); // 检索无命中，模型臆造
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: "" }], // 全库命中 0
+      }),
+    },
+    modelCaller,
+  });
+  const data = await agent.processQueryData("关银屏是第几回", "sango-novel");
+  assert.equal(data.answer, "演义中未涉及", "检索无命中 → 拒答，不得为凑回号编造章节");
+  assert.deepEqual(data.citations, [], "citations 空");
 });
 

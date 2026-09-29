@@ -10,6 +10,8 @@ import {
   SENTENCE_OVERLAP_THRESHOLD,
   buildFallback,
   buildInjectionView,
+  buildSourceLine,
+  findChapterLeakSentences,
   findLowOverlapSentences,
   loadAliasTable,
   pickBestFallbackFragment,
@@ -159,7 +161,16 @@ test("⑬ 注入视图只给纯原文 + 服务端编号：片段带 [片段N]、
   assert.match(view.text, /\[片段1\]/);
   assert.match(view.text, /⟨Q1⟩“特来求结两家之好/);
   assert.match(view.text, /⟨Q2⟩“吾虎女安肯嫁犬子乎！”/);
-  assert.doesNotMatch(view.text, /第73回/, "注入不回目，模型无从抄写出处");
+  assert.match(
+    view.text,
+    /〔出处1〕第73回 玄德进位汉中王　云长攻拔襄阳郡/,
+    "结构化出处行放出回号+回目名（bug-00004 方案 C）"
+  );
+  assert.doesNotMatch(
+    view.text.replace(/〔出处\d+〕第\d+回[^\n]*/g, ""),
+    /第73回/,
+    "正文仍为纯原文：回号只出现在结构化出处行"
+  );
   assert.doesNotMatch(view.text, /·\s*段\d/, "注入不带段号");
   assert.doesNotMatch(view.text, /分数|score/i, "注入不带分数");
   assert.equal(view.quotes.size, 2, "指针表应含两条可见引语");
@@ -760,10 +771,14 @@ test("⑲.1 同 chunk 内引语文本重复：按 offset 各就各位（修正 i
       ],
     },
   ]);
-  assert.equal(
-    view.text,
-    "[片段1] 布曰：⟨Q1⟩“某愿往。”布又曰：⟨Q2⟩“某愿往。”",
+  assert.ok(
+    view.text.startsWith("[片段1] 布曰：⟨Q1⟩“某愿往。”布又曰：⟨Q2⟩“某愿往。”"),
     "两条同名引语各标各的位置，不挤在同一处"
+  );
+  assert.match(
+    view.text,
+    /〔出处1〕第3回 议温明董卓叱丁原　馈金珠李肃说吕布/,
+    "结构化出处行放出回号+回目名（bug-00004 方案 C）"
   );
   assert.equal(view.quotes.get("Q1")!.text, "某愿往。");
   assert.equal(view.quotes.get("Q2")!.text, "某愿往。");
@@ -798,10 +813,16 @@ test("⑲.2 非法 / 越界 offset、len：只跳过该条，不崩、不插错�
   assert.equal(entry.quotes?.length, 2, "只跳过非法定位，合法引语照常保留");
   const view = buildInjectionView([entry]);
   assert.deepEqual([...view.quotes.keys()], ["Q1", "Q2"], "编号从 1 起连续、无空洞");
-  assert.equal(
-    view.text,
-    "[片段1] 瑾曰：⟨Q1⟩“特来求结两家之好，请君侯思之。”云长勃然大怒曰：⟨Q2⟩“吾虎女安肯嫁犬子乎！”",
+  assert.ok(
+    view.text.startsWith(
+      "[片段1] 瑾曰：⟨Q1⟩“特来求结两家之好，请君侯思之。”云长勃然大怒曰：⟨Q2⟩“吾虎女安肯嫁犬子乎！”"
+    ),
     "非法定位不插标记，合法引语的标记落在开引号前"
+  );
+  assert.match(
+    view.text,
+    /〔出处1〕第73回 玄德进位汉中王　云长攻拔襄阳郡/,
+    "结构化出处行放出回号+回目名（bug-00004 方案 C）"
   );
   const direct = buildInjectionView([
     {
@@ -962,3 +983,100 @@ test("⑳.6 结构门·bug-00044 低重叠结论复核参考：合并后 bestFra
   );
 });
 
+// ===== bug-00004 方案 C：结构化出处行（回号类问句放开回号+回目名，段号仍不放）=====
+
+test("㉑ bug-00004 buildSourceLine：仅 chapter/title 齐全时输出〔出处N〕第N回 回目名，否则 null", () => {
+  assert.equal(
+    buildSourceLine("片段1", 73, "玄德进位汉中王　云长攻拔襄阳郡"),
+    "〔出处1〕第73回 玄德进位汉中王　云长攻拔襄阳郡",
+    "编号 N 与片段号一致，形态与 [片段N]/⟨Qn⟩ 互不混淆"
+  );
+  assert.equal(buildSourceLine("片段1", undefined, "回目"), null, "缺 chapter 不输出");
+  assert.equal(buildSourceLine("片段1", 73, undefined), null, "缺 title 不输出");
+  assert.equal(buildSourceLine("片段X", 73, "回目"), null, "非 片段N 键不输出");
+});
+
+test("㉑.1 bug-00004 buildInjectionView：多片段各附结构化出处行，正文仍为纯原文（回号只出现在结构化行）", () => {
+  const view = buildInjectionView([
+    {
+      text: "玄德遂与关、张二人结为兄弟，誓同生死。",
+      source: "sanguo-yanyi",
+      chapter: 1,
+      title: "宴桃园豪杰三结义　斩黄巾英雄首立功",
+    },
+    {
+      text: "吕布出阵搦战，张飞挺矛直取，关羽舞刀夹攻，玄德掣双股剑助战。",
+      source: "sanguo-yanyi",
+      chapter: 5,
+      title: "发矫诏诸镇应曹公　破关兵三英战吕布",
+    },
+    {
+      text: "孔明奄然归天，姜维等悲恸不已。",
+      source: "sanguo-yanyi",
+      // 无 chapter/title：不出结构化行，正文照常注入
+    },
+  ]);
+  assert.match(
+    view.text,
+    /\[片段1\] 玄德遂与关、张二人结为兄弟，誓同生死。\n〔出处1〕第1回 宴桃园豪杰三结义　斩黄巾英雄首立功/,
+    "片段1 附出处行（回号+回目名）"
+  );
+  assert.match(
+    view.text,
+    /〔出处2〕第5回 发矫诏诸镇应曹公　破关兵三英战吕布/,
+    "片段2 附出处行（回号+回目名）"
+  );
+  assert.ok(!view.text.includes("〔出处3〕"), "无 chapter/title 的片段不出结构化行");
+  const body = view.text.replace(/〔出处\d+〕第\d+回[^\n]*/g, "");
+  assert.doesNotMatch(body, /第1回|第5回/, "正文仍为纯原文：回号只出现在结构化出处行");
+  assert.doesNotMatch(body, /宴桃园豪杰三结义|三英战吕布/, "正文不含回目名");
+});
+
+test("㉑.2 bug-00004 findChapterLeakSentences：非回号类问句结论含「第N回」或回目名 → 确定性裁剪候选（0 LLM）", () => {
+  const view = buildInjectionView([
+    {
+      text: "玄德遂与关、张二人结为兄弟，誓同生死。",
+      source: "sanguo-yanyi",
+      chapter: 1,
+      title: "宴桃园豪杰三结义　斩黄巾英雄首立功",
+    },
+  ]);
+  assert.deepEqual(
+    findChapterLeakSentences("关羽的武器是青龙偃月刀。", view),
+    [],
+    "普通结论不含回号/回目名 → 不裁剪"
+  );
+  assert.deepEqual(
+    findChapterLeakSentences("关羽的武器是青龙偃月刀，出自第一回。[片段1]", view),
+    ["关羽的武器是青龙偃月刀，出自第一回。[片段1]"],
+    "结论含中文回号 → 命中（整句连同指针）"
+  );
+  assert.deepEqual(
+    findChapterLeakSentences("这个说法见于第104回。[片段1]", view),
+    ["这个说法见于第104回。[片段1]"],
+    "结论含阿拉伯回号 → 命中"
+  );
+  assert.deepEqual(
+    findChapterLeakSentences("关羽的武器是青龙偃月刀，见宴桃园豪杰三结义斩黄巾英雄首立功一回。[片段1]", view),
+    ["关羽的武器是青龙偃月刀，见宴桃园豪杰三结义斩黄巾英雄首立功一回。[片段1]"],
+    "结论含回目名（去空白匹配）→ 命中"
+  );
+});
+
+test("㉑.3 bug-00004 低重叠复核候选 bestSourceLine：回号类问句复核参考可并入结构化出处行", () => {
+  const view = buildInjectionView([
+    {
+      text: "玄德遂与关、张二人结为兄弟，誓同生死。",
+      source: "sanguo-yanyi",
+      chapter: 1,
+      title: "宴桃园豪杰三结义　斩黄巾英雄首立功",
+    },
+  ]);
+  const low = findLowOverlapSentences("刘备第一次出场在第一回。\n\n[片段1]", view);
+  assert.equal(low.length, 1, "回号类结论句与片段正文低重叠 → 进复核候选");
+  assert.equal(
+    low[0].bestSourceLine,
+    "〔出处1〕第1回 宴桃园豪杰三结义　斩黄巾英雄首立功",
+    "候选携带最佳片段的结构化出处行，复核参考 = 片段原文 + 出处行"
+  );
+});

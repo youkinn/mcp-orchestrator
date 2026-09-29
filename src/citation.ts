@@ -375,6 +375,21 @@ export interface InjectionViewOptions {
   tailFallback?: boolean;
 }
 
+/** 结构化出处行（bug-00004 方案 C）：〔出处N〕第N回 回目名。
+ * 紧跟对应片段块末尾，位置固定、可被 prompt 定向引用；与 [片段N] / ⟨Qn⟩ 标记形态互不混淆。
+ * chapter / title 缺失（草稿台无出处片段）时不输出，返回 null。 */
+export function buildSourceLine(
+  fragmentKey: string,
+  chapter?: number,
+  title?: string
+): string | null {
+  const match = /^片段(\d+)$/.exec(fragmentKey);
+  if (!match || chapter === undefined || !title) {
+    return null;
+  }
+  return `〔出处${match[1]}〕第${chapter}回 ${title}`;
+}
+
 export function buildInjectionView(
   fragments: RecallFragment[],
   query = "",
@@ -426,7 +441,15 @@ export function buildInjectionView(
       });
       quoteFragments.set(qid, fragmentKey);
     }
-    parts.push(`[${fragmentKey}] ${marked}`);
+    // bug-00004 方案 C：片段块末尾附结构化出处行（回号+回目名），正文保持纯原文
+    const sourceLine = buildSourceLine(
+      fragmentKey,
+      fragment.chapter,
+      fragment.title
+    );
+    parts.push(
+      sourceLine ? `[${fragmentKey}] ${marked}\n${sourceLine}` : `[${fragmentKey}] ${marked}`
+    );
   });
   return { text: parts.join("\n\n"), quotes, fragments: targets, quoteFragments };
 }
@@ -588,6 +611,9 @@ export interface LowOverlapSentence {
   bestOverlap: number;
   /** 重叠率最高片段原文（复核参考文本；无注入片段时为 null） */
   bestFragmentText: string | null;
+  /** 重叠率最高片段的结构化出处行（〔出处N〕第N回 回目名；无片段或出处缺失时为 null）。
+   * bug-00004 方案 C：回号类问句复核时把该行并入参考，避免「片段原文无回号 → 误判 unsupported」。 */
+  bestSourceLine: string | null;
 }
 
 /** 结构门第三条·低重叠句挑选（纯函数）：返回需要边界语义复核的叙述句。
@@ -624,12 +650,14 @@ export function findLowOverlapSentences(
         continue;
       }
       let bestOverlap = 0;
+      let bestFragmentKey: string | undefined;
       let bestFragment: RenderedQuote | undefined;
-      for (const fragment of view.fragments.values()) {
+      for (const [fragmentKey, fragment] of view.fragments.entries()) {
         const overlap = sentenceFragmentOverlap(sentence.text, fragment.text);
         if (bestFragment === undefined || overlap > bestOverlap) {
           bestOverlap = overlap;
           bestFragment = fragment;
+          bestFragmentKey = fragmentKey;
         }
       }
       if (bestOverlap < SENTENCE_OVERLAP_THRESHOLD) {
@@ -638,11 +666,20 @@ export function findLowOverlapSentences(
           pointers: [],
           bestOverlap,
           bestFragmentText: bestFragment?.text ?? null,
+          bestSourceLine:
+            bestFragmentKey && bestFragment
+              ? buildSourceLine(
+                  bestFragmentKey,
+                  bestFragment.chapter,
+                  bestFragment.title
+                )
+              : null,
         });
       }
       continue;
     }
     let bestOverlap = 0;
+    let bestFragmentKey: string | undefined;
     let bestFragment: RenderedQuote | undefined;
     for (const pointer of sentence.narrativePointers) {
       const fragment = view.fragments.get(pointer);
@@ -654,6 +691,7 @@ export function findLowOverlapSentences(
       if (bestFragment === undefined || overlap > bestOverlap) {
         bestOverlap = overlap;
         bestFragment = fragment;
+        bestFragmentKey = pointer;
       }
     }
     if (bestOverlap < SENTENCE_OVERLAP_THRESHOLD) {
@@ -662,6 +700,14 @@ export function findLowOverlapSentences(
         pointers: sentence.narrativePointers,
         bestOverlap,
         bestFragmentText: bestFragment?.text ?? null,
+        bestSourceLine:
+          bestFragmentKey && bestFragment
+            ? buildSourceLine(
+                bestFragmentKey,
+                bestFragment.chapter,
+                bestFragment.title
+              )
+            : null,
       });
     }
   }
@@ -677,6 +723,31 @@ export function stripAnswerSentences(
     .filter((sentence) => !dropTexts.has(sentence.text))
     .map((sentence) => sentence.text)
     .join("");
+}
+
+/** bug-00004 方案 C：非回号类问句的确定性裁剪（0 LLM）——返回含「第N回」或注入回目名的
+ * 整句（连同指针），供护栏按现有 stripAnswerSentences 裁掉，守住「非回号类问句不输出回目」。
+ * 回号正则覆盖阿拉伯 / 中文数字；回目名按注入视图 title 去空白后包含判定（模型可能不带全角空格）。 */
+export function findChapterLeakSentences(
+  answer: string,
+  view: InjectionView
+): string[] {
+  const titles = [...view.fragments.values()]
+    .map((fragment) => fragment.title)
+    .filter((title): title is string => Boolean(title));
+  const chapterRe = /第[0-9０-９一二三四五六七八九十百千零〇]+回/;
+  const leaked: string[] = [];
+  for (const sentence of splitAnswerSentences(answer)) {
+    const body = stripPointerMarkers(sentence.text).replace(/\s/g, "");
+    if (chapterRe.test(body)) {
+      leaked.push(sentence.text);
+      continue;
+    }
+    if (titles.some((title) => body.includes(title.replace(/\s/g, "")))) {
+      leaked.push(sentence.text);
+    }
+  }
+  return leaked;
 }
 
 /** 结构门第三条·字面裁剪（零 LLM 兼容口径，保留给纯函数用例 / 复核不可用时的保守回落）：
