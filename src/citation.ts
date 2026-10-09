@@ -482,10 +482,16 @@ export function validateQuotePointers(
   return { ok: pointers.length > 0 && invalid.length === 0, pointers, invalid };
 }
 
-/** 长引语安全网（spec §6.4）：丢弃模型违规抄写的超长「…」（其原文由指针 + 字段渲染提供） */
+/** 长引语安全网（spec §6.4）：丢弃模型违规抄写的超长引号内容（弯引号 “…” 与直角引号「…」
+ * 两类，其原文由指针 + 字段渲染提供）；超长（> MAX_MODEL_QUOTE_LENGTH 字）整段丢弃，
+ * 短引号内容原样保留。 */
 export function stripOverlongModelQuotes(answer: string): string {
-  return answer.replace(/「([^」]*)」/g, (whole, inner: string) =>
-    inner.length > MAX_MODEL_QUOTE_LENGTH ? "" : whole
+  return answer.replace(
+    /「([^」]*)」|“([^”]*)”/g,
+    (whole, cornerInner: string, curlyInner: string) => {
+      const inner = cornerInner ?? curlyInner;
+      return inner.length > MAX_MODEL_QUOTE_LENGTH ? "" : whole;
+    }
   );
 }
 
@@ -856,20 +862,45 @@ function resolvePointerRef(
   return fragmentKey ? { quote, fragmentKey } : null;
 }
 
+/** bug-00025 C：引文渲染后的紧随回声识别。rest 为 `[Qn]` 之后紧邻的原始答案文本；
+ * 回声形态为弯引号 “…” 或直角引号「…」，其内容等于引文全文或为其子串 → 返回整段回声
+ * （含两侧引号）供消费，否则 null。严守「紧随其后」：回声必须紧贴渲染引文、中间不留任何
+ * 字符，避免误删正常叙述正文。 */
+function matchEchoQuote(rest: string, quote: string): string | null {
+  const matched = /^(?:“([^”]*)”|「([^」]*)」)/.exec(rest);
+  if (!matched) {
+    return null;
+  }
+  const echo = (matched[1] ?? matched[2]).trim();
+  return echo.length > 0 && quote.includes(echo) ? matched[0] : null;
+}
+
 /** 服务端渲染引用与出处（feat-A006）：`[Qn]` 引语指针 → 「引文」+ 全局上标角标，
  * `[片段N]` 叙述段指针 → 仅全局上标角标（不内联原文，answer 只放结论，原文进 citations 卡片）；
  * 不再内联出处；citations 按引用出现顺序、片段粒度合并（同片段多引语合并为一条，
- * 角标数量 = 片段数量），只收被引用片段；未注册的指针原样保留。 */
+ * 角标数量 = 片段数量），只收被引用片段；未注册的指针原样保留。
+ * bug-00025：入参先剥离模型抄写的 ⟨Qn⟩ 内部编号（只去标记、正文保留），保证最终 answer
+ * 恒无内部编号；`[Qn]` 渲染为 「引文」¹ 后若紧随模型回声引号（全文或子串），回声一并消费
+ * 去重（见 matchEchoQuote）；无回声时既有渲染逐字节不变。 */
 export function renderAnswerWithCitations(
   answer: string,
   view: InjectionView
 ): ChatData {
+  const withoutInternalMarkers = answer.replace(/⟨Q?\d+⟩/g, "");
   const citations: Citation[] = [];
   const citedIndexes = new Map<string, number>();
-  const rendered = answer.replace(/\[(Q\d+|片段\d+)\]/g, (whole, ref: string) => {
+  let rendered = "";
+  let cursor = 0;
+  const pointerRe = /\[(Q\d+|片段\d+)\]/g;
+  let pointerMatch: RegExpExecArray | null;
+  while ((pointerMatch = pointerRe.exec(withoutInternalMarkers)) !== null) {
+    const ref = pointerMatch[1];
+    rendered += withoutInternalMarkers.slice(cursor, pointerMatch.index);
     const resolved = resolvePointerRef(ref, view);
     if (!resolved) {
-      return whole;
+      rendered += pointerMatch[0];
+      cursor = pointerRe.lastIndex;
+      continue;
     }
     let index = citedIndexes.get(resolved.fragmentKey);
     if (index === undefined) {
@@ -882,11 +913,23 @@ export function renderAnswerWithCitations(
         title: fragment?.title ?? resolved.quote.title,
       });
     }
-    if (ref.startsWith("Q")) {
-      return `「${resolved.quote.text}」${toSuperscript(index)}`;
+    if (!ref.startsWith("Q")) {
+      rendered += toSuperscript(index);
+      cursor = pointerRe.lastIndex;
+      continue;
     }
-    return toSuperscript(index);
-  });
+    const echo = matchEchoQuote(
+      withoutInternalMarkers.slice(pointerRe.lastIndex),
+      resolved.quote.text
+    );
+    if (echo) {
+      // 回声引号连同其内容被消费：指针游标越过回声，紧跟的引文不再重复出现
+      pointerRe.lastIndex += echo.length;
+    }
+    rendered += `「${resolved.quote.text}」${toSuperscript(index)}`;
+    cursor = pointerRe.lastIndex;
+  }
+  rendered += withoutInternalMarkers.slice(cursor);
   return { answer: rendered, citations };
 }
 

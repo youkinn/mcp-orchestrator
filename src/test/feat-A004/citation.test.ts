@@ -658,6 +658,159 @@ test("⑯.6 无引用恒 []：answer 无指针时 citations 为空、answer 原�
   assert.deepEqual(out.citations, []);
 });
 
+test("⑯.7 长引语安全网·弯引号：超 30 字的 “…” 抄写整段丢弃，短弯引号原样保留（bug-00025）", () => {
+  const long = "汝是何等人，敢来诈降！吾今缺少福物祭旗，愿借你首级。不看汝节义，立斩汝首！";
+  assert.ok(long.length > MAX_MODEL_QUOTE_LENGTH);
+  const answer = `蔡和叫[Q4]“${long}”周瑜大怒[Q5]。`;
+  const stripped = stripOverlongModelQuotes(answer);
+  assert.ok(!stripped.includes(long), "超长弯引号抄写应被丢弃");
+  assert.match(stripped, /\[Q4\]/, "指针保留，原文改由字段渲染");
+  assert.equal(
+    stripOverlongModelQuotes("蔡和叫[Q4]“无罪！”周瑜说[Q5]。"),
+    "蔡和叫[Q4]“无罪！”周瑜说[Q5]。",
+    "短弯引号不属于违规抄写"
+  );
+});
+
+test("⑯.8 内部编号剥离：模型抄写的 ⟨Qn⟩ 只去标记、引语正文保留，answer 恒无 ⟨Qn⟩（bug-00025）", () => {
+  const view: InjectionView = {
+    text: "",
+    quotes: new Map([["Q4", { text: "无罪！", chapter: 43, title: "群英会蒋干中计" }]]),
+    fragments: new Map([
+      ["片段1", { text: "蔡中蔡和曰：“无罪！”", chapter: 43, title: "群英会蒋干中计" }],
+    ]),
+    quoteFragments: new Map([["Q4", "片段1"]]),
+  };
+  const out = renderAnswerWithCitations(
+    "周瑜喝令：⟨Q4⟩“拿下！”蔡和叫[Q4]“无罪！”。",
+    view
+  );
+  assert.equal(
+    out.answer,
+    "周瑜喝令：“拿下！”蔡和叫「无罪！」¹。",
+    "⟨Q4⟩ 标记被剥离，正文保留；[Q4] 渲染引文并消费紧随其后的回声"
+  );
+  assert.doesNotMatch(out.answer, /⟨Q\d+⟩/, "渲染出口恒无内部编号");
+});
+
+test("⑯.9 引文回声去重·全文：渲染 「X」¹ 后紧跟的满引号回声删除（bug-00025 蔡和题）", () => {
+  const view: InjectionView = {
+    text: "",
+    quotes: new Map([
+      ["Q4", { text: "无罪！", chapter: 43, title: "群英会蒋干中计" }],
+      [
+        "Q5",
+        {
+          text: "汝是何等人，敢来诈降！吾今缺少福物祭旗，愿借你首级。",
+          chapter: 43,
+          title: "群英会蒋干中计",
+        },
+      ],
+    ]),
+    fragments: new Map([
+      ["片段1", { text: "蔡和叫：“无罪！”", chapter: 43, title: "群英会蒋干中计" }],
+      [
+        "片段2",
+        {
+          text: "周瑜曰：“汝是何等人，敢来诈降！”",
+          chapter: 43,
+          title: "群英会蒋干中计",
+        },
+      ],
+    ]),
+    quoteFragments: new Map([
+      ["Q4", "片段1"],
+      ["Q5", "片段2"],
+    ]),
+  };
+  const out = renderAnswerWithCitations(
+    "蔡和叫[Q4]“无罪！”周瑜说[Q5]“汝是何等人，敢来诈降！吾今缺少福物祭旗，愿借你首级。”…",
+    view
+  );
+  assert.equal(
+    out.answer,
+    "蔡和叫「无罪！」¹周瑜说「汝是何等人，敢来诈降！吾今缺少福物祭旗，愿借你首级。」²…",
+    "回声整段消费，只留服务端渲染的引文 + 上标"
+  );
+});
+
+test("⑯.10 引文回声去重·子串：回声为引文子串（截短形态）同样删除，覆盖弯引号 / 直角引号两种回声", () => {
+  const view: InjectionView = {
+    text: "",
+    quotes: new Map([
+      [
+        "Q5",
+        {
+          text: "汝是何等人，敢来诈降！吾今缺少福物祭旗，愿借你首级。",
+          chapter: 43,
+          title: "群英会蒋干中计",
+        },
+      ],
+    ]),
+    fragments: new Map([["片段2", { text: "周瑜曰：“汝是何等人！”", chapter: 43, title: "群英会蒋干中计" }]]),
+    quoteFragments: new Map([["Q5", "片段2"]]),
+  };
+  const renderedQuote = "汝是何等人，敢来诈降！吾今缺少福物祭旗，愿借你首级。";
+  assert.equal(
+    renderAnswerWithCitations("周瑜厉声[Q5]“汝是何等人”。", view).answer,
+    `周瑜厉声「${renderedQuote}」¹。`,
+    "弯引号截短回声被消费"
+  );
+  assert.equal(
+    renderAnswerWithCitations("周瑜厉声[Q5]「汝是何等人」，", view).answer,
+    `周瑜厉声「${renderedQuote}」¹，`,
+    "直角引号截短回声被消费"
+  );
+});
+
+test("⑯.11 无回声不回归：引文后无模型回声 / 叙述引号非引文子串时，既有渲染逐字节不变", () => {
+  const view: InjectionView = {
+    text: "",
+    quotes: new Map([
+      [
+        "Q2",
+        {
+          text: "吾虎女安肯嫁犬子乎！",
+          chapter: 73,
+          title: "玄德进位汉中王　云长攻拔襄阳郡",
+        },
+      ],
+      [
+        "Q1",
+        {
+          text: "特来求结两家之好，请君侯思之。",
+          chapter: 73,
+          title: "玄德进位汉中王　云长攻拔襄阳郡",
+        },
+      ],
+    ]),
+    fragments: new Map([
+      [
+        "片段1",
+        {
+          text: "瑾曰：“特来求结两家之好，请君侯思之。”云长勃然大怒曰：“吾虎女安肯嫁犬子乎！”",
+          chapter: 73,
+          title: "玄德进位汉中王　云长攻拔襄阳郡",
+        },
+      ],
+    ]),
+    quoteFragments: new Map([
+      ["Q1", "片段1"],
+      ["Q2", "片段1"],
+    ]),
+  };
+  assert.equal(
+    renderAnswerWithCitations("关羽怒拒[Q2]，使者此前曾[Q1]。", view).answer,
+    "关羽怒拒「吾虎女安肯嫁犬子乎！」¹，使者此前曾「特来求结两家之好，请君侯思之。」¹。",
+    "无回声时与既有渲染逐字节一致（⑯.3 口径）"
+  );
+  assert.equal(
+    renderAnswerWithCitations("关羽回以[Q2]，“关羽不肯答应”。", view).answer,
+    "关羽回以「吾虎女安肯嫁犬子乎！」¹，“关羽不肯答应”。",
+    "回声内容非引文子串 → 属正常叙述，不得误删"
+  );
+});
+
 test("⑰ 长引语安全网：超 30 字的「…」视为违规抄写被丢弃，短引语原样保留", () => {
   const long = "吾虎女安肯嫁犬子乎！不看汝弟之面，立斩汝首！再休多言！汝可速回。";
   assert.ok(long.length > MAX_MODEL_QUOTE_LENGTH);
