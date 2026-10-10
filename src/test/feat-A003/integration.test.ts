@@ -282,8 +282,6 @@ const NOVEL_RECALL = JSON.stringify([
     type: 'narration',
     segFrom: 4,
     segTo: 4,
-    quoteBalanced: true,
-    quotes: [{ offset: 7, len: 13 }],
   },
 ]);
 

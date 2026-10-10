@@ -31,10 +31,9 @@ import {
   scanRecallPersonIds,
   findLowOverlapSentences,
   stripAnswerSentences,
-  stripOverlongModelQuotes,
   stripPointerMarkers,
   toRecallFragments,
-  validateQuotePointers,
+  validateFragmentPointers,
   verifyCitation,
   type ChatData,
   type Citation,
@@ -191,7 +190,7 @@ export const CLASSIFY_SYSTEM_PROMPT = [
 export const SANGO_NOVEL_DOMAIN_PROMPT = [
   "当前为「三国演义原著解读」场景。系统已检索《三国演义》原文并附在问题下方【已检索到的原文片段】中；请直接依据片段作答，不要再调用检索工具。",
   "1. 先给一句直接回答用户问题主体的结论，人名以召回原文为准（关羽、云长、关公均可）。",
-  "2. 结论后引用原文：引语只输出 [Qn] 指针（n 为 ⟨Qn⟩ 标记序号），指针后严禁带任何引文正文 / 标点回声；无引号叙述句输出 [片段N]；引文原文一律由服务端按字段渲染，你不得抄写引语，严禁输出回目、出处、段号。",
+  "2. 结论后如需引用，只输出 [片段N] 指针（N 为【已检索到的原文片段】中的片段编号，对应最终引用卡片）；指针后严禁带任何正文回声 / 标点回声；引用原文一律由服务端按字段渲染，你不得抄写原文，严禁输出回目、出处、段号。",
   "3. 例外：仅当用户问句为回号/回目类问句（如「第几回」「哪一回」「回目」）时，可引用注入片段末尾的〔出处N〕结构化出处行输出对应回号与回目名；其余情况仍严禁输出回目、出处、段号。",
   "4. 片段中确实没有相关内容时回复「演义中未涉及」，禁止用先验知识补全。",
   "5. 不以「按原文，」开头，不输出解释、总结或格式以外的内容；提问明显不属于原著（如问候、天气）时按普通对话处理。",
@@ -884,11 +883,11 @@ export class Agent {
 
   /**
    * 演义域引用护栏（feat-A004/A006 起，A016 演进）：
-   * - 硬校验（0 LLM）：别名表断言扫描 + 指针合法性校验（指针 ∈ 注入 qid、断言人物 ⊆ 召回）；
+   * - 硬校验（0 LLM）：别名表断言扫描 + 指针合法性校验（指针 ∈ 注入片段编号、断言人物 ⊆ 召回）；
    * - 结构门「句-片段文本重叠」：重叠 ≥ 阈值放行；低重叠叙述句按复核预算 1 做边界语义复核
-   *   （stage novel_boundary_check，至多 1 次 LLM；引语内容句豁免、不进候选，bug-00039/00040）；
+   *   （stage novel_boundary_check，至多 1 次 LLM）；
    *   全部裁剪无留存 → 拒答「演义中未涉及」+ citations []；
-   * - 校验通过 → 服务端渲染引文 + 全局上标角标并组装 citations（按引用出现顺序、片段粒度合并）；
+   * - 校验通过 → 服务端剥离 `[片段N]` 指针并组装 citations（按回号 + 原文位置排序、片段粒度合并）；
    *   同时回填被引用片段 → 候选 chunkId 集合（feat-A009：内部映射，不做文本比对）；
    *   校验不过 → 兜底结论归纳（concludeFallback，异常路径 +1 LLM）。
    */
@@ -919,7 +918,6 @@ export class Agent {
     // 须按 bug-00018 的空答案兜底口径处置（重试 / 兜底结论 / 报错）。
     const isNovelAnswer =
       scanRecallPersonIds(answer, aliasTable).size > 0 ||
-      /\[Q\d+\]/.test(answer) ||
       /\[片段\d+\]/.test(answer) ||
       /按原文，/.test(answer);
     if (!isNovelAnswer) {
@@ -929,15 +927,9 @@ export class Agent {
         citedFragmentKeys: new Set(),
       };
     }
-    // H4 长引语安全网：模型输出里的超长「…」是违规抄写，直接丢弃；原文改由指针 + 字段渲染提供。
-    // 断言扫描对象是丢弃违规抄写后的答案正文人名（抄写内容不参与断言）
-    const cleaned = stripOverlongModelQuotes(answer);
-    const assertedIds = scanRecallPersonIds(cleaned, aliasTable);
-    const pointer = validateQuotePointers(
-      cleaned,
-      view.quotes,
-      view.fragments
-    );
+    // 断言扫描对象是答案正文人名（引用指针由服务端渲染，不参与断言）
+    const assertedIds = scanRecallPersonIds(answer, aliasTable);
+    const pointer = validateFragmentPointers(answer, view.fragments);
     const asserted = [...assertedIds].map((id) => ({ name: id, id }));
     const check = verifyCitation(asserted, recallText, recallPersonIds);
     if (pointer.ok && check.ok) {
@@ -950,13 +942,12 @@ export class Agent {
       // （零额外调用）；重叠 < 阈值的待裁叙述句触发一次轻量 LLM 语义支撑复核（独立 stage
       // novel_boundary_check，正常样本不出现）：supported → 放行整句，unsupported → 裁剪；
       // 全部裁剪无留存 → 拒答「演义中未涉及」+ citations []（拒答口径与缓存规则不变）。
-      // 引语内容句（含 [Qn]/无指针引语句）豁免见 findLowOverlapSentences（bug-00040）。
-      // bug-00037（4d7a408a）：结论句不带指针、指针挂引文句时，结论断言原样逃过本门——现
+      // bug-00037（4d7a408a）：结论句不带指针、指针挂引用行时，结论断言原样逃过本门——现
       // 无指针叙述句也纳入重叠检查（对全部注入片段取最高重叠），低重叠同样走边界语义复核。
       // bug-00004 方案 C：回号类问句（§1.2.1 chapter 焦点词，零 LLM）识别；非回号类问句
       // 结论含「第N回」/回目名直接确定性裁剪（0 LLM，不占复核预算）；回号类问句复核参考
       // 并入结构化出处行，避免「片段原文无回号 → 误判 unsupported」。
-      let filtered = cleaned;
+      let filtered = answer;
       const isChapterQuestion = hasChapterFocus(query);
       if (!isChapterQuestion) {
         const leaks = findChapterLeakSentences(filtered, view);
@@ -973,8 +964,6 @@ export class Agent {
         // 无支撑内容放行，预算外不再逐句串行复核）。提示词约束答案「一句结论」，正常路径
         // 根本不触发复核，它只是格式越界时的安全网（拒答口径与 4bea3ab 一致：全部裁剪后
         // 判空 → 拒答，见下方 stripPointerMarkers 判空）。
-        // bug-00040：引语片段句（整句内容均为引语）已在 findLowOverlapSentences 中豁免，
-        // 不进复核候选、不裁剪、不占复核预算。
         const unsupported: string[] = [];
         let bestSentence = lowOverlap[0];
         for (const sentence of lowOverlap) {
@@ -1015,7 +1004,7 @@ export class Agent {
           filtered = stripAnswerSentences(filtered, new Set(unsupported));
         }
       }
-      // bug-00038：拒答判定按「去指针后的正文」——全部裁剪无留存、或只剩裸 [片段N]/[Qn]
+      // bug-00038：拒答判定按「去指针后的正文」——全部裁剪无留存、或只剩裸 [片段N]
       // 引用行（无正文）都属于无正文可答 → 拒答「演义中未涉及」+ citations []，避免渲染空正文+脚注。
       if (!stripPointerMarkers(filtered).trim()) {
         return {
@@ -1024,15 +1013,12 @@ export class Agent {
           citedFragmentKeys: new Set(),
         };
       }
-      // feat-A017：渲染期已知每个引用归属的注入片段（[片段N] / ⟨Qn⟩ → 片段映射），
+      // feat-A017：渲染期已知每个引用归属的注入片段（[片段N] → 片段映射），
       // diff 与被引用 chunkId 同一数据源、单一实现点（§4.4）
       const citedFragmentKeys = new Set<string>();
       for (const ref of extractCitePointers(filtered)) {
-        const fragmentKey = ref.startsWith("Q")
-          ? view.quoteFragments.get(ref)
-          : ref;
-        if (fragmentKey && /^片段\d+$/.test(fragmentKey)) {
-          citedFragmentKeys.add(fragmentKey);
+        if (/^片段\d+$/.test(ref)) {
+          citedFragmentKeys.add(ref);
         }
       }
       return {
@@ -1077,10 +1063,7 @@ export class Agent {
     }
     const pickedIndices = computePickedIndices(fragments);
     for (const ref of extractCitePointers(answer)) {
-      const fragmentKey = ref.startsWith("Q")
-        ? view.quoteFragments.get(ref)
-        : ref;
-      const match = fragmentKey && /^片段(\d+)$/.exec(fragmentKey);
+      const match = /^片段(\d+)$/.exec(ref);
       if (!match) {
         continue;
       }
@@ -1175,7 +1158,7 @@ export class Agent {
         }
 
         // 注入策略（2026-09-20 定稿）：前 5 段整段保底 + 第 6–10 段预算兜底（INJECT_TAIL_FALLBACK_ENABLED=false 时只注入前 5 段）；
-        // 超预算丢整段、不段内裁剪；注入视图只给纯原文 + 服务端编号（`[片段N]` / `⟨Qn⟩`），不带回目、段号、分数（spec §6.3）
+        // 超预算丢整段、不段内裁剪；注入视图只给纯原文 + 服务端编号（`[片段N]`），不带回目、段号、分数（spec §6.3）
         const view = buildInjectionView(novelFragments, query);
         const injected = novelFragments.length ? view.text : "（检索无命中）";
         return {

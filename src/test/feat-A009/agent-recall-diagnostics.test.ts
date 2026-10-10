@@ -4,7 +4,7 @@
 // 无诊断检索不登记不落库。全部用既有 FakeModel（modelCaller）+ mock transport，不调用任何 LLM。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Agent } from '../../agent.js';
+import { Agent, NOVEL_BOUNDARY_CHECK_PROMPT } from '../../agent.js';
 import { MCPTransport } from '../../transport.js';
 import { loadAliasTable } from '../../citation.js';
 import { runWithTraceId } from '../../trace.js';
@@ -90,8 +90,6 @@ const ENTRIES = [
     type: 'narration',
     segFrom: 4,
     segTo: 4,
-    quoteBalanced: true,
-    quotes: [{ offset: 7, len: F1_QUOTE.length }],
   },
   {
     id: CHUNK_2,
@@ -99,7 +97,6 @@ const ENTRIES = [
     chapter: 5,
     title: TITLE,
     type: 'narration',
-    quotes: [],
   },
   {
     id: CHUNK_3,
@@ -107,7 +104,6 @@ const ENTRIES = [
     chapter: 5,
     title: TITLE,
     type: 'narration',
-    quotes: [],
   },
 ];
 
@@ -201,7 +197,10 @@ test('② 被引用片段 → candidates[].cited=true + funnel.cited 计数', as
         recallResult(makeDiagnostics(3, [candidate(1, CHUNK_1), candidate(2, CHUNK_2), candidate(3, CHUNK_3)]), 1),
     },
     fallbackConcluder: async () => '斩华雄者系关羽',
-    modelCaller: async () => textResponse('按原文，斩华雄者系关羽。[Q1]'),
+    modelCaller: async (messages: any[]) =>
+      messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT
+        ? textResponse('supported')
+        : textResponse('按原文，斩华雄者系关羽。[片段1]'),
     retrievalDiagnosticsPersister: (_traceId, _seq, diagnostics) => {
       recorded.push({ diagnostics: diagnostics as Record<string, unknown> });
     },
@@ -213,7 +212,7 @@ test('② 被引用片段 → candidates[].cited=true + funnel.cited 计数', as
   const byChunk = new Map(
     (diag.candidates as Array<{ chunkId: string; cited: boolean }>).map((c) => [c.chunkId, c])
   );
-  assert.equal(byChunk.get(CHUNK_1)?.cited, true, '被 [Q1] 引用的 c0001 应 cited=true');
+  assert.equal(byChunk.get(CHUNK_1)?.cited, true, '被 [片段1] 引用的 c0001 应 cited=true');
   assert.equal(byChunk.get(CHUNK_2)?.cited, false, '未引用片段 cited=false');
   assert.equal(byChunk.get(CHUNK_3)?.cited, false);
 });
@@ -263,7 +262,10 @@ test('④ 落库失败旁路：persister 抛错不影响 /api/chat 响应与 dat
         recallResult(makeDiagnostics(3, [candidate(1, CHUNK_1), candidate(2, CHUNK_2), candidate(3, CHUNK_3)]), 1),
     },
     fallbackConcluder: async () => '斩华雄者系关羽',
-    modelCaller: async () => textResponse('按原文，斩华雄者系关羽。[Q1]'),
+    modelCaller: async (messages: any[]) =>
+      messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT
+        ? textResponse('supported')
+        : textResponse('按原文，斩华雄者系关羽。[片段1]'),
     retrievalDiagnosticsPersister: () => {
       persisted += 1;
       throw new Error('db down');
@@ -290,12 +292,15 @@ test('⑤ auto 分类编号 1 → 确定性预调注入：injected/cited 正常�
         recallResult(makeDiagnostics(3, [candidate(1, CHUNK_1), candidate(2, CHUNK_2), candidate(3, CHUNK_3)]), 1),
     },
     fallbackConcluder: async () => '斩华雄者系关羽',
-    modelCaller: async () => {
+    modelCaller: async (messages: any[]) => {
       callCount += 1;
+      if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+        return textResponse('supported');
+      }
       // A011 起 auto 首轮为无 tools 分类轮：模型只输出编号，检索由服务端按编号确定性预调，不再模型自主调工具
       return callCount === 1
         ? textResponse('1')
-        : textResponse('按原文，斩华雄者系关羽。[Q1]');
+        : textResponse('按原文，斩华雄者系关羽。[片段1]');
     },
     retrievalDiagnosticsPersister: (_traceId, _seq, diagnostics) => {
       recorded.push({ diagnostics: diagnostics as Record<string, unknown> });
@@ -312,7 +317,8 @@ test('⑤ auto 分类编号 1 → 确定性预调注入：injected/cited 正常�
   );
   assert.equal(c1?.injected, true, '确定性预调注入 → 候选 injected=true');
   assert.equal(c1?.cited, true, '被引用候选 cited=true');
-  assert.ok(data.answer.includes('云长提刀出阵'), '注入 + 引用渲染正常');
+  assert.ok(data.answer.includes('斩华雄者系关羽'), '结论正文保留');
+  assert.doesNotMatch(data.answer, /\[片段\d+\]/, '指针已剥离');
 });
 
 test('⑥ 无诊断检索：不登记调用、persister 不被触发（旁路）', async () => {

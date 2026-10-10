@@ -18,7 +18,6 @@
  *   @k           答案段（含判定正则的段）折算后的排名命中率（同段多 chunk 取最好名次）
  *   750/1000覆盖 按排名累加 chunk 字数至预算上限，答案是否已进入注入（最贴近真实注入约束）
  *   top5重复     top5 内存在共享整句的 chunk 对（重叠量化的直接读数）
- *   引号断       含引号的 chunk 中 “/” 不配对的占比（引语被切断的度量）
  */
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -33,35 +32,19 @@ const DEV_DOCS_DIR = resolve(process.env.SANGO_DEV_DOCS_DIR ?? resolve(WORKSPACE
 const { tokenize } = await import(pathToFileURL(resolve(SANGO_DIR, 'src', 'utils', 'text.ts')).href);
 
 const MAIN_CASE = '孙权遣人向关羽求亲，关羽是怎么回复使者的';
-const OPEN = '\u201c';
-const CLOSE = '\u201d';
 
 // ===================== 切分算法（规范 §3 的参考实现） =====================
 const splitSentences = (t) => t.split(/(?<=[。！？；])/).filter((s) => s.trim());
-const quoteDelta = (s) =>
-  (s.match(new RegExp(OPEN, 'g')) ?? []).length - (s.match(new RegExp(CLOSE, 'g')) ?? []).length;
 
-/** 步骤 1：切句。步骤 2（可选）：引语未配平则向后并句，上限 quoteMax（0 = 不并句） */
-function toUnits(text, quoteMax) {
-  const out = [];
-  for (const s of splitSentences(text)) {
-    const prev = out[out.length - 1];
-    if (quoteMax > 0 && prev && prev.open > 0 && prev.s.length + s.length <= quoteMax) {
-      prev.s += s;
-      prev.open = Math.max(0, prev.open + quoteDelta(s));
-    } else {
-      out.push({ s, open: Math.max(0, quoteDelta(s)) });
-    }
-  }
-  return out;
+/** 步骤 1：切句（句末标点切分，unit 内不再并句） */
+function toUnits(text) {
+  return splitSentences(text).map((s) => ({ s }));
 }
 
 /**
  * 步骤 3：顺序装箱到 target，不在 unit 内部切分（至少装 1 个 unit）。
- * closeQuoteCap > 0 时，箱尾引语未配平则继续吞入后续 unit 至配平或达上限；
- * 吞入的 unit 计入 end，下一箱从 end 继续，保证不重复、不遗漏（不变量 I1）。
  */
-function packUnits(units, target, closeQuoteCap = 0) {
+function packUnits(units, target) {
   const out = [];
   let start = 0;
   while (start < units.length) {
@@ -71,14 +54,6 @@ function packUnits(units, target, closeQuoteCap = 0) {
       len += units[end].s.length;
       end++;
     }
-    if (closeQuoteCap > 0) {
-      let depth = units.slice(start, end).reduce((d, u) => d + quoteDelta(u.s), 0);
-      while (depth > 0 && end < units.length && len + units[end].s.length <= closeQuoteCap) {
-        depth += quoteDelta(units[end].s);
-        len += units[end].s.length;
-        end++;
-      }
-    }
     out.push(units.slice(start, end));
     if (end >= units.length) break;
     start = end;
@@ -86,31 +61,8 @@ function packUnits(units, target, closeQuoteCap = 0) {
   return out;
 }
 
-/** 成对引语抽取：栈式配对，返回 [[open, close]]，按出现顺序（构建期，§3 步骤 6 / §5 quotes[]） */
-function quotePairs(t) {
-  const pairs = [];
-  const stack = [];
-  for (let i = 0; i < t.length; i++) {
-    if (t[i] === OPEN) stack.push(i);
-    else if (t[i] === CLOSE && stack.length) pairs.push([stack.pop(), i]);
-  }
-  return pairs.sort((a, b) => a[0] - b[0]);
-}
-
-/** 说话人：开引号前 14 字内 `X曰：“` 的 X；抽不到为 null */
-const SPEAKER_RE = /([\u4e00-\u9fa5]{1,4})(曰|云|问|答|喝|叱|骂)：“$/;
-
-/** 步骤 6：抽取 chunk 内的引语表（§5 quotes[]） */
-function extractQuotes(text) {
-  return quotePairs(text).map(([o, c], i) => {
-    const head = text.slice(Math.max(0, o - 14), o + 1);
-    const m = head.match(SPEAKER_RE);
-    return { qid: `Q${i + 1}`, text: text.slice(o + 1, c), offset: o + 1, speaker: m ? m[1] : null };
-  });
-}
-
-/** 步骤 4+5+6：按回组装（跨段）+ 尾部碎片软下限 + 可选重叠 + 引语表；记录 gid/partIdx/partN 供 I3 判据使用 */
-function buildChunks(docs, { target, quoteMax = 0, crossSeg = true, minTarget = 0, overlapSent = 0, closeQuoteCap = 0, isolateType = true, mergeNext = false }) {
+/** 步骤 4+5：按回组装（跨段）+ 尾部碎片软下限 + 可选重叠；记录 gid/partIdx/partN 供 I3 判据使用 */
+function buildChunks(docs, { target, crossSeg = true, minTarget = 0, overlapSent = 0, isolateType = true, mergeNext = false }) {
   const chunks = [];
   const emit = (items, type, gid, partIdx, partN) => {
     if (!items.length) return;
@@ -128,7 +80,7 @@ function buildChunks(docs, { target, quoteMax = 0, crossSeg = true, minTarget = 
     const idxs = docs.map((d, i) => (d.chapter === ch ? i : -1)).filter((i) => i >= 0);
     const groups = [];
     for (const i of idxs) {
-      const items = toUnits(docs[i].text, quoteMax).map((u) => ({ ...u, seg: i }));
+      const items = toUnits(docs[i].text).map((u) => ({ ...u, seg: i }));
       const last = groups[groups.length - 1];
       if (!isolateType) {
         if (last) last.items.push(...items);
@@ -140,7 +92,7 @@ function buildChunks(docs, { target, quoteMax = 0, crossSeg = true, minTarget = 
       else groups.push({ type: docs[i].type, items });
     }
     groups.forEach((g, gi) => {
-      const parts = packUnits(g.items, target, closeQuoteCap);
+      const parts = packUnits(g.items, target);
       parts.forEach((p, pi) => emit(p, g.type, `${ch}:${gi}`, pi, parts.length));
     });
   }
@@ -184,33 +136,7 @@ function buildChunks(docs, { target, quoteMax = 0, crossSeg = true, minTarget = 
       };
     }
   }
-  for (const c of chunks) c.quotes = extractQuotes(c.text);
   return chunks;
-}
-/** 引号是否不配对（含引号的文本） */
-const unpairedText = (t) => {
-  const o = (t.match(new RegExp(OPEN, 'g')) ?? []).length;
-  const c = (t.match(new RegExp(CLOSE, 'g')) ?? []).length;
-  return o !== c;
-};
-
-/** 注入侧引语完整度：每个查询 top3 片段中是否含未配平引语（§4.5 主判据） */
-function fragQuoteStat(units) {
-  const bi = buildIndex(units.map((u) => norm(u.text)));
-  let qAny = 0;
-  let fragTotal = 0;
-  let fragUnpaired = 0;
-  for (const [q] of CASES) {
-    const top = rankOf(bi, q).slice(0, 3);
-    let any = false;
-    for (const i of top) {
-      if (!/[\u201c\u201d]/.test(units[i].text)) continue;
-      fragTotal++;
-      if (unpairedText(units[i].text)) { fragUnpaired++; any = true; }
-    }
-    if (any) qAny++;
-  }
-  return { qAny, fragTotal, fragUnpaired };
 }
 
 /** I3 真口径：把每个切点分类为「句末标点」「源段边界」「切在句内」 */
@@ -238,38 +164,19 @@ function classifyCuts(chunks, docs) {
       else {
         out.chosen++;
         out.chosenChars[lastChar] = (out.chosenChars[lastChar] ?? 0) + 1;
-        if (!TERM.includes(lastChar) && lastChar !== CLOSE) out.chosenBad++;
+        if (!TERM.includes(lastChar)) out.chosenBad++;
       }
       if (off === stream.length) continue;
       if (sentEnds.has(off)) out.sent++;
       else if (segEnds.has(off)) {
         out.seg++;
-        if (!TERM.includes(lastChar) && lastChar !== CLOSE) {
+        if (!TERM.includes(lastChar)) {
           out.examples.push({ chapter: ch, from: c.firstSeg, to: c.lastSeg, len: c.text.length, tail: c.text.slice(-14) });
         }
       } else out.mid++;
     }
   }
   return out;
-}
-
-/** 答案引语可用性：分母=答案句位于源段成对引语内的用例；分子=命中块 quotes[] 能取到该引语（§4.5/§4.7） */
-function quoteAvailStat(units) {
-  const bi = buildIndex(units.map((u) => norm(u.text)));
-  let avail = 0;
-  for (const [q, re] of QUOTE_CASES) {
-    const order = rankOf(bi, q);
-    const hit = order.find((i) => re.test(units[i].text));
-    if (hit === undefined) continue;
-    const u = units[hit];
-    const m = re.exec(u.text);
-    const qs = u.quotes ?? quotePairs(u.text).map(([o, c]) => ({ text: u.text.slice(o + 1, c), offset: o + 1 }));
-    if (qs.some((x) => {
-      const at = u.text.indexOf(x.text, Math.max(0, x.offset - 1));
-      return at >= 0 && at <= m.index && m.index <= at + x.text.length;
-    })) avail++;
-  }
-  return { avail, total: QUOTE_CASES.length };
 }
 
 const fmtChars = (o) => Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, v]) => `「${k}」${v}`).join(' ');
@@ -354,12 +261,6 @@ const RAW = [
 const CASES = RAW.filter(([, re]) => origTexts.some((t) => re.test(t)));
 const N = CASES.length;
 const MAIN = CASES.findIndex(([q]) => q === MAIN_CASE);
-/** 答案句位于源段成对引语内的用例（§4.5/§4.7 的分母） */
-const QUOTE_CASES = CASES.filter(([, re]) => {
-  const d = docs.find((x) => re.test(x.text));
-  const m = re.exec(d.text);
-  return quotePairs(d.text).some(([o, c]) => o < m.index && m.index < c);
-});
 const pct = (arr, p) => {
   const a = [...arr].sort((x, y) => x - y);
   return a[Math.min(a.length - 1, Math.floor((a.length - 1) * p))];
@@ -408,14 +309,6 @@ function measure(label, units) {
     const r = orders[ci].findIndex((i) => re.test(units[i].text));
     return r < 0 ? -1 : r + 1;
   });
-  let quoted = 0;
-  let unpaired = 0;
-  for (const u of units) {
-    const o = (u.text.match(new RegExp(OPEN, 'g')) ?? []).length;
-    const c = (u.text.match(new RegExp(CLOSE, 'g')) ?? []).length;
-    if (o + c > 0) quoted++;
-    if (o !== c) unpaired++;
-  }
   const cov = (budget) => CASES.filter(([, re], ci) => {
     let used = 0;
     for (const i of orders[ci]) {
@@ -444,18 +337,18 @@ function measure(label, units) {
     hit1: ranks.filter((r) => r > 0 && r <= 1).length,
     hit3: ranks.filter((r) => r > 0 && r <= 3).length,
     hit5: ranks.filter((r) => r > 0 && r <= 5).length,
-    unpaired, quoted, cov750: cov(750), cov1000: cov(1000), dup,
+    cov750: cov(750), cov1000: cov(1000), dup,
     main: MAIN >= 0 ? ranks[MAIN] : -1,
     broken: CASES.filter(([, re]) => !units.some((u) => re.test(u.text))).length,
     crossSeg: units.filter((u) => u.segs && u.segs.length > 1).length,
   };
 }
 const HEAD = '配置'.padEnd(28) + 'chunk'.padEnd(7) + '均长'.padEnd(6) + '最短'.padEnd(6) + 'p90'.padEnd(6) + 'max'.padEnd(7)
-  + '引号断'.padEnd(9) + '@1'.padEnd(7) + '@3'.padEnd(7) + '@5'.padEnd(7)
+  + '@1'.padEnd(7) + '@3'.padEnd(7) + '@5'.padEnd(7)
   + '750覆盖'.padEnd(9) + '1000覆盖'.padEnd(10) + 'top5重复'.padEnd(10) + '主案例';
 const row = (m) =>
   m.label.padEnd(28) + String(m.n).padEnd(7) + String(m.avg).padEnd(6) + String(m.min).padEnd(6) + String(m.p90).padEnd(6) + String(m.max).padEnd(7)
-  + `${Math.round((m.unpaired / m.quoted) * 100)}%`.padEnd(9) + `${m.hit1}/${N}`.padEnd(7) + `${m.hit3}/${N}`.padEnd(7) + `${m.hit5}/${N}`.padEnd(7)
+  + `${m.hit1}/${N}`.padEnd(7) + `${m.hit3}/${N}`.padEnd(7) + `${m.hit5}/${N}`.padEnd(7)
   + `${m.cov750}/${N}`.padEnd(9) + `${m.cov1000}/${N}`.padEnd(10) + `${m.dup}/${N}`.padEnd(10)
   + `#${m.main < 0 ? 'miss' : m.main}`;
 
@@ -501,24 +394,8 @@ for (const minTarget of [0, 100, 150, 200]) {
   console.log(row(m).padEnd(136) + String(m.tiny));
 }
 
-console.log('\n=== 6 引语配平上限（目标 250 / 跨段 / 软下限 100 / 无重叠）===');
-console.log(HEAD);
-for (const quoteMax of [0, 200, 300, 500, Infinity]) {
-  const label = quoteMax === 0 ? '上限 0（不并句）' : quoteMax === Infinity ? '上限 不限（完全原子）' : `上限 ${quoteMax} 字`;
-  console.log(row(measure(label, buildChunks(docs, { target: 250, quoteMax, minTarget: 100 }))));
-}
-
-console.log('\n=== 6b 箱尾引语配平延伸（目标 250 / 跨段 / 软下限 100 / 无重叠）===');
-console.log(HEAD);
-console.log(row(measure('不延伸', buildChunks(docs, { target: 250, minTarget: 100 }))));
-for (const cap of [300, 400, 500]) {
-  console.log(row(measure(`延伸至 ${cap} 字`, buildChunks(docs, { target: 250, minTarget: 100, closeQuoteCap: cap }))));
-}
-
-const TYPE_LABEL_LOCAL = { narration: '叙述', verse: '诗词', comment: '评注' };
-
 // ===================== §7 推荐配置 =====================
-const RECOMMEND = { target: 250, quoteMax: 0, crossSeg: true, minTarget: 100, overlapSent: 0, closeQuoteCap: 400 };
+const RECOMMEND = { target: 250, crossSeg: true, minTarget: 100, overlapSent: 0 };
 const rec = measure('推荐', buildChunks(docs, RECOMMEND));
 const baseUnits = docs.map((d, i) => ({ text: d.text, segs: [i], chapter: d.chapter, title: d.title, firstSeg: d.segIndex, lastSeg: d.segIndex }));
 console.log('\n=== 7 推荐配置 vs 现状 ===');
@@ -532,64 +409,11 @@ for (const [k, a, b] of [
   ['召回 @5', `${baseline.hit5}/${N}`, `${rec.hit5}/${N}`],
   ['750 字注入预算覆盖', `${baseline.cov750}/${N}`, `${rec.cov750}/${N}`],
   ['1000 字注入预算覆盖', `${baseline.cov1000}/${N}`, `${rec.cov1000}/${N}`],
-  ['引号不配对占比（库级）', `${Math.round((baseline.unpaired / baseline.quoted) * 100)}%`, `${Math.round((rec.unpaired / rec.quoted) * 100)}%`],
-  ['注入侧含断引语查询（top3）', `${fragQuoteStat(baseUnits).qAny}/${N}`, `${fragQuoteStat(rec.units).qAny}/${N}`],
   ['答案句被切碎（天花板）', `${baseline.broken}/${N}`, `${rec.broken}/${N}`],
   ['top5 近重复', `${baseline.dup}/${N}`, `${rec.dup}/${N}`],
   ['跨段 chunk', '0', `${rec.crossSeg}（${Math.round((rec.crossSeg / rec.n) * 100)}%）`],
   ['主案例（第73回 段5）排名', `#${baseline.main}`, `#${rec.main}`],
 ]) console.log(String(k).padEnd(30) + String(a).padEnd(18) + String(b));
-
-// ===================== §7b 引语配平方式对比（§4.5）=====================
-console.log('\n=== 7b 引语配平方式对比（目标 250 / 跨段 / 软下限 100 / 无重叠）===');
-console.log('配置'.padEnd(16) + 'chunk'.padEnd(7) + '均长'.padEnd(6) + 'max'.padEnd(7)
-  + '引号断(库)'.padEnd(12) + '注入侧断引语'.padEnd(14) + '答案引语可用'.padEnd(14)
-  + '@1'.padEnd(7) + '@3'.padEnd(7) + '750覆盖'.padEnd(9) + '1000覆盖'.padEnd(10) + 'top5重复'.padEnd(10) + '主案例');
-{
-  const rows = [
-    ['现状（整段）', baseUnits],
-    ['不延伸', buildChunks(docs, { target: 250, minTarget: 100 })],
-    ['并句至 200 字', buildChunks(docs, { target: 250, quoteMax: 200, minTarget: 100 })],
-    ['并句至 300 字', buildChunks(docs, { target: 250, quoteMax: 300, minTarget: 100 })],
-    ['延伸至 400 字', buildChunks(docs, { target: 250, minTarget: 100, closeQuoteCap: 400 })],
-    ['延伸至 500 字', buildChunks(docs, { target: 250, minTarget: 100, closeQuoteCap: 500 })],
-  ];
-  for (const [label, units] of rows) {
-    const m = measure(label, units);
-    const st = fragQuoteStat(units);
-    const qa = quoteAvailStat(units);
-    const lens = units.map((u) => u.text.length);
-    console.log(label.padEnd(16) + String(units.length).padEnd(7) + String(Math.round(sum(lens) / lens.length)).padEnd(6)
-      + String(Math.max(...lens)).padEnd(7) + `${Math.round((m.unpaired / m.quoted) * 100)}%`.padEnd(12)
-      + `${st.qAny}/${N}`.padEnd(14) + `${qa.avail}/${qa.total}`.padEnd(14)
-      + `${m.hit1}/${N}`.padEnd(7) + `${m.hit3}/${N}`.padEnd(7)
-      + `${m.cov750}/${N}`.padEnd(9) + `${m.cov1000}/${N}`.padEnd(10)
-      + `${m.dup}/${N}`.padEnd(10) + `#${m.main}`);
-  }
-}
-
-// ===================== §7b2 引语配平上限对 chunk 长度的影响 =====================
-console.log('\n=== 7b2 配平上限对 chunk 长度的影响（I7 与注入可预期性）===');
-console.log('上限'.padEnd(10) + 'chunk'.padEnd(8) + '均长'.padEnd(6) + 'max'.padEnd(7) + '超400字块'.padEnd(11) + '超500字块'.padEnd(11) + '注入侧断引语');
-for (const cap of [400, 500, 600]) {
-  const cs = buildChunks(docs, { target: 250, minTarget: 100, closeQuoteCap: cap });
-  const lens = cs.map((c) => c.text.length);
-  const st = fragQuoteStat(cs);
-  console.log(`上限 ${cap}`.padEnd(10) + String(cs.length).padEnd(8) + String(Math.round(sum(lens) / lens.length)).padEnd(6)
-    + String(Math.max(...lens)).padEnd(7) + String(lens.filter((l) => l > 400).length).padEnd(11)
-    + String(lens.filter((l) => l > 500).length).padEnd(11) + `${st.qAny}/${N}`);
-}
-
-// ===================== §7c 跨段（开延伸 400 后对照）=====================
-console.log('\n=== 7c 跨段 vs 不跨段（均开引语延伸 400）===');
-console.log(HEAD + '  tiny');
-for (const [label, cs] of [
-  ['不跨段+延伸400', buildChunks(docs, { target: 250, crossSeg: false, minTarget: 100, closeQuoteCap: 400 })],
-  ['跨段+延伸400（终配）', buildChunks(docs, { target: 250, crossSeg: true, minTarget: 100, closeQuoteCap: 400 })],
-]) {
-  const m = measure(label, cs);
-  console.log(row(m).padEnd(136) + String(m.tiny));
-}
 
 // ===================== §7d verse 隔离 vs 不隔离（§4.6）=====================
 console.log('\n=== 7d verse 隔离 vs 不隔离（终配参数）===');
@@ -606,7 +430,7 @@ for (const [label, cs] of [
 }
 
 // ===================== §8 不变量校验 =====================
-console.log('\n=== 8 不变量校验（I1~I9）===');
+console.log('\n=== 8 不变量校验（I1~I8）===');
 const chunks = buildChunks(docs, RECOMMEND);
 let mismatch = 0;
 for (const ch of [...new Set(docs.map((d) => d.chapter))]) {
@@ -616,26 +440,22 @@ for (const ch of [...new Set(docs.map((d) => d.chapter))]) {
 }
 // I3 真口径：切点落在句末标点，或落在源段边界（源文本该处本无句末标点）
 const cut = classifyCuts(chunks, docs);
-// I9：quotes[] 覆盖 chunk 内全部成对引语
-let quoteMiss = 0;
-for (const c of chunks) if (c.quotes.length !== quotePairs(c.text).length) quoteMiss++;
 console.log(`  I1 同回 chunk 拼接 === 原文段拼接：${mismatch === 0 ? 'PASS' : `FAIL（${mismatch} 回）`}`);
 console.log(`  I2 chunk 跨回（应为 0）：${chunks.filter((c) => new Set(c.segs.map((s) => docs[s].chapter)).size > 1).length}`);
 console.log(`  I3 切点落在句末标点或源段边界（应为 0 违规）：句末标点 ${cut.sent}｜源段边界 ${cut.seg}｜切在句内 ${cut.mid}`);
 console.log(`  I4 答案句被切碎（应为 0）：${rec.broken}`);
-console.log(`  I5 chunk 元数据完整性（chapter/title/segFrom/segTo/type/quoteBalanced）：${chunks.every((c) => c.chapter && c.title && c.firstSeg !== undefined && c.lastSeg !== undefined && c.type) ? 'PASS' : 'FAIL'}`);
+console.log(`  I5 chunk 元数据完整性（chapter/title/segFrom/segTo/type）：${chunks.every((c) => c.chapter && c.title && c.firstSeg !== undefined && c.lastSeg !== undefined && c.type) ? 'PASS' : 'FAIL'}`);
 console.log(`  I6 文本内含元数据（应为 0）：${chunks.filter((c) => /【出处】|第\d+回|段\d+/.test(c.text)).length}`);
-console.log(`  I7 chunk 超配平上限 400 字（应为 0）：${chunks.filter((c) => c.text.length > 400).length}`);
+console.log(`  I7 chunk 超硬上限 400 字（应为 0）：${chunks.filter((c) => c.text.length > 400).length}`);
 console.log(`  I8 长度 < 80 字的 chunk：${rec.tiny}（占 ${(rec.tiny / chunks.length * 100).toFixed(1)}%，成因见 §10，接受）`);
-console.log(`  I9 quotes[] 覆盖 chunk 内全部成对引语（应为 0 漏抽）：${quoteMiss}`);
-console.log(`  （参考）chunk 超目标 250 字：${chunks.filter((c) => c.text.length > 250).length} / ${chunks.length}（延伸所致，受 I7 约束）`);
+console.log(`  （参考）chunk 超目标 250 字：${chunks.filter((c) => c.text.length > 250).length} / ${chunks.length}`);
 
 // ===================== §9 切点分类（I3 真口径）=====================
 console.log('\n=== 9 切点分类（I3 真口径）===');
 console.log(`  段/组末尾强制边界：${cut.forced}｜组内主动切点：${cut.chosen}`);
 console.log(`  强制边界末字：${fmtChars(cut.forcedChars)}`);
 console.log(`  主动切点末字：${fmtChars(cut.chosenChars)}`);
-console.log(`  主动切点中「既非句末标点也非收引号」（应为 0）：${cut.chosenBad}`);
+console.log(`  主动切点中「非句末标点」（应为 0）：${cut.chosenBad}`);
 console.log('  非句末标点的强制边界（源段本身如此，非算法切句内）：');
 for (const b of cut.examples) console.log(`    第${b.chapter}回 段${b.from}-${b.to} 长${b.len} 尾「${b.tail}」`);
 
@@ -687,66 +507,3 @@ for (const c of chunks) {
 }
 console.log(`  chunk（终配/隔离）：verse 类 ${vPure + vFused + vNone} 个｜纯诗 ${vPure}｜叙述+诗融合 ${vFused}｜无标记 ${vNone}`);
 
-// ===================== §12 引语表规模与输出 token 账 =====================
-console.log('\n=== 12 引语表规模与输出 token 账（§6.2）===');
-const allPairs = docs.flatMap((d) => quotePairs(d.text));
-const qLens = allPairs.map(([o, c]) => c - o - 1).filter((l) => l > 0);
-console.log(`  全库成对引语 ${qLens.length} 条｜本体合计 ${sum(qLens)} 字｜均 ${Math.round(sum(qLens) / qLens.length)}｜p50 ${pct(qLens, 0.5)}｜p90 ${pct(qLens, 0.9)}｜p99 ${pct(qLens, 0.99)}｜max ${Math.max(...qLens)}`);
-const spkOk = docs.flatMap((d) => quotePairs(d.text).map(([o]) => d.text.slice(Math.max(0, o - 14), o + 1))).filter((h) => SPEAKER_RE.test(h)).length;
-console.log(`  speaker 可抽取：${spkOk}/${allPairs.length}（${Math.round((spkOk / allPairs.length) * 100)}%）`);
-console.log(`  语料 JSON 增量估算：约 ${Math.round((sum(qLens) * 3 + allPairs.length * 30) / 1024)} KB（一次性构建产物）`);
-const tokRows = [];
-for (const [, re] of CASES) {
-  const d = docs.find((x) => re.test(x.text));
-  const m = re.exec(d.text);
-  const enc = quotePairs(d.text).find(([o, c]) => o < m.index && m.index < c);
-  if (!enc) continue;
-  const qlen = enc[1] - enc[0] - 1;
-  const suffix = `（出处：第${d.chapter}回 ${d.title}）`.length;
-  tokRows.push({ qlen, suffix, cur: qlen + 2 + suffix });
-}
-const curLens = tokRows.map((r) => r.cur);
-const ql = tokRows.map((r) => r.qlen);
-console.log(`  分母：24 例中答案句落在成对引语内 = ${tokRows.length}/${N}`);
-console.log(`  引语本体：均 ${Math.round(sum(ql) / ql.length)} 字｜p50 ${pct(ql, 0.5)}｜p90 ${pct(ql, 0.9)}｜max ${Math.max(...ql)}`);
-console.log(`  出处后缀：均 ${Math.round(sum(tokRows.map((r) => r.suffix)) / tokRows.length)} 字`);
-console.log(`  现状单条引用须吐：均 ${Math.round(sum(curLens) / curLens.length)} 字｜p50 ${pct(curLens, 0.5)}｜p90 ${pct(curLens, 0.9)}｜max ${Math.max(...curLens)}`);
-console.log(`  新方案只吐指针（如「[Q2]」5 字）：单条省 ${Math.round(sum(curLens) / curLens.length) - 5} 字（${Math.round((1 - 5 / (sum(curLens) / curLens.length)) * 100)}%），最长一条省 ${Math.max(...curLens) - 5} 字`);
-const hdrLens = docs.map((d) => `【出处】第${d.chapter}回 ${d.title} · 段${d.segIndex}（${TYPE_LABEL_LOCAL[d.type] ?? d.type}）`.length);
-console.log(`  现状出处头（formatDoc）：均 ${Math.round(sum(hdrLens) / hdrLens.length)} 字｜p50 ${pct(hdrLens, 0.5)}｜max ${Math.max(...hdrLens)}（top3 注入省约 ${Math.round(sum(hdrLens) / hdrLens.length) * 3} 字）`);
-
-// ===================== §13 父子分块（top3 口径）=====================
-console.log('\n=== 13 父子分块（§4.7，口径：答案句落在引语内的用例）===');
-const quoteCases = CASES.filter(([, re]) => {
-  const d = docs.find((x) => re.test(x.text));
-  const m = re.exec(d.text);
-  return quotePairs(d.text).some(([o, c]) => o < m.index && m.index < c);
-});
-const enclosing = (t, i) => quotePairs(t).find(([o, c]) => o < i && i < c);
-const parentStat = (units, segsOf) => {
-  const bi = buildIndex(units.map((u) => norm(u.text)));
-  const orders = quoteCases.map(([q]) => rankOf(bi, q));
-  let childOk = 0, parentOk = 0, childChars = 0, parentChars = 0;
-  quoteCases.forEach(([, re], ci) => {
-    const top = orders[ci].slice(0, 3);
-    const hit = top.find((i) => re.test(units[i].text));
-    childChars += sum(top.map((i) => units[i].text.length));
-    if (hit !== undefined) {
-      const t = units[hit].text;
-      if (enclosing(t, re.exec(t).index)) childOk++;
-    }
-    const segIdx = new Set();
-    for (const i of top) for (const s of segsOf(i)) segIdx.add(s);
-    const parentText = [...segIdx].map((s) => docs[s].text).join('');
-    const pm = re.exec(parentText);
-    if (pm && enclosing(parentText, pm.index)) parentOk++;
-    parentChars += parentText.length;
-  });
-  return { childOk, parentOk, childChars: Math.round(childChars / quoteCases.length), parentChars: Math.round(parentChars / quoteCases.length) };
-};
-for (const [label, st] of [
-  ['现状（段级）', parentStat(baseUnits, (i) => [i])],
-  ['推荐（chunk 250）', parentStat(rec.units, (i) => rec.units[i].segs)],
-]) {
-  console.log(`  ${label}：top3 子级含完整答案引语 ${st.childOk}/${quoteCases.length}｜top3 父级（源段）含 ${st.parentOk}/${quoteCases.length}｜子级注入 ${st.childChars} 字｜父级注入 ${st.parentChars} 字`);
-}

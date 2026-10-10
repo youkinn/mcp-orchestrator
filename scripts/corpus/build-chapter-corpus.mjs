@@ -59,8 +59,8 @@ function splitParagraph(text) {
     return [{ text, type: COMMENTARY_MARK.test(text) ? 'commentary' : 'narration' }];
   }
   const start = match.index;
-  const quoteEnd = Math.max(text.indexOf('”', start), text.indexOf('」', start));
-  const end = quoteEnd === -1 ? text.length : quoteEnd + 1;
+  const verseEnd = Math.max(text.indexOf('”', start), text.indexOf('」', start));
+  const end = verseEnd === -1 ? text.length : verseEnd + 1;
   const before = text.slice(0, start).trim();
   const verse = text.slice(start, end).trim();
   const after = text.slice(end).trim();

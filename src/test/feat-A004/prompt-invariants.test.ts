@@ -30,7 +30,6 @@ test("① 分类提示词：§2.3 原文照录，含 1/2/99 编号与兜底取�
 test("② sango-novel 域提示：§2.4 原文照录，含指针 / 片段 / 兜底条款，不指示调用工具", () => {
   assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /当前为「三国演义原著解读」场景/);
   assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /不要再调用检索工具/);
-  assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /\[Qn\]/);
   assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /\[片段N\]/);
   assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /「演义中未涉及」/);
   assert.doesNotMatch(SANGO_NOVEL_DOMAIN_PROMPT, /sango_novel_search/);
