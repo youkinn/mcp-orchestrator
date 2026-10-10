@@ -735,9 +735,9 @@ test("⑳.6 结构门·bug-00044 低重叠结论复核参考：合并后 bestFra
   assert.equal(low.length, 1, "合并后仅结论句 1 个低重叠候选（指针行已并入，不再单独成句）");
   assert.deepEqual(low[0].pointers, ["片段7"], "候选带所引片段指针");
   assert.ok(low[0].bestOverlap < SENTENCE_OVERLAP_THRESHOLD, "与所引片段仍低重叠 → 走边界语义复核路径");
-  assert.equal(
-    low[0].bestFragmentText,
-    "张角传檄四方，旬日之间，天下响应，兵至数十万。",
+  assert.deepEqual(
+    low[0].referenceFragments.map((fragment) => fragment.text),
+    ["张角传檄四方，旬日之间，天下响应，兵至数十万。"],
     "复核参考取结论所引片段（片段7）原文，而非字面重叠最高的无关片段（片段4）"
   );
 });
@@ -833,10 +833,10 @@ test("㉑.3 bug-00004 低重叠复核候选 bestSourceLine：回号类问句复�
   ]);
   const low = findLowOverlapSentences("刘备第一次出场在第一回。\n\n[片段1]", view);
   assert.equal(low.length, 1, "回号类结论句与片段正文低重叠 → 进复核候选");
-  assert.equal(
-    low[0].bestSourceLine,
-    "〔出处1〕第1回 宴桃园豪杰三结义　斩黄巾英雄首立功",
-    "候选携带最佳片段的结构化出处行，复核参考 = 片段原文 + 出处行"
+  assert.deepEqual(
+    low[0].referenceFragments.map((fragment) => fragment.sourceLine),
+    ["〔出处1〕第1回 宴桃园豪杰三结义　斩黄巾英雄首立功"],
+    "候选携带所引片段的结构化出处行，复核参考 = 片段原文 + 出处行"
   );
 });
 
@@ -851,13 +851,52 @@ test("㉛.7 bug-00004 未闭环·extractChapterNumber：回号提取与归一（
   assert.equal(extractChapterNumber(""), null, "空串 → null");
 });
 
-test("㉛.8 bug-00004 未闭环·chapterConsistencyVerdict：结论回号=出处行回号 → supported；不一致 → unsupported；结论无回号 → null", () => {
+test("㉛.8 bug-00004 未闭环·chapterConsistencyVerdict（bug-00057 多片段）：结论回号与所引任一片段出处行一致 → supported；都取不到回号 → null", () => {
   const source3 = "〔出处1〕第3回 议温明董卓叱丁原　馈金珠李肃说吕布";
   const source29 = "〔出处1〕第29回 小霸王怒斩于吉　碧眼儿坐领江东";
-  assert.equal(chapterConsistencyVerdict("吕布最早登场于第3回。", source3), "supported", "回号一致 → supported");
-  assert.equal(chapterConsistencyVerdict("吕布最早登场于第三回。", source3), "supported", "中文数字归一后一致 → supported");
-  assert.equal(chapterConsistencyVerdict("鲁肃初次登场是在第43回。", source29), "unsupported", "回号不一致（第43 vs 第29）→ unsupported");
-  assert.equal(chapterConsistencyVerdict("吕布在议温明董卓叱丁原一回登场。", source3), null, "结论无第N回（只写回目名）→ null（交复核 LLM）");
-  assert.equal(chapterConsistencyVerdict("吕布最早登场于第3回。", null), null, "无出处行 → null");
-  assert.equal(chapterConsistencyVerdict("", source3), null, "空结论 → null");
+  const source31 = "〔出处2〕第31回 曹操大宴铜雀台　孔明三气周公瑾";
+  assert.equal(chapterConsistencyVerdict("吕布最早登场于第3回。", [source3]), "supported", "回号一致 → supported");
+  assert.equal(chapterConsistencyVerdict("吕布最早登场于第三回。", [source3]), "supported", "中文数字归一后一致 → supported");
+  assert.equal(chapterConsistencyVerdict("鲁肃初次登场是在第43回。", [source29]), "unsupported", "回号不一致（第43 vs 第29）→ unsupported");
+  assert.equal(chapterConsistencyVerdict("吕布在议温明董卓叱丁原一回登场。", [source3]), null, "结论无第N回（只写回目名）→ null（交复核 LLM）");
+  assert.equal(chapterConsistencyVerdict("吕布最早登场于第3回。", []), null, "无出处行 → null");
+  assert.equal(chapterConsistencyVerdict("吕布最早登场于第3回。", [null]), null, "出处行取不到回号 → null");
+  assert.equal(chapterConsistencyVerdict("", [source3]), null, "空结论 → null");
+  assert.equal(chapterConsistencyVerdict("吕布最早登场于第3回。", [source29, source3]), "supported", "bug-00057：任一所引片段回号一致 → supported");
+  assert.equal(chapterConsistencyVerdict("吕布最早登场于第3回。", [source29, source31]), "unsupported", "所有所引片段回号都不一致 → unsupported");
+});
+test("㊲ bug-00057 结构门·复核参考片段集：带指针句取所引全部合法片段（原文 + 出处行），所引指针全不可解析 → 参考为空", () => {
+  const view = buildInjectionView([
+    {
+      text: "何进遣人召外兵入京，欲尽诛宦官。",
+      source: "sanguo-yanyi",
+      chapter: 3,
+      title: "议温明董卓叱丁原　馈金珠李肃说吕布",
+    },
+    {
+      text: "张让等伏兵于嘉德殿，何进入宫被围，遂遇害。",
+      source: "sanguo-yanyi",
+      chapter: 3,
+      title: "议温明董卓叱丁原　馈金珠李肃说吕布",
+    },
+  ]);
+  const low = findLowOverlapSentences("何进欲诛宦官而未成，反遭宦官杀害。[片段1][片段2]", view);
+  assert.equal(low.length, 1, "跨段合并叙述结论句与所引两片段各自低重叠 → 进复核候选");
+  assert.deepEqual(
+    low[0].referenceFragments.map((fragment) => fragment.pointer),
+    ["片段1", "片段2"],
+    "复核参考 = 结论句所引全部合法片段（按指针顺序去重）"
+  );
+  assert.deepEqual(
+    low[0].referenceFragments.map((fragment) => fragment.sourceLine),
+    [
+      "〔出处1〕第3回 议温明董卓叱丁原　馈金珠李肃说吕布",
+      "〔出处2〕第3回 议温明董卓叱丁原　馈金珠李肃说吕布",
+    ],
+    "逐片段携带结构化出处行（回号类判据取用）"
+  );
+  assert.ok(low[0].bestOverlap < SENTENCE_OVERLAP_THRESHOLD, "bestOverlap 仍为句-片段重叠最大值（触发条件不变）");
+  const orphan = findLowOverlapSentences("某句断言。[片段9]", view);
+  assert.equal(orphan.length, 1, "所引指针不可解析仍是低重叠候选");
+  assert.deepEqual(orphan[0].referenceFragments, [], "所引指针全不可解析 → 参考片段集为空（沿用 unsupported 且不调 LLM）");
 });

@@ -503,6 +503,16 @@ export function splitAnswerSentences(answer: string): Array<{
   return sentences;
 }
 
+/** 复核参考片段（bug-00057）：结论句所引单片段的原文 + 结构化出处行（〔出处N〕第N回 回目名）。 */
+export interface LowOverlapFragment {
+  /** 片段指针（如 片段5） */
+  pointer: string;
+  /** 片段原文 */
+  text: string;
+  /** 该片段的结构化出处行（回号类判据取用）；章节 / 回目缺失时为 null */
+  sourceLine: string | null;
+}
+
 /** 低重叠叙述句（边界语义复核候选）：带 [片段N] 或与注入片段低重叠的叙述句，重叠率 < 阈值。 */
 export interface LowOverlapSentence {
   /** 整句原始文本（含 [片段N] 指针） */
@@ -511,11 +521,10 @@ export interface LowOverlapSentence {
   pointers: string[];
   /** 候选片段重叠率的最大值（仍 < SENTENCE_OVERLAP_THRESHOLD；无注入片段时为 0） */
   bestOverlap: number;
-  /** 重叠率最高片段原文（复核参考文本；无注入片段时为 null） */
-  bestFragmentText: string | null;
-  /** 重叠率最高片段的结构化出处行（〔出处N〕第N回 回目名；无片段或出处缺失时为 null）。
-   * bug-00004 方案 C：回号类问句复核时把该行并入参考，避免「片段原文无回号 → 误判 unsupported」。 */
-  bestSourceLine: string | null;
+  /** 复核参考片段集（bug-00057）：带指针句 = 该句所引全部可解析片段（按指针首现顺序去重）；
+   * 无指针句 = 全注入片段中重叠率最高的那一个；所引指针全不可解析 / 无注入片段时为 []。
+   * 复核 LLM 以整组片段为准判定支撑，回号类判据取各片段出处行。 */
+  referenceFragments: LowOverlapFragment[];
 }
 
 /** 结构门第三条·低重叠句挑选（纯函数）：返回需要边界语义复核的叙述句。
@@ -556,37 +565,51 @@ export function findLowOverlapSentences(
         }
       }
       if (bestOverlap < SENTENCE_OVERLAP_THRESHOLD) {
+        // bug-00057 契约 4：无指针叙述句口径不变——全注入片段取重叠最高那一个作参考
         low.push({
           text: sentence.text,
           pointers: [],
           bestOverlap,
-          bestFragmentText: bestFragment?.text ?? null,
-          bestSourceLine:
+          referenceFragments:
             bestFragmentKey && bestFragment
-              ? buildSourceLine(
-                  bestFragmentKey,
-                  bestFragment.chapter,
-                  bestFragment.title
-                )
-              : null,
+              ? [
+                  {
+                    pointer: bestFragmentKey,
+                    text: bestFragment.text,
+                    sourceLine: buildSourceLine(
+                      bestFragmentKey,
+                      bestFragment.chapter,
+                      bestFragment.title
+                    ),
+                  },
+                ]
+              : [],
         });
       }
       continue;
     }
+    // bug-00057 契约 1：带指针句的复核参考 = 该句所引全部合法片段（原文 + 出处行），
+    // 不再只取字面重叠最高的单个片段；bestOverlap 仍取句-片段重叠最大值（触发条件不变）。
     let bestOverlap = 0;
-    let bestFragmentKey: string | undefined;
-    let bestFragment: RenderedFragment | undefined;
+    const referenceFragments: LowOverlapFragment[] = [];
+    const seenPointers = new Set<string>();
     for (const pointer of sentence.narrativePointers) {
+      if (seenPointers.has(pointer)) {
+        continue;
+      }
       const fragment = view.fragments.get(pointer);
       if (!fragment) {
         continue;
       }
+      seenPointers.add(pointer);
+      referenceFragments.push({
+        pointer,
+        text: fragment.text,
+        sourceLine: buildSourceLine(pointer, fragment.chapter, fragment.title),
+      });
       const overlap = sentenceFragmentOverlap(sentence.text, fragment.text);
-      // 首个可解析片段即作为复核参考（零重叠也应给到片段文本），重叠更高才替换
-      if (bestFragment === undefined || overlap > bestOverlap) {
+      if (overlap > bestOverlap) {
         bestOverlap = overlap;
-        bestFragment = fragment;
-        bestFragmentKey = pointer;
       }
     }
     if (bestOverlap < SENTENCE_OVERLAP_THRESHOLD) {
@@ -594,15 +617,7 @@ export function findLowOverlapSentences(
         text: sentence.text,
         pointers: sentence.narrativePointers,
         bestOverlap,
-        bestFragmentText: bestFragment?.text ?? null,
-        bestSourceLine:
-          bestFragmentKey && bestFragment
-            ? buildSourceLine(
-                bestFragmentKey,
-                bestFragment.chapter,
-                bestFragment.title
-              )
-            : null,
+        referenceFragments,
       });
     }
   }
@@ -645,9 +660,9 @@ export function findChapterLeakSentences(
   return leaked;
 }
 
-/** 回号一致性核对（bug-00004 未闭环，负责人 2026-09-29 拍板）：
- * 回号/回目类问句复核判据显式放行——结论回号与所引〔出处N〕结构化出处行回号一致 → supported
- * （「首次/最初/最早」是问句自带口径，不要求单段原文证明极值）。确定性核对 0 LLM；
+/** 回号一致性核对（bug-00004 未闭环，负责人 2026-09-29 拍板；bug-00057 扩展为多片段）：
+ * 回号/回目类问句复核判据显式放行——结论回号与所引任一片段〔出处N〕结构化出处行回号一致 → supported
+ * （「首次/最初/最早」是问句口径，不要求单段证明极值）。确定性核对 0 LLM；
  * 结论句无回号（如只写回目名）→ 交复核 LLM（prompt 已补判据 + 示例兜底）。
  * 中文数字 / 阿拉伯数字 / 全角数字统一归一到 int 比较。 */
 
@@ -690,21 +705,24 @@ export function extractChapterNumber(text: string): number | null {
   return chineseNumberToInt(raw);
 }
 
-/** 回号一致性判据：结论回号 == 〔出处N〕行回号 → "supported"；两者都可提取但不相等 → "unsupported"；
- * 任一侧无回号（如结论只写回目名）→ null（交复核 LLM 兜底）。 */
+/** 回号一致性判据（bug-00057 扩展为多片段）：结论回号与所引任一片段〔出处N〕行回号一致 → "supported"；
+ * 结论回号与所有出处行回号都不一致（且至少一行可取到回号）→ "unsupported"；
+ * 结论无回号 / 所有出处行都取不到回号（如结论只写回目名）→ null（交复核 LLM 兜底）。 */
 export function chapterConsistencyVerdict(
   sentence: string,
-  sourceLine: string | null
+  sourceLines: ReadonlyArray<string | null>
 ): "supported" | "unsupported" | null {
-  if (!sourceLine) {
-    return null;
-  }
   const sentenceChapter = extractChapterNumber(sentence);
-  const sourceChapter = extractChapterNumber(sourceLine);
-  if (sentenceChapter === null || sourceChapter === null) {
+  if (sentenceChapter === null) {
     return null;
   }
-  return sentenceChapter === sourceChapter ? "supported" : "unsupported";
+  const sourceChapters = sourceLines
+    .map((line) => (line ? extractChapterNumber(line) : null))
+    .filter((chapter): chapter is number => chapter !== null);
+  if (sourceChapters.length === 0) {
+    return null;
+  }
+  return sourceChapters.includes(sentenceChapter) ? "supported" : "unsupported";
 }
 
 /** 结构门第三条·字面裁剪（零 LLM 兼容口径，保留给纯函数用例 / 复核不可用时的保守回落）：

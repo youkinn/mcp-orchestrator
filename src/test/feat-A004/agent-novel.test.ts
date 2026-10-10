@@ -1338,3 +1338,185 @@ test("㉛.6 bug-00004 未闭环兜底·结论无回号：回号类问句但结�
   assert.ok(reviewUserContent.includes("〔出处1〕第3回 议温明董卓叱丁原　馈金珠李肃说吕布"), "复核输入仍含结构化出处行供核对");
   assert.equal(checkCallCount, 1, "结论无回号 → 确定性核对回落，触发一次复核 LLM（预算不变）");
 });
+// ===== bug-00057：边界复核参考由「单片段」改为「结论句所引全部片段」=====
+
+test("㊳ 单轮·边界复核·正例 bug-00057：跨段合并叙述结论句所引两片段整体支撑 → supported 放行（复刻 trace 54fc21f0 / b9c48afa 的结论句 + 所引片段结构）", async () => {
+  const entries = [
+    { id: "sanguo-yanyi:0003:c0010", text: "何进遣人召外兵入京，欲尽诛宦官。", chapter: 3, title: "议温明董卓叱丁原　馈金珠李肃说吕布", type: "narration" },
+    { id: "sanguo-yanyi:0003:c0013", text: "张让等伏兵于嘉德殿，何进入宫被围，遂遇害。", chapter: 3, title: "议温明董卓叱丁原　馈金珠李肃说吕布", type: "narration" },
+  ];
+  let modelCallCount = 0;
+  let checkCallCount = 0;
+  let reviewContent = "";
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      reviewContent = String(messages[1]?.content ?? "");
+      return textResponse("supported"); // 两片段合起来支撑「谋诛宦官未成、反被杀」→ 放行
+    }
+    return textResponse("何进欲诛宦官而未成，反遭宦官杀害。[片段1][片段2]");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "何进谋诛宦官未成反被杀",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("何进谋诛宦官结果如何", "sango-novel");
+  assert.ok(data.answer.includes("何进欲诛宦官而未成"), "所引片段整体支撑 → supported 放行整句，不得误裁");
+  assert.equal(data.citations.length, 2, "所引两片段均渲染为 citations");
+  assert.ok(reviewContent.includes("[片段1]") && reviewContent.includes("[片段2]"), "复核输入含结论句所引全部片段原文");
+  assert.ok(
+    reviewContent.includes("〔出处1〕第3回 议温明董卓叱丁原　馈金珠李肃说吕布") &&
+      reviewContent.includes("〔出处2〕第3回 议温明董卓叱丁原　馈金珠李肃说吕布"),
+    "复核输入逐片段给出结构化出处行（回号类判据用）"
+  );
+  assert.equal(checkCallCount, 1, "恰一次边界复核（单请求复核预算=1 不变）");
+  assert.equal(modelCallCount, 2, "生成轮 + 边界语义复核各一次（无新增 LLM 调用）");
+});
+
+test("㊴ 单轮·边界复核·负例 bug-00057：结论断言不在任一所引片段 → 看全两片段仍 unsupported → 裁剪拒答（判据否定侧）", async () => {
+  const entries = [
+    { id: "sanguo-yanyi:0003:c0010", text: "何进遣人召外兵入京，欲尽诛宦官。", chapter: 3, title: "议温明董卓叱丁原　馈金珠李肃说吕布", type: "narration" },
+    { id: "sanguo-yanyi:0003:c0013", text: "张让等伏兵于嘉德殿，何进入宫被围，遂遇害。", chapter: 3, title: "议温明董卓叱丁原　馈金珠李肃说吕布", type: "narration" },
+  ];
+  let modelCallCount = 0;
+  let checkCallCount = 0;
+  let reviewContent = "";
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      reviewContent = String(messages[1]?.content ?? "");
+      return textResponse("unsupported"); // 「登基称帝」两片段均无载 → 判不支撑
+    }
+    return textResponse("何进登基称帝，改国号为汉。[片段1][片段2]");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "何进称帝",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("何进后来称帝了吗", "sango-novel");
+  assert.equal(data.answer, "演义中未涉及", "待裁断言两片段都不支撑 → unsupported → 裁剪 → 无留存拒答");
+  assert.deepEqual(data.citations, [], "拒答清空 citations");
+  assert.ok(reviewContent.includes("[片段1]") && reviewContent.includes("[片段2]"), "复核输入给出全部所引片段（仍判 unsupported）");
+  assert.equal(checkCallCount, 1, "恰一次边界复核（预算不变）");
+  assert.equal(modelCallCount, 2, "生成轮 + 边界语义复核各一次");
+});
+
+test("㊵ 单轮·边界复核 bug-00057：单指针句行为不变——复核输入仍只给该句所引的那一个片段", async () => {
+  const entries = [
+    { id: "sanguo-yanyi:0003:c0010", text: "何进遣人召外兵入京，欲尽诛宦官。", chapter: 3, title: "议温明董卓叱丁原　馈金珠李肃说吕布", type: "narration" },
+    { id: "sanguo-yanyi:0003:c0013", text: "张让等伏兵于嘉德殿，何进入宫被围，遂遇害。", chapter: 3, title: "议温明董卓叱丁原　馈金珠李肃说吕布", type: "narration" },
+  ];
+  let checkCallCount = 0;
+  let modelCallCount = 0;
+  let reviewContent = "";
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      reviewContent = String(messages[1]?.content ?? "");
+      return textResponse("supported");
+    }
+    return textResponse("宦者设伏，事主入宫即遭围杀。[片段2]");
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "入宫遇害",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("有人入宫后被围杀是怎么回事", "sango-novel");
+  assert.ok(data.answer.includes("宦者设伏"), "单指针改述结论句 supported 放行");
+  assert.equal(data.citations.length, 1, "只渲染所引片段2");
+  assert.ok(reviewContent.includes("[片段2]"), "复核输入含所引片段2");
+  assert.ok(!reviewContent.includes("[片段1]"), "未引用的片段1不进复核参考（单指针口径不变）");
+  assert.equal(checkCallCount, 1, "恰一次边界复核");
+  assert.equal(modelCallCount, 2, "生成轮 + 边界语义复核各一次");
+});
+
+test("㊶ 单轮·边界复核 bug-00057：无指针叙述句行为不变——全注入片段取最高重叠那一个作参考", async () => {
+  const entries = [
+    { id: "sanguo-yanyi:0073:c0008", text: "权遣使至荆州，为其子求娶关羽之女。关公大怒，遂不允婚。", chapter: 73, title: "玄德进位汉中王　云长攻拔襄阳郡", type: "narration" },
+    { id: "sanguo-yanyi:0067:c0002", text: "张辽守合肥，与孙权相持，久战不决。", chapter: 67, title: "曹操平定汉中地　张辽威震逍遥津", type: "narration" },
+  ];
+  let checkCallCount = 0;
+  let modelCallCount = 0;
+  let reviewContent = "";
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      reviewContent = String(messages[1]?.content ?? "");
+      return textResponse("supported");
+    }
+    return textResponse("关羽断然回绝了结亲之请。\n\n[片段1] 权遣使至荆州，为其子求娶关羽之女。关公大怒，遂不允婚。"); // 无指针结论句 + 引用行（bug-00037 形态）
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "关羽拒绝结亲",
+    modelCaller,
+  });
+  const data = await agent.processQueryData("孙权为子求娶关羽之女，结果如何", "sango-novel");
+  assert.ok(data.answer.includes("关羽断然回绝"), "无指针改述结论句 supported 放行");
+  assert.equal(data.citations.length, 1, "只渲染最高重叠片段（片段1）");
+  assert.equal((reviewContent.match(/〔出处/g) ?? []).length, 1, "无指针句只给一个参考片段（口径不变）");
+  assert.ok(reviewContent.includes("〔出处1〕第73回 玄德进位汉中王　云长攻拔襄阳郡"), "参考为最高重叠的片段1");
+  assert.equal(checkCallCount, 1, "恰一次边界复核");
+  assert.equal(modelCallCount, 2, "生成轮 + 边界语义复核各一次");
+});
+
+test("㊷ 单轮·边界复核 bug-00057：所引指针全非法 → 不进边界复核候选（复核 LLM 0 次）", async () => {
+  const entries = [
+    { id: "sanguo-yanyi:0003:c0010", text: "何进遣人召外兵入京，欲尽诛宦官。", chapter: 3, title: "议温明董卓叱丁原　馈金珠李肃说吕布", type: "narration" },
+  ];
+  let checkCallCount = 0;
+  let modelCallCount = 0;
+  const modelCaller = async (messages: any[]): Promise<ModelResponse> => {
+    modelCallCount += 1;
+    if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+      checkCallCount += 1;
+      return textResponse("supported");
+    }
+    return textResponse("何进诛宦未成。[片段9]"); // 片段9 不在注入集合 → 指针非法
+  };
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () => ({
+        content: [{ type: "text", text: JSON.stringify(entries) }],
+      }),
+    },
+    fallbackConcluder: async () => "何进诛宦未成",
+    modelCaller,
+  });
+  await agent.processQueryData("何进诛宦结果", "sango-novel");
+  assert.equal(checkCallCount, 0, "指针非法 → 不进边界复核候选 → 复核 LLM 0 次（参考片段为空的口径见 citation ㊲）");
+  assert.equal(modelCallCount, 1, "仅生成轮一次模型调用；兜底走注入的 fallbackConcluder，不掺复核轮");
+});

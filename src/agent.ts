@@ -39,6 +39,7 @@ import {
   type Citation,
   type DraftbenchDiff,
   type InjectionView,
+  type LowOverlapFragment,
   type RecallFragment,
 } from "./citation.js";
 import { hasChapterFocus } from "./cache.js";
@@ -258,17 +259,18 @@ const CITATION_FALLBACK_CONCLUSION_PROMPT =
 // findChapterLeakSentences 确定性裁剪兜底，本判据不放宽）。
 export const NOVEL_BOUNDARY_CHECK_PROMPT = [
   "你是《三国演义》原著引用的边界审查员。",
-  "给定：用户问题、模型结论句、片段原文。结论句中的 [片段N] 是服务端编号标记，不属于正文。",
-  "片段原文末尾的〔出处N〕行（如〔出处1〕第73回 玄德进位汉中王　云长攻拔襄阳郡）是服务端注入的结构化出处行，不是正文；正文未出现回号不代表结论不受支撑。",
-  "回号/回目类判据：结论主体是回号/回目（问句含「第几回 / 哪一回 / 第几回登场」等回号类问法）时，结论回号与所引〔出处N〕行回号一致 → supported；结论回号与〔出处N〕行回号不一致（如结论写第43回、〔出处1〕行是第29回）→ unsupported。",
-  "「首次 / 最初 / 最早 / 初次」等极值问法是用户问句自带口径，不要求单段原文证明极值；只要结论回号与所引〔出处N〕行回号一致即 supported。",
+  "给定：用户问题、模型结论句、结论句所引的片段组。片段组逐条给出 [片段N] 编号标记与片段原文（可能多条）；编号是服务端标记，不属于正文。",
+  "每条片段原文末尾的〔出处N〕行（如〔出处1〕第73回 玄德进位汉中王　云长攻拔襄阳郡）是服务端注入的结构化出处行，不是正文；正文未出现回号不代表结论不受支撑。",
+  "回号/回目类判据：结论主体是回号/回目（问句含「第几回 / 哪一回 / 第几回登场」等回号类问法）时，结论回号与所引任一片段的〔出处N〕行回号一致 → supported；结论回号与所有所引〔出处N〕行回号都不一致（如结论写第43回、〔出处1〕行是第29回）→ unsupported。",
+  "「首次 / 最初 / 最早 / 初次」等极值问法是用户问句自带口径，不要求单个片段原文证明极值；只要结论回号与所引任一片段的〔出处N〕行回号一致即 supported。",
   "判定示例：",
   "正例：用户问「吕布最早登场于哪一回」，结论「吕布最早登场于第3回。[片段1]」，〔出处1〕第3回 → 回号一致 → supported（「最早」是问句口径，不要求单段证明极值）。",
-  "反例：用户问「某事件发生于哪一回」，结论「发生在第43回。[片段1]」，〔出处1〕第29回 → 回号不一致 → unsupported。",
+  "反例：用户问「某事件发生于哪一回」，结论「发生在第43回。[片段1][片段2]」，〔出处1〕第29回、〔出处2〕第31回 → 回号均不一致 → unsupported。",
   "非回号/回目类问句（如问人物、事件、原因）的结论仍严禁输出回目、出处、段号，不得援引本回号判据放行。",
-  "判断：结论句的核心断言（人物、事件、结局、因果的事实归属）是否由该片段原文支撑。",
-  "允许对片段做语义等价的改述：不改变片段中的人名、动作方向、受事者、结果，且片段原文足以推出或印证该断言 → supported。",
-  "片段原文不足以支撑该断言（如结论来自先验知识、常识或个人判断），或改动了片段中的人名、动作方向、受事者、结果 → unsupported。",
+  "判断：结论句的核心断言（人物、事件、结局、因果的事实归属）是否由所给片段整体支撑。",
+  "支撑口径：任一片段或片段组合（多条片段拼合后的整体信息）足以推出或印证该断言 → supported；结论句合并叙述多个片段的事实时，只要各分句分别由所给片段之一或片段组合支撑，即视为整体支撑。",
+  "允许对片段做语义等价的改述：不改变片段中的人名、动作方向、受事者、结果，且所给片段足以推出或印证该断言 → supported。",
+  "所有所给片段都不足以支撑该断言（如结论来自先验知识、常识或个人判断），或改动了片段中的人名、动作方向、受事者、结果 → unsupported。",
   "只输出一个词：supported 或 unsupported，不要任何解释、标点或多余文字。",
 ].join("\n");
 
@@ -841,18 +843,26 @@ export class Agent {
   }
 
   /** bug-00032/33/34：低重叠句边界语义复核（独立 stage novel_boundary_check，正常样本不触发）。
-   * 输入 = 用户问题 + 结论句 + 指向片段原文；supported → 放行整句，其余（unsupported /
-   * 解析失败 / 复核调用异常）→ 裁剪。复核不可用时回落字面门口径（旧确定性裁剪），保险丝不失效；
-   * 判定结果经现有 LLM 明细落库（stage=novel_boundary_check，responseSummary 即 verdict）。 */
+   * bug-00057：输入 = 用户问题 + 结论句 + 结论句所引全部片段（逐条「[片段N] 原文 + 〔出处N〕行」）；
+   * supported → 放行整句，其余（unsupported / 解析失败 / 复核调用异常）→ 裁剪。复核不可用时回落
+   * 字面门口径（旧确定性裁剪），保险丝不失效；判定结果经现有 LLM 明细落库。 */
   private async checkNovelBoundarySupport(
     query: string,
     sentence: string,
-    fragmentText: string
+    fragments: LowOverlapFragment[]
   ): Promise<"supported" | "unsupported"> {
+    const referenceBlock = fragments
+      .map((fragment) =>
+        fragment.sourceLine
+          ? `[${fragment.pointer}] ${fragment.text}\n${fragment.sourceLine}`
+          : `[${fragment.pointer}] ${fragment.text}`
+      )
+      .join("\n\n");
     const content = [
       `用户问题：${query}`,
       `模型结论句：${sentence}`,
-      `片段原文：${fragmentText}`,
+      `所引片段：`,
+      referenceBlock,
     ].join("\n");
     try {
       // bug-00018 口径：只做二选一判定 → 关闭思考 + temperature 0，保证输出稳定
@@ -959,7 +969,7 @@ export class Agent {
       if (lowOverlap.length > 0) {
         // bug-00039：单请求复核预算=1——逐句复核是串行 LLM 调用
         // （trace ba5bb4ec 实测单次约 1s），低重叠候选只复核 bestOverlap 最高（并列取
-        // 数组最先出现）的唯一句；bestFragmentText === null（无片段参考）直接判
+        // 数组最先出现）的唯一句；referenceFragments 为空（所引指针全不可解析 / 无片段参考）直接判
         // unsupported、不调 LLM；其余候选句一律直接计入 unsupported 裁剪集合（保守防
         // 无支撑内容放行，预算外不再逐句串行复核）。提示词约束答案「一句结论」，正常路径
         // 根本不触发复核，它只是格式越界时的安全网（拒答口径与 4bea3ab 一致：全部裁剪后
@@ -972,25 +982,25 @@ export class Agent {
           }
         }
         // bug-00004 未闭环（复核侧误裁，trace 2a05a6ae / 4fd7a7a6）：回号/回目类问句复核判据
-        // 显式放行（负责人 2026-09-29 拍板）——结论回号与〔出处N〕结构化出处行回号一致 → supported
-        // （「首次/最初/最早」是问句自带口径，不要求单段原文证明极值）。flash 复核对 prompt 判据
-        // 不可靠（真实链路实测仍误裁），故回号类问句先做确定性核对（0 LLM）短路；结论无回号
-        // （如只写回目名）才交复核 LLM（prompt 已补判据 + 正反例兜底）。非回号类问句不受影响，
-        // 仍走既有确定性裁剪（findChapterLeakSentences）+ 低重叠复核。
-        const chapterVerdict =
-          isChapterQuestion && bestSentence.bestSourceLine
-            ? chapterConsistencyVerdict(bestSentence.text, bestSentence.bestSourceLine)
-            : null;
+        // 显式放行（负责人 2026-09-29 拍板）——结论回号与所引任一片段〔出处N〕结构化出处行回号
+        // 一致 → supported（「首次/最初/最早」是问句自带口径，不要求单段原文证明极值）。flash 复核
+        // 对 prompt 判据不可靠（真实链路实测仍误裁），故回号类问句先做确定性核对（0 LLM）短路；
+        // 结论无回号（如只写回目名）才交复核 LLM（prompt 已补判据 + 正反例兜底）。非回号类问句
+        // 不受影响，仍走既有确定性裁剪（findChapterLeakSentences）+ 低重叠复核。
+        const chapterVerdict = isChapterQuestion
+          ? chapterConsistencyVerdict(
+              bestSentence.text,
+              bestSentence.referenceFragments.map((fragment) => fragment.sourceLine)
+            )
+          : null;
         const verdict =
           chapterVerdict ??
-          (bestSentence.bestFragmentText === null
+          (bestSentence.referenceFragments.length === 0
             ? "unsupported"
             : await this.checkNovelBoundarySupport(
                 query,
                 bestSentence.text,
-                isChapterQuestion && bestSentence.bestSourceLine
-                  ? `${bestSentence.bestFragmentText}\n${bestSentence.bestSourceLine}`
-                  : bestSentence.bestFragmentText
+                bestSentence.referenceFragments
               ));
         if (verdict !== "supported") {
           unsupported.push(bestSentence.text);

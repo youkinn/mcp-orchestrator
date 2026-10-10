@@ -342,3 +342,38 @@ test('⑥ 无诊断检索：不登记调用、persister 不被触发（旁路）
   assert.equal(persisted, 0, '无诊断不落库');
   assert.ok(data.answer.length > 0, '响应正常');
 });
+test('⑥ 边界复核多片段支撑（bug-00057）：结论句引 [片段1][片段3] 复核 supported → citations 两条、cited=2', async () => {
+  const recorded: Array<{ diagnostics: Record<string, unknown> }> = [];
+  let checkCallCount = 0;
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () =>
+        recallResult(makeDiagnostics(3, [candidate(1, CHUNK_1), candidate(2, CHUNK_2), candidate(3, CHUNK_3)]), 1),
+    },
+    fallbackConcluder: async () => '关羽斩华雄',
+    modelCaller: async (messages: any[]) => {
+      if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+        checkCallCount += 1;
+        return textResponse('supported');
+      }
+      return textResponse('关羽一合斩落敌将首级，诸侯震惊。[片段1][片段3]');
+    },
+    retrievalDiagnosticsPersister: (_traceId, _seq, diagnostics) => {
+      recorded.push({ diagnostics: diagnostics as Record<string, unknown> });
+    },
+  });
+
+  const data = await runWithTraceId(TRACE_ID, () => agent.processQueryData('谁斩了华雄？', 'sango-novel'));
+  assert.equal(checkCallCount, 1, '跨段结论句触发一次边界复核（单请求预算不变）');
+  assert.equal(data.citations.length, 2, '所引两片段（片段1 + 片段3）均渲染为 citations');
+  const diag = recorded[0].diagnostics;
+  assert.equal(funnelField(diag, 'cited'), 2, 'funnel.cited=被引用 chunk 去重数（2）');
+  const byChunk = new Map(
+    (diag.candidates as Array<{ chunkId: string; cited: boolean }>).map((c) => [c.chunkId, c])
+  );
+  assert.equal(byChunk.get(CHUNK_1)?.cited, true, '片段1 → CHUNK_1 cited=true');
+  assert.equal(byChunk.get(CHUNK_3)?.cited, true, '片段3 → CHUNK_3 cited=true');
+  assert.equal(byChunk.get(CHUNK_2)?.cited, false, '未引用片段 CHUNK_2 cited=false');
+});
