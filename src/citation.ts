@@ -79,19 +79,26 @@ export interface PersonMention {
   id?: string;
 }
 
-/** spec §5 检索工具出参条目（C4 定稿：裸数组，字段逐字为 id/text/chapter/title/type/segFrom/segTo） */
+/**
+ * 检索工具出参条目（裸 JSON 数组；字段逐字为语料 schema v2：
+ * chunk_id / parent_id / seq_in_parent / type / role / text / char_count + 回级 chapter / title）。
+ */
 export interface RecallEntry {
-  id?: string;
+  /** chunk 唯一 ID：`{source}:{回号4位}:p{段号4位}:c{同段块序2位}` */
+  chunk_id?: string;
   text: string;
   /** 回号；逐条携带（单次召回的多条可来自不同回，出处只能逐条渲染） */
   chapter?: number;
   /** 回目；逐条携带 */
   title?: string;
+  /** chunk 类型（语料取值 prose | verse） */
   type?: string;
-  /** 片段起点段号（同回原文出现位置，引用排序键） */
-  segFrom?: number;
-  /** 片段终点段号；跨段 chunk 时 segFrom != segTo */
-  segTo?: number;
+  /** chunk 角色（语料取值 body | lead）；lead = 引题，不进检索索引 */
+  role?: string;
+  /** 父段 ID：`{source}:{回号4位}:p{段号4位}`；段号取自这里，作引用排序键 */
+  parent_id?: string;
+  /** 同段内块序（1 起）；同段内的引用排序次级键 */
+  seq_in_parent?: number;
 }
 
 /** 召回原文片段：text 为纯原文（不含出处 / 段号 / 分数），出处由 chapter / title 字段渲染 */
@@ -100,12 +107,10 @@ export interface RecallFragment {
   source: string;
   chapter?: number;
   title?: string;
-  /** 章内文本顺序号（chunk id 后缀 c\d+，同回引用排序的精确键） */
-  chunkSeq?: number;
-  /** 片段起点段号（同回原文出现位置，引用排序键；缺失片段排引用末位） */
-  segFrom?: number;
-  /** 片段终点段号；跨段 chunk 时 segFrom != segTo */
-  segTo?: number;
+  /** 段号（同回原文出现位置，引用排序键；取自 parent_id，缺失片段排引用末位） */
+  segNo?: number;
+  /** 同段内块序（1 起；同段内按块序排序） */
+  seqInParent?: number;
 }
 
 /** 注入视图的片段条数上限：与检索返回条数联动（返回收缩到 10 条即全部注入）。
@@ -117,10 +122,10 @@ export interface RenderedFragment {
   text: string;
   chapter?: number;
   title?: string;
-  /** 章内文本顺序号（chunk id 后缀 c\d+，同回引用排序的精确键） */
-  chunkSeq?: number;
-  segFrom?: number;
-  segTo?: number;
+  /** 段号（同回原文出现位置，引用排序键；缺章 / 缺段号的片段排引用末位） */
+  segNo?: number;
+  /** 同段内块序（1 起） */
+  seqInParent?: number;
 }
 
 /** feat-A006 引用出处卡片：按回号递增、同回按原文出现先后排序的扁平数组；无引用时恒 [] */
@@ -261,7 +266,7 @@ function parseRecallEntries(text: string): RecallEntry[] {
   }
 }
 
-/** 工具出参文本 → 召回片段：解析裸数组条目，元数据（chapter / title）逐条携带，正文只留纯原文 */
+/** 工具出参文本 → 召回片段：解析裸数组条目，元数据（chapter / title / 段号 / 块序）逐条携带，正文只留纯原文 */
 export function toRecallFragments(
   texts: string[],
   source: string
@@ -276,26 +281,27 @@ export function toRecallFragments(
         text: entry.text,
         source,
         chapter: typeof entry.chapter === "number" ? entry.chapter : undefined,
-        chunkSeq: parseChunkSeq(entry.id),
         title:
           typeof entry.title === "string" && entry.title.trim()
             ? entry.title.trim()
             : undefined,
-        segFrom:
-          typeof entry.segFrom === "number" ? entry.segFrom : undefined,
-        segTo: typeof entry.segTo === "number" ? entry.segTo : undefined,
+        segNo: parseSegmentNo(entry.parent_id),
+        seqInParent:
+          typeof entry.seq_in_parent === "number"
+            ? entry.seq_in_parent
+            : undefined,
       });
     }
   }
   return fragments;
 }
 
-/** 从 chunk id（{source}:{回号4位}:c{章内序号4位}）反解章内文本顺序号；无 id / 非该格式返回 undefined */
-function parseChunkSeq(id: string | undefined): number | undefined {
-  if (typeof id !== "string") {
+/** 从父段 ID（{source}:{回号4位}:p{段号4位}）反解段号；无 parent_id / 非该格式返回 undefined */
+function parseSegmentNo(parentId: string | undefined): number | undefined {
+  if (typeof parentId !== "string") {
     return undefined;
   }
-  const match = /:c(\d+)$/.exec(id);
+  const match = /:p(\d+)$/.exec(parentId);
   return match ? Number(match[1]) : undefined;
 }
 /**
@@ -366,9 +372,8 @@ export function buildInjectionView(
       text: fragment.text,
       chapter: fragment.chapter,
       title: fragment.title,
-      chunkSeq: fragment.chunkSeq,
-      segFrom: fragment.segFrom,
-      segTo: fragment.segTo,
+      segNo: fragment.segNo,
+      seqInParent: fragment.seqInParent,
     });
     // bug-00004 方案 C：片段块末尾附结构化出处行（回号+回目名），正文保持纯原文
     const sourceLine = buildSourceLine(
@@ -752,7 +757,7 @@ function resolvePointerRef(
 /** 服务端渲染引用与出处（feat-A006）：`[片段N]` 指针从 answer 剥离（不输出角标），原文与出处进
  * citations 卡片（不内联原文、不内联出处）；citations 按片段粒度合并（同片段多引用合并为一条），
  * 只收被引用片段；并按回号递增、同回按原文出现先后
- * （chunkSeq → segFrom → segTo）排序后下发——无回号 / 无位置的片段排最后、相互保持引用出现顺序。 */
+ * （段号 → 同段块序）排序后下发——无回号 / 无段号的片段排最后、相互保持引用出现顺序。 */
 export function renderAnswerWithCitations(
   answer: string,
   view: InjectionView
@@ -773,16 +778,12 @@ export function renderAnswerWithCitations(
       cited.push({ fragmentKey, fragment });
     }
   }
-  // 第二遍：排序（chapter → chunkSeq → segFrom → segTo；排序键缺失的排最后、保持原相对顺序）
+  // 第二遍：排序（chapter → segNo → seqInParent；排序键缺失的排最后、保持原相对顺序）
   const keyed: Array<{ fragmentKey: string; fragment: RenderedFragment }> = [];
   const unkeyed: Array<{ fragmentKey: string; fragment: RenderedFragment }> = [];
   for (const entry of cited) {
-    const { chapter, chunkSeq, segFrom, segTo } = entry.fragment;
-    if (
-      Number.isFinite(chapter) &&
-      (Number.isFinite(chunkSeq) ||
-        (Number.isFinite(segFrom) && Number.isFinite(segTo)))
-    ) {
+    const { chapter, segNo } = entry.fragment;
+    if (Number.isFinite(chapter) && Number.isFinite(segNo)) {
       keyed.push(entry);
     } else {
       unkeyed.push(entry);
@@ -791,9 +792,8 @@ export function renderAnswerWithCitations(
   keyed.sort(
     (a, b) =>
       a.fragment.chapter! - b.fragment.chapter! ||
-      (a.fragment.chunkSeq ?? a.fragment.segFrom ?? 0) -
-        (b.fragment.chunkSeq ?? b.fragment.segFrom ?? 0) ||
-      (a.fragment.segTo ?? 0) - (b.fragment.segTo ?? 0)
+      a.fragment.segNo! - b.fragment.segNo! ||
+      (a.fragment.seqInParent ?? 0) - (b.fragment.seqInParent ?? 0)
   );
   const ordered = [...keyed, ...unkeyed];
   // 第三遍：剥离所有 `[片段N]` 指针，answer 只留结论正文（不再输出上标角标）
