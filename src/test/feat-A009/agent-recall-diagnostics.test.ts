@@ -75,35 +75,42 @@ const ALIAS_TABLE = loadAliasTable('a009-not-exist'); // stub 别名表（关羽
 const F1_QUOTE = '云长提刀出阵，斩华雄于帐前！';
 const F1_BODY = `众皆大惊曰：“${F1_QUOTE}”`;
 const TITLE = '发矫诏诸镇应曹公　破关兵三英战吕布';
-const CHUNK_1 = 'sanguo-yanyi:0005:c0001';
-const CHUNK_2 = 'sanguo-yanyi:0005:c0002';
-const CHUNK_3 = 'sanguo-yanyi:0005:c0003';
-const CHUNK_4 = 'sanguo-yanyi:0005:c0004';
+const CHUNK_1 = 'sanguo-yanyi:0005:p0004:c01';
+const CHUNK_2 = 'sanguo-yanyi:0005:p0005:c01';
+const CHUNK_3 = 'sanguo-yanyi:0005:p0006:c01';
+const CHUNK_4 = 'sanguo-yanyi:0005:p0007:c01';
 
-/** 工具出参条目（C4 定稿：裸 JSON 数组，逐条带 id=chunkId）：top-3 命中 */
+/** 工具出参条目（裸 JSON 数组，逐条带 chunk_id）：top-3 命中 */
 const ENTRIES = [
   {
-    id: CHUNK_1,
+    chunk_id: CHUNK_1,
+    parent_id: 'sanguo-yanyi:0005:p0004',
+    seq_in_parent: 1,
     text: F1_BODY,
     chapter: 5,
     title: TITLE,
-    type: 'narration',
-    segFrom: 4,
-    segTo: 4,
+    type: 'prose',
+    role: 'body',
   },
   {
-    id: CHUNK_2,
+    chunk_id: CHUNK_2,
+    parent_id: 'sanguo-yanyi:0005:p0005',
+    seq_in_parent: 1,
     text: '玄德与云长、翼德出帐，共议破关之策。',
     chapter: 5,
     title: TITLE,
-    type: 'narration',
+    type: 'prose',
+    role: 'body',
   },
   {
-    id: CHUNK_3,
+    chunk_id: CHUNK_3,
+    parent_id: 'sanguo-yanyi:0005:p0006',
+    seq_in_parent: 1,
     text: '华雄连斩数将，诸侯莫敢当。',
     chapter: 5,
     title: TITLE,
-    type: 'narration',
+    type: 'prose',
+    role: 'body',
   },
 ];
 

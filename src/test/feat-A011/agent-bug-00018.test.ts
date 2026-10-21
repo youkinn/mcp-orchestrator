@@ -70,13 +70,14 @@ const ALIAS_TABLE = loadAliasTable('a004-not-exist'); // stub 别名表（关羽
 
 const RECALL_TEXT = JSON.stringify([
   {
-    id: 'sanguo-yanyi:0005:c0001',
+    chunk_id: 'sanguo-yanyi:0005:p0004:c01',
+    parent_id: 'sanguo-yanyi:0005:p0004',
+    seq_in_parent: 1,
     text: '众皆大惊曰：“云长提刀出阵，斩华雄于帐前！”',
     chapter: 5,
     title: '发矫诏诸镇应曹公　破关兵三英战吕布',
-    type: 'narration',
-    segFrom: 4,
-    segTo: 4,
+    type: 'prose',
+    role: 'body',
   },
 ]);
 

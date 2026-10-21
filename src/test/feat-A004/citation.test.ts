@@ -152,8 +152,8 @@ test("⑬ 注入视图只给纯原文 + 服务端编号：片段带 [片段N]，
     source: "sanguo-yanyi",
     chapter: 73,
     title: "玄德进位汉中王　云长攻拔襄阳郡",
-    segFrom: 5,
-    segTo: 5,
+    segNo: 5,
+    seqInParent: 1,
   };
   const view = buildInjectionView([fragment]);
   assert.match(view.text, /\[片段1\]/);
@@ -171,8 +171,8 @@ test("⑬ 注入视图只给纯原文 + 服务端编号：片段带 [片段N]，
   assert.doesNotMatch(view.text, /分数|score/i, "注入不带分数");
   assert.equal(view.fragments.size, 1, "片段表应含该片段");
   assert.equal(view.fragments.get("片段1")?.text, fragment.text, "片段表保存整段原文");
-  assert.equal(view.fragments.get("片段1")?.segFrom, 5, "片段表保留 segFrom 供引用排序");
-  assert.equal(view.fragments.get("片段1")?.segTo, 5, "片段表保留 segTo 供引用排序");
+  assert.equal(view.fragments.get("片段1")?.segNo, 5, "片段表保留段号供引用排序");
+  assert.equal(view.fragments.get("片段1")?.seqInParent, 1, "片段表保留同段块序供引用排序");
 });
 
 test("⑬.1 整段注入：长段原文完整可见（不再按检索词窗口裁剪）", () => {
@@ -443,8 +443,8 @@ test("⑯.4 引用排序·跨回：citations 按回号递增排序下发，answe
           text: "云长勃然大怒曰：“吾虎女安肯嫁犬子乎！……”",
           chapter: 73,
           title: "玄德进位汉中王　云长攻拔襄阳郡",
-          segFrom: 5,
-          segTo: 5,
+          segNo: 5,
+          seqInParent: 1,
         },
       ],
       [
@@ -453,8 +453,8 @@ test("⑯.4 引用排序·跨回：citations 按回号递增排序下发，answe
           text: "庞德曰：“吾奉魏王旨，特来取汝首！恐汝不信，备榇在此。”",
           chapter: 42,
           title: "张翼德大闹长坂桥　刘豫州败走汉津口",
-          segFrom: 3,
-          segTo: 3,
+          segNo: 3,
+          seqInParent: 1,
         },
       ],
     ]),
@@ -476,12 +476,12 @@ test("⑯.4 引用排序·跨回：citations 按回号递增排序下发，answe
   ]);
 });
 
-test("⑯.7 引用排序·同回：按 segFrom → segTo 原文出现先后排序", () => {
+test("⑯.7 引用排序·同回：按段号 → 同段块序 原文出现先后排序", () => {
   const view: InjectionView = {
     text: "",
     fragments: new Map([
-      ["片段1", { text: "后段原文", chapter: 5, title: "回目五", segFrom: 5, segTo: 5 }],
-      ["片段2", { text: "前段原文", chapter: 5, title: "回目五", segFrom: 2, segTo: 3 }],
+      ["片段1", { text: "后段原文", chapter: 5, title: "回目五", segNo: 5, seqInParent: 1 }],
+      ["片段2", { text: "前段原文", chapter: 5, title: "回目五", segNo: 2, seqInParent: 1 }],
     ]),
   };
   const out = renderAnswerWithCitations("先引[片段1]，后引[片段2]。", view);
@@ -492,30 +492,30 @@ test("⑯.7 引用排序·同回：按 segFrom → segTo 原文出现先后排�
   );
 });
 
-test("⑯.9 引用排序·同回同段：segFrom/segTo 相同时按 chunkSeq（chunk id 章内序号）排序", () => {
+test("⑯.9 引用排序·同段：段号相同按 seqInParent（同段块序）排序", () => {
   const view: InjectionView = {
     text: "",
     fragments: new Map([
-      // c0003 劫营段、c0002 请命段同在第68回段1（segFrom=segTo=1），键值相同
-      ["片段1", { text: "劫营段", chapter: 68, title: "回目六八", chunkSeq: 3, segFrom: 1, segTo: 1 }],
-      ["片段2", { text: "诗赞段", chapter: 68, title: "回目六八", chunkSeq: 4, segFrom: 2, segTo: 2 }],
-      ["片段3", { text: "请命段", chapter: 68, title: "回目六八", chunkSeq: 2, segFrom: 1, segTo: 1 }],
+      // 劫营段、请命段同在第68回段1（块序 2 / 1），诗赞段在段2
+      ["片段1", { text: "劫营段", chapter: 68, title: "回目六八", segNo: 1, seqInParent: 2 }],
+      ["片段2", { text: "诗赞段", chapter: 68, title: "回目六八", segNo: 2, seqInParent: 1 }],
+      ["片段3", { text: "请命段", chapter: 68, title: "回目六八", segNo: 1, seqInParent: 1 }],
     ]),
   };
   const out = renderAnswerWithCitations("劫[片段1]，赞[片段2]，请[片段3]。", view);
-  assert.equal(out.answer, "劫，赞，请。", "同段按 chunkSeq 原文序排列 citations");
+  assert.equal(out.answer, "劫，赞，请。", "同段按块序原文序排列 citations");
   assert.deepEqual(
     out.citations.map((c) => c.text),
     ["请命段", "劫营段", "诗赞段"]
   );
 });
 
-test("⑯.8 引用排序·键缺失：无 chapter/segFrom/segTo 的片段排最后，且相互保持引用出现顺序", () => {
+test("⑯.8 引用排序·键缺失：无 chapter/segNo 的片段排最后，且相互保持引用出现顺序", () => {
   const view: InjectionView = {
     text: "",
     fragments: new Map([
       ["片段1", { text: "无键甲", title: "回目甲" }],
-      ["片段2", { text: "有键片段", chapter: 3, title: "回目三", segFrom: 1, segTo: 1 }],
+      ["片段2", { text: "有键片段", chapter: 3, title: "回目三", segNo: 1, seqInParent: 1 }],
       ["片段3", { text: "无键乙", title: "回目乙" }],
     ]),
   };
@@ -559,34 +559,36 @@ test("⑯.6 无引用恒 []：answer 无指针时 citations 为空、answer 原�
 test("⑱ 出参解析：裸数组条目逐条走字段，正文只留纯原文（出处 / 段号 / 分数不进正文）", () => {
   const entries = JSON.stringify([
     {
-      id: "sanguo-yanyi:0073:c0007",
+      chunk_id: "sanguo-yanyi:0073:p0005:c01",
+      parent_id: "sanguo-yanyi:0073:p0005",
+      seq_in_parent: 1,
+      type: "prose",
+      role: "body",
       text: "瑾曰：“特来求结两家之好，请君侯思之。”云长勃然大怒曰：“吾虎女安肯嫁犬子乎！”",
       chapter: 73,
       title: "玄德进位汉中王　云长攻拔襄阳郡",
-      type: "narration",
-      segFrom: 5,
-      segTo: 5,
     },
     {
-      id: "sanguo-yanyi:0082:c0001",
+      chunk_id: "sanguo-yanyi:0082:p0001:c01",
+      parent_id: "sanguo-yanyi:0082:p0001",
+      seq_in_parent: 1,
+      type: "prose",
+      role: "body",
       text: "却说章武元年秋八月，先主起大军至夔关。",
       chapter: 82,
       title: "孙权降魏受九锡　先主征吴赏六军",
-      type: "narration",
-      segFrom: 1,
-      segTo: 1,
     },
   ]);
   const [entry, second] = toRecallFragments([entries], "sanguo-yanyi");
   assert.equal(entry.chapter, 73);
   assert.equal(entry.title, "玄德进位汉中王　云长攻拔襄阳郡");
-  assert.equal(entry.segFrom, 5, "segFrom 随条目带出，供引用排序");
-  assert.equal(entry.segTo, 5, "segTo 随条目带出，供引用排序");
+  assert.equal(entry.segNo, 5, "段号由 parent_id 反解，供引用排序");
+  assert.equal(entry.seqInParent, 1, "同段块序随条目带出，供引用排序");
   assert.doesNotMatch(entry.text, /【出处】/, "正文只留纯原文（I6）");
   assert.doesNotMatch(entry.text, /段5/, "段号走字段，不进正文");
   assert.equal(second.chapter, 82, "跨回召回时出处逐条渲染（文档级元数据不存在）");
   assert.equal(second.title, "孙权降魏受九锡　先主征吴赏六军");
-  assert.equal(second.segFrom, 1, "segFrom 逐条带出");
+  assert.equal(second.segNo, 1, "段号逐条带出");
 });
 
 test("⑱.1 出参解析：非裸数组（旧拼接文本 / 包裹对象 / 非法 JSON）不产出片段", () => {
