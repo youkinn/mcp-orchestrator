@@ -1,6 +1,6 @@
 // feat-A009 编排侧诊断回填辅助（story-A009-03 编排部分）
 // 职责：从检索工具出参提取诊断与行号、按「片段 → 候选」映射回填 injected/cited、
-// 按 (trace_id, seq) 旁路落库。不依赖文本比对——映射走工具出参条目 id（chunkId）与注入视图编号。
+// 按 (trace_id, seq) 旁路落库。不依赖文本比对——映射走工具出参条目 chunk_id（落库字段 chunkId）与注入视图编号。
 import {
   INJECT_FRAGMENT_LIMIT,
   INJECT_HEAD_GUARANTEE,
@@ -64,7 +64,7 @@ export function extractEntryChunkIds(
       ) {
         continue;
       }
-      const id = (entry as { id?: unknown }).id;
+      const id = (entry as { chunk_id?: unknown }).chunk_id;
       chunkIds.push(typeof id === "string" && id.trim() ? id : null);
     }
   }

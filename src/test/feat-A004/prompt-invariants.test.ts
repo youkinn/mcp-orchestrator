@@ -30,7 +30,6 @@ test("① 分类提示词：§2.3 原文照录，含 1/2/99 编号与兜底取�
 test("② sango-novel 域提示：§2.4 原文照录，含指针 / 片段 / 兜底条款，不指示调用工具", () => {
   assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /当前为「三国演义原著解读」场景/);
   assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /不要再调用检索工具/);
-  assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /\[Qn\]/);
   assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /\[片段N\]/);
   assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /「演义中未涉及」/);
   assert.doesNotMatch(SANGO_NOVEL_DOMAIN_PROMPT, /sango_novel_search/);
@@ -48,12 +47,33 @@ test("②b 演义域生成轮含改述口径（bug-00032/33/34）：允许语义
   assert.match(SANGO_NOVEL_DOMAIN_PROMPT, /引用指针必须指向该支撑片段/);
 });
 
-test("②c 边界复核提示词与域提示改述口径一致（judge 同口径校准）", () => {
+test("②c 边界复核提示词与域提示改述口径一致（judge 同口径校准；bug-00057 多片段口径）", () => {
   assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /语义等价的改述/);
   assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /不改变片段中的人名、动作方向、受事者、结果/);
-  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /片段原文足以推出或印证该断言 → supported/);
-  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /片段原文不足以支撑该断言/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /所给片段足以推出或印证该断言 → supported/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /所有所给片段都不足以支撑该断言/);
   assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /改动了片段中的人名、动作方向、受事者、结果 → unsupported/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /任一片段或片段组合/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /结论句合并叙述多个片段的事实/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /片段组/);
+});
+
+test("②d 边界复核提示词含回号/回目类判据（bug-00004 未闭环）：回号一致 → supported、不一致 → unsupported、极值问法是问句口径、非回号类不放宽", () => {
+  // 判据显式放行：结论回号与所引任一片段〔出处N〕行回号一致 → supported（正文无回号不代表不受支撑）
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /回号\/回目类判据/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /结论回号与所引任一片段的〔出处N〕行回号一致 → supported/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /正文未出现回号不代表结论不受支撑/);
+  // 反例：回号都不一致（第43回 vs 第29回）→ unsupported
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /结论回号与所有所引〔出处N〕行回号都不一致/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /第43回/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /第29回）→ unsupported/);
+  // 极值问法（首次/最初/最早）是用户问句自带口径，不要求单个片段原文证明极值
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /首次 \/ 最初 \/ 最早 \/ 初次/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /不要求单个片段原文证明极值/);
+  // 非回号类问句的结论仍严禁输出回目/出处/段号（本判据不放宽）
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /非回号\/回目类问句/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /仍严禁输出回目、出处、段号/);
+  assert.match(NOVEL_BOUNDARY_CHECK_PROMPT, /不得援引本回号判据放行/);
 });
 
 test("③ fengyunsanguo 域提示：§2.4 原文照录，含固定话术与未召回兜底", () => {

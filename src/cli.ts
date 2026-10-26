@@ -124,7 +124,7 @@ async function fetchChunkText(
     (chunk: any) =>
       chunk !== null &&
       typeof chunk === "object" &&
-      chunk.chunkId === chunkId
+      chunk.chunk_id === chunkId
   ) as { text?: unknown } | undefined;
   return typeof entry?.text === "string" ? entry.text : "";
 }
@@ -162,8 +162,8 @@ async function draftbenchTraceCommand(args: string[]): Promise<void> {
   console.log("候选（只读源，全量展示）:");
   for (const candidate of candidates) {
     const seg =
-      candidate.segFrom != null && candidate.segTo != null
-        ? `段${candidate.segFrom}-${candidate.segTo}`
+      candidate.segNo != null
+        ? `段${candidate.segNo}${candidate.seqInParent != null ? `·块${candidate.seqInParent}` : ""}`
         : "";
     const marker = candidate.injected ? "[注入]" : "      ";
     console.log(
@@ -248,7 +248,7 @@ async function draftbenchSendCommand(args: string[]): Promise<void> {
   const query = flagValue(args, "--query") ?? editFile.query;
   const params = {
     temperature: Number(
-      flagValue(args, "--temperature") ?? editFile.params?.temperature ?? 0.7
+      flagValue(args, "--temperature") ?? editFile.params?.temperature ?? 0.1
     ),
     topK: Number(flagValue(args, "--topK") ?? editFile.params?.topK ?? 10),
     guarantee: Number(

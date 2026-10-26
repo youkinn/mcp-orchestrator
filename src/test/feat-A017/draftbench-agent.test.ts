@@ -126,7 +126,7 @@ function makeAgent(): {
 }
 
 const DEFAULT_PARAMS: DraftbenchParams = {
-  temperature: 0.7,
+  temperature: 0.1,
   topK: 10,
   guarantee: 5,
   budget: 2000,
@@ -144,7 +144,7 @@ test('draftbench 管线：默认参数注入视图 + 生成轮覆盖 + 不检索
   // 恰好一次生成轮：temperature 覆盖 + 有注入即关闭思考
   assert.equal(spy.calls.length, 1);
   const call = spy.calls[0];
-  assert.equal(call.options.temperature, 0.7);
+  assert.equal(call.options.temperature, 0.1);
   assert.equal(call.options.disableThinking, true);
   const joined = call.messages.map((message) => message.content).join('\n');
   assert.ok(joined.includes('三国演义原著解读'), '应使用 sango-novel 域提示');

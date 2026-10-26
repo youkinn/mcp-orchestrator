@@ -4,7 +4,7 @@
 // 无诊断检索不登记不落库。全部用既有 FakeModel（modelCaller）+ mock transport，不调用任何 LLM。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Agent } from '../../agent.js';
+import { Agent, NOVEL_BOUNDARY_CHECK_PROMPT } from '../../agent.js';
 import { MCPTransport } from '../../transport.js';
 import { loadAliasTable } from '../../citation.js';
 import { runWithTraceId } from '../../trace.js';
@@ -75,39 +75,42 @@ const ALIAS_TABLE = loadAliasTable('a009-not-exist'); // stub 别名表（关羽
 const F1_QUOTE = '云长提刀出阵，斩华雄于帐前！';
 const F1_BODY = `众皆大惊曰：“${F1_QUOTE}”`;
 const TITLE = '发矫诏诸镇应曹公　破关兵三英战吕布';
-const CHUNK_1 = 'sanguo-yanyi:0005:c0001';
-const CHUNK_2 = 'sanguo-yanyi:0005:c0002';
-const CHUNK_3 = 'sanguo-yanyi:0005:c0003';
-const CHUNK_4 = 'sanguo-yanyi:0005:c0004';
+const CHUNK_1 = 'sanguo-yanyi:0005:p0004:c01';
+const CHUNK_2 = 'sanguo-yanyi:0005:p0005:c01';
+const CHUNK_3 = 'sanguo-yanyi:0005:p0006:c01';
+const CHUNK_4 = 'sanguo-yanyi:0005:p0007:c01';
 
-/** 工具出参条目（C4 定稿：裸 JSON 数组，逐条带 id=chunkId）：top-3 命中 */
+/** 工具出参条目（裸 JSON 数组，逐条带 chunk_id）：top-3 命中 */
 const ENTRIES = [
   {
-    id: CHUNK_1,
+    chunk_id: CHUNK_1,
+    parent_id: 'sanguo-yanyi:0005:p0004',
+    seq_in_parent: 1,
     text: F1_BODY,
     chapter: 5,
     title: TITLE,
-    type: 'narration',
-    segFrom: 4,
-    segTo: 4,
-    quoteBalanced: true,
-    quotes: [{ offset: 7, len: F1_QUOTE.length }],
+    type: 'prose',
+    role: 'body',
   },
   {
-    id: CHUNK_2,
+    chunk_id: CHUNK_2,
+    parent_id: 'sanguo-yanyi:0005:p0005',
+    seq_in_parent: 1,
     text: '玄德与云长、翼德出帐，共议破关之策。',
     chapter: 5,
     title: TITLE,
-    type: 'narration',
-    quotes: [],
+    type: 'prose',
+    role: 'body',
   },
   {
-    id: CHUNK_3,
+    chunk_id: CHUNK_3,
+    parent_id: 'sanguo-yanyi:0005:p0006',
+    seq_in_parent: 1,
     text: '华雄连斩数将，诸侯莫敢当。',
     chapter: 5,
     title: TITLE,
-    type: 'narration',
-    quotes: [],
+    type: 'prose',
+    role: 'body',
   },
 ];
 
@@ -201,7 +204,10 @@ test('② 被引用片段 → candidates[].cited=true + funnel.cited 计数', as
         recallResult(makeDiagnostics(3, [candidate(1, CHUNK_1), candidate(2, CHUNK_2), candidate(3, CHUNK_3)]), 1),
     },
     fallbackConcluder: async () => '斩华雄者系关羽',
-    modelCaller: async () => textResponse('按原文，斩华雄者系关羽。[Q1]'),
+    modelCaller: async (messages: any[]) =>
+      messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT
+        ? textResponse('supported')
+        : textResponse('按原文，斩华雄者系关羽。[片段1]'),
     retrievalDiagnosticsPersister: (_traceId, _seq, diagnostics) => {
       recorded.push({ diagnostics: diagnostics as Record<string, unknown> });
     },
@@ -213,7 +219,7 @@ test('② 被引用片段 → candidates[].cited=true + funnel.cited 计数', as
   const byChunk = new Map(
     (diag.candidates as Array<{ chunkId: string; cited: boolean }>).map((c) => [c.chunkId, c])
   );
-  assert.equal(byChunk.get(CHUNK_1)?.cited, true, '被 [Q1] 引用的 c0001 应 cited=true');
+  assert.equal(byChunk.get(CHUNK_1)?.cited, true, '被 [片段1] 引用的 c0001 应 cited=true');
   assert.equal(byChunk.get(CHUNK_2)?.cited, false, '未引用片段 cited=false');
   assert.equal(byChunk.get(CHUNK_3)?.cited, false);
 });
@@ -263,7 +269,10 @@ test('④ 落库失败旁路：persister 抛错不影响 /api/chat 响应与 dat
         recallResult(makeDiagnostics(3, [candidate(1, CHUNK_1), candidate(2, CHUNK_2), candidate(3, CHUNK_3)]), 1),
     },
     fallbackConcluder: async () => '斩华雄者系关羽',
-    modelCaller: async () => textResponse('按原文，斩华雄者系关羽。[Q1]'),
+    modelCaller: async (messages: any[]) =>
+      messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT
+        ? textResponse('supported')
+        : textResponse('按原文，斩华雄者系关羽。[片段1]'),
     retrievalDiagnosticsPersister: () => {
       persisted += 1;
       throw new Error('db down');
@@ -290,12 +299,15 @@ test('⑤ auto 分类编号 1 → 确定性预调注入：injected/cited 正常�
         recallResult(makeDiagnostics(3, [candidate(1, CHUNK_1), candidate(2, CHUNK_2), candidate(3, CHUNK_3)]), 1),
     },
     fallbackConcluder: async () => '斩华雄者系关羽',
-    modelCaller: async () => {
+    modelCaller: async (messages: any[]) => {
       callCount += 1;
+      if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+        return textResponse('supported');
+      }
       // A011 起 auto 首轮为无 tools 分类轮：模型只输出编号，检索由服务端按编号确定性预调，不再模型自主调工具
       return callCount === 1
         ? textResponse('1')
-        : textResponse('按原文，斩华雄者系关羽。[Q1]');
+        : textResponse('按原文，斩华雄者系关羽。[片段1]');
     },
     retrievalDiagnosticsPersister: (_traceId, _seq, diagnostics) => {
       recorded.push({ diagnostics: diagnostics as Record<string, unknown> });
@@ -312,7 +324,8 @@ test('⑤ auto 分类编号 1 → 确定性预调注入：injected/cited 正常�
   );
   assert.equal(c1?.injected, true, '确定性预调注入 → 候选 injected=true');
   assert.equal(c1?.cited, true, '被引用候选 cited=true');
-  assert.ok(data.answer.includes('云长提刀出阵'), '注入 + 引用渲染正常');
+  assert.ok(data.answer.includes('斩华雄者系关羽'), '结论正文保留');
+  assert.doesNotMatch(data.answer, /\[片段\d+\]/, '指针已剥离');
 });
 
 test('⑥ 无诊断检索：不登记调用、persister 不被触发（旁路）', async () => {
@@ -335,4 +348,39 @@ test('⑥ 无诊断检索：不登记调用、persister 不被触发（旁路）
   );
   assert.equal(persisted, 0, '无诊断不落库');
   assert.ok(data.answer.length > 0, '响应正常');
+});
+test('⑥ 边界复核多片段支撑（bug-00057）：结论句引 [片段1][片段3] 复核 supported → citations 两条、cited=2', async () => {
+  const recorded: Array<{ diagnostics: Record<string, unknown> }> = [];
+  let checkCallCount = 0;
+  const agent = new Agent(new MockTransport([NOVEL_TOOL]), makeConfig(), {
+    tools: [NOVEL_TOOL],
+    aliasTable: ALIAS_TABLE,
+    localTools: {
+      sango_novel_search: async () =>
+        recallResult(makeDiagnostics(3, [candidate(1, CHUNK_1), candidate(2, CHUNK_2), candidate(3, CHUNK_3)]), 1),
+    },
+    fallbackConcluder: async () => '关羽斩华雄',
+    modelCaller: async (messages: any[]) => {
+      if (messages[0]?.content === NOVEL_BOUNDARY_CHECK_PROMPT) {
+        checkCallCount += 1;
+        return textResponse('supported');
+      }
+      return textResponse('关羽一合斩落敌将首级，诸侯震惊。[片段1][片段3]');
+    },
+    retrievalDiagnosticsPersister: (_traceId, _seq, diagnostics) => {
+      recorded.push({ diagnostics: diagnostics as Record<string, unknown> });
+    },
+  });
+
+  const data = await runWithTraceId(TRACE_ID, () => agent.processQueryData('谁斩了华雄？', 'sango-novel'));
+  assert.equal(checkCallCount, 1, '跨段结论句触发一次边界复核（单请求预算不变）');
+  assert.equal(data.citations.length, 2, '所引两片段（片段1 + 片段3）均渲染为 citations');
+  const diag = recorded[0].diagnostics;
+  assert.equal(funnelField(diag, 'cited'), 2, 'funnel.cited=被引用 chunk 去重数（2）');
+  const byChunk = new Map(
+    (diag.candidates as Array<{ chunkId: string; cited: boolean }>).map((c) => [c.chunkId, c])
+  );
+  assert.equal(byChunk.get(CHUNK_1)?.cited, true, '片段1 → CHUNK_1 cited=true');
+  assert.equal(byChunk.get(CHUNK_3)?.cited, true, '片段3 → CHUNK_3 cited=true');
+  assert.equal(byChunk.get(CHUNK_2)?.cited, false, '未引用片段 CHUNK_2 cited=false');
 });

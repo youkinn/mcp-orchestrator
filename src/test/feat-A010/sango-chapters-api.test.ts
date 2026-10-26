@@ -23,7 +23,14 @@ const PAYLOAD_73 = {
   prev: { chapter: 72, title: '诸葛亮智取汉中　曹阿瞒兵退斜谷' },
   next: { chapter: 74, title: '庞令明抬榇决死战　关云长放水淹七军' },
   chunks: [
-    { chunkId: 'sanguo-yanyi:0073:c0001', text: '却说曹操退兵至斜谷……', type: 'narration', segFrom: 1, segTo: 1 },
+    {
+      chunk_id: 'sanguo-yanyi:0073:p0001:c01',
+      parent_id: 'sanguo-yanyi:0073:p0001',
+      seq_in_parent: 1,
+      type: 'prose',
+      role: 'body',
+      text: '却说曹操退兵至斜谷……',
+    },
   ],
 };
 

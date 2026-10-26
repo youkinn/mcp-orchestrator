@@ -1,8 +1,8 @@
 // feat-A017 草稿台接口（/api/v1/draftbench*，与 /api/v1/logs* 同级挂载，同一 Express 进程）：
 // GET /trace/:traceId —— 反查该请求候选 / 注入 chunks（tool_retrieval_logs.diagnostics + request_logs 链路）；
-//   preview / segFrom / segTo 由本文按 chunkId 经既有 sango_novel_chapter 通道合成（§10 决策 2，多回合并
+//   preview / segNo / seqInParent 由本文按 chunkId 经既有 sango_novel_chapter 通道合成（§10 决策 2，多回合并
 //   多次通道调用属实现细节；通道失败按 best-effort 回 null，不因预览降级拖垮拉取主数据）；params 默认带出
-//   线上实际值（temperature = llm_call_logs 生成轮末次成功值，缺省 0.7；topK/guarantee/budget = 注入常量；
+//   线上实际值（temperature = llm_call_logs 生成轮末次成功值，缺省 0.1；topK/guarantee/budget = 注入常量；
 //   tailFallback 只读）。
 // GET /records —— 草稿台发送记录列表（仅 source=draftbench，时间倒序，分页口径同 /api/v1/logs）。
 // GET /records/:traceId —— 记录详情（载入 + diff 按 §4.4 重算，单一实现点 computeDraftbenchDiff）。
@@ -33,7 +33,7 @@ const RECORD_NOT_FOUND_MESSAGE = '草稿台记录不存在';
 const QUERY_ERROR_MESSAGE = '查询草稿台记录失败，请稍后重试';
 const DELETE_ERROR_MESSAGE = '删除草稿台记录失败，请稍后重试';
 const PREVIEW_MAX_LENGTH = 120;
-const DEFAULT_TEMPERATURE = 0.7;
+const DEFAULT_TEMPERATURE = 0.1;
 /** §4.2 参数缺省（与生产注入常量同值；记录 / 校验失败行 params 快照缺失时展示用） */
 const DEFAULT_PARAMS: DraftbenchRecordParams = {
   temperature: DEFAULT_TEMPERATURE,
@@ -59,10 +59,19 @@ function parseQueryInteger(raw: unknown): number | undefined | null {
 }
 
 interface ChapterEntry {
-  chunkId?: unknown;
+  chunk_id?: unknown;
+  parent_id?: unknown;
+  seq_in_parent?: unknown;
   text?: unknown;
-  segFrom?: unknown;
-  segTo?: unknown;
+}
+
+/** 父段 ID（`{source}:{回号4位}:p{段号4位}`）→ 段号；格式不符回 null */
+function segmentNoOf(parentId: unknown): number | null {
+  if (typeof parentId !== 'string') {
+    return null;
+  }
+  const match = /:p(\d+)$/.exec(parentId);
+  return match ? Number(match[1]) : null;
 }
 
 interface ChapterPayload {
@@ -77,8 +86,10 @@ interface TraceCandidateRow {
   rank: number;
   chapter: number | null;
   title: string | null;
-  segFrom: number | null;
-  segTo: number | null;
+  /** 段号（取自语料 parent_id） */
+  segNo: number | null;
+  /** 同段内块序（语料 seq_in_parent） */
+  seqInParent: number | null;
   preview: string | null;
   injected: boolean;
   cited: boolean;
@@ -163,8 +174,8 @@ export function createDraftbenchApi(
             rank: typeof record.rank === 'number' ? record.rank : index + 1,
             chapter: typeof record.chapter === 'number' ? record.chapter : null,
             title: typeof record.title === 'string' ? record.title : null,
-            segFrom: null,
-            segTo: null,
+            segNo: null,
+            seqInParent: null,
             preview: null,
             injected: record.injected === true,
             cited: record.cited === true,
@@ -179,7 +190,7 @@ export function createDraftbenchApi(
         })
         .sort((a, b) => a.rank - b.rank);
 
-      // §10 决策 2：preview / segFrom / segTo 服务端经 sango_novel_chapter 按 chunkId 合成（多回合并批量通道调用）
+      // §10 决策 2：preview / segNo / seqInParent 服务端经 sango_novel_chapter 按 chunkId 合成（多回合并批量通道调用）
       const chapterCache = new Map<number, ChapterPayload | null>();
       const loadChapter = async (
         chapter: number
@@ -199,13 +210,14 @@ export function createDraftbenchApi(
         }
         const payload = await loadChapter(candidate.chapter);
         const entry =
-          payload?.chunks.find((chunk) => chunk.chunkId === candidate.chunkId) ??
+          payload?.chunks.find((chunk) => chunk.chunk_id === candidate.chunkId) ??
           null;
         const text = typeof entry?.text === 'string' ? entry.text : '';
         candidates.push({
           ...candidate,
-          segFrom: typeof entry?.segFrom === 'number' ? entry.segFrom : null,
-          segTo: typeof entry?.segTo === 'number' ? entry.segTo : null,
+          segNo: segmentNoOf(entry?.parent_id),
+          seqInParent:
+            typeof entry?.seq_in_parent === 'number' ? entry.seq_in_parent : null,
           preview: text
             ? text.slice(0, PREVIEW_MAX_LENGTH)
             : null,

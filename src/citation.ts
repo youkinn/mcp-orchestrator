@@ -1,9 +1,8 @@
 // feat-A004：《三国演义》原著检索的引用硬校验模块
 // 校验规则：答案断言人物集合（ID 级）⊆ 召回原文人物集合（ID 级），不成立走兜底。
 // 人物 ID 化：本地别名表（封闭集合）扫描；无 ID 的次要人物退化为字符串包含校验。
-// 引用与出处改服务端渲染（spec §6.3）：模型只输出指针 `[Qn]`，引语原文与出处由本模块按
-// quotes[] / chapter / title 字段渲染；注入视图只给纯原文 + 服务端编号（`[片段N]` / `⟨Qn⟩`），
-// 不带回目、段号、分数。
+// 引用与出处改服务端渲染（spec §6.3）：模型只输出指针 `[片段N]`，引用原文与出处由本模块按
+// 字段渲染；注入视图只给纯原文 + 服务端编号（`[片段N]`），不带回目、段号、分数。
 import { readFileSync } from "node:fs";
 
 export const SANGO_NOVEL_SEARCH_TOOL = "sango_novel_search";
@@ -80,28 +79,26 @@ export interface PersonMention {
   id?: string;
 }
 
-/** spec §5 语料 schema（bug-00010 出参瘦身）：一条引语只给定位，不再重复携带文本 /
- * qid / speaker——引语原文由编排侧按切片还原，出参体积随之减半。 */
-export interface RecallQuote {
-  /** 开引号在该条目 text 中的 1 基下标 */
-  offset: number;
-  /** 引语本体字数（不含两侧引号） */
-  len: number;
-}
-
-/** spec §5 检索工具出参条目（C4 定稿：裸数组，字段逐字为 id/text/chapter/title/type/segFrom/segTo/quoteBalanced/quotes） */
+/**
+ * 检索工具出参条目（裸 JSON 数组；字段逐字为语料 schema v2：
+ * chunk_id / parent_id / seq_in_parent / type / role / text / char_count + 回级 chapter / title）。
+ */
 export interface RecallEntry {
-  id?: string;
+  /** chunk 唯一 ID：`{source}:{回号4位}:p{段号4位}:c{同段块序2位}` */
+  chunk_id?: string;
   text: string;
   /** 回号；逐条携带（单次召回的多条可来自不同回，出处只能逐条渲染） */
   chapter?: number;
   /** 回目；逐条携带 */
   title?: string;
+  /** chunk 类型（语料取值 prose | verse） */
   type?: string;
-  segFrom?: number;
-  segTo?: number;
-  quoteBalanced?: boolean;
-  quotes?: RecallQuote[];
+  /** chunk 角色（语料取值 body | lead）；lead = 引题，不进检索索引 */
+  role?: string;
+  /** 父段 ID：`{source}:{回号4位}:p{段号4位}`；段号取自这里，作引用排序键 */
+  parent_id?: string;
+  /** 同段内块序（1 起）；同段内的引用排序次级键 */
+  seq_in_parent?: number;
 }
 
 /** 召回原文片段：text 为纯原文（不含出处 / 段号 / 分数），出处由 chapter / title 字段渲染 */
@@ -110,27 +107,30 @@ export interface RecallFragment {
   source: string;
   chapter?: number;
   title?: string;
-  /** 该片段携带的引语（只有定位；渲染前由 buildInjectionView 还原文本并重编号） */
-  quotes?: RecallQuote[];
+  /** 段号（同回原文出现位置，引用排序键；取自 parent_id，缺失片段排引用末位） */
+  segNo?: number;
+  /** 同段内块序（1 起；同段内按块序排序） */
+  seqInParent?: number;
 }
 
 /** 注入视图的片段条数上限：与检索返回条数联动（返回收缩到 10 条即全部注入）。
  * 放宽后第 4~10 名对模型可见——张飞题证据段排 #5，旧值 3 把它挡在模型视野外（bug-00009 同类）。 */
 export const INJECT_FRAGMENT_LIMIT = 10;
 
-/** 长引语安全网阈值（字）：模型输出里超过该长度的「…」视为违规抄写 */
-export const MAX_MODEL_QUOTE_LENGTH = 30;
-
-/** 引语渲染所需的元数据：逐字可信的原文 + 出处字段 */
-export interface RenderedQuote {
+/** 注入视图片段元数据：逐字可信的原文 + 出处 + 片段位置（引用排序键） */
+export interface RenderedFragment {
   text: string;
   chapter?: number;
   title?: string;
+  /** 段号（同回原文出现位置，引用排序键；缺章 / 缺段号的片段排引用末位） */
+  segNo?: number;
+  /** 同段内块序（1 起） */
+  seqInParent?: number;
 }
 
-/** feat-A006 引用出处卡片：按引用出现顺序的扁平数组；无引用时恒 [] */
+/** feat-A006 引用出处卡片：按回号递增、同回按原文出现先后排序的扁平数组；无引用时恒 [] */
 export interface Citation {
-  /** 命中片段原文（工具出参 text，可含引语；无回目 / 段号 / 类型 / 分数） */
+  /** 命中片段原文（工具出参 text；无回目 / 段号 / 类型 / 分数） */
   text: string;
   /** 回号 */
   chapter?: number;
@@ -144,14 +144,11 @@ export interface ChatData {
   citations: Citation[];
 }
 
-/** 注入视图：注入给模型的纯原文（带 `[片段N]` / `⟨Qn⟩` 标记）+ 全局 qid → 引语元数据 */
+/** 注入视图：注入给模型的纯原文（带 `[片段N]` 标记）+ 全局片段编号 → 片段元数据 */
 export interface InjectionView {
   text: string;
-  quotes: Map<string, RenderedQuote>;
   /** 全局片段编号 → 该片段原文窗口（叙述句答案的引用目标：`[片段N]` 指针渲染用，bug-00009） */
-  fragments: Map<string, RenderedQuote>;
-  /** 全局引语序号 → 所属片段编号（feat-A006：同片段多引语合并为一条 citation） */
-  quoteFragments: Map<string, string>;
+  fragments: Map<string, RenderedFragment>;
 }
 
 
@@ -269,7 +266,7 @@ function parseRecallEntries(text: string): RecallEntry[] {
   }
 }
 
-/** 工具出参文本 → 召回片段：解析裸数组条目，元数据（chapter / title）逐条携带，正文只留纯原文 */
+/** 工具出参文本 → 召回片段：解析裸数组条目，元数据（chapter / title / 段号 / 块序）逐条携带，正文只留纯原文 */
 export function toRecallFragments(
   texts: string[],
   source: string
@@ -288,79 +285,31 @@ export function toRecallFragments(
           typeof entry.title === "string" && entry.title.trim()
             ? entry.title.trim()
             : undefined,
-        quotes: Array.isArray(entry.quotes)
-          ? entry.quotes.filter((quote) =>
-              isValidQuoteRange(quote, entry.text.length)
-            )
-          : undefined,
+        segNo: parseSegmentNo(entry.parent_id),
+        seqInParent:
+          typeof entry.seq_in_parent === "number"
+            ? entry.seq_in_parent
+            : undefined,
       });
     }
   }
   return fragments;
 }
 
-/** 引语定位合法性：offset / len 为整数、len 为正、开引号在正文内、且整条引语（含两侧
- * 引号）不越出正文。非法只跳过该条引语，绝不让整组 quotes 静默变空（bug-00009 同类回归：
- * quotes 全空 ⇒ 注入视图无 ⟨Qn⟩ ⇒ 指针校验失败 ⇒ 全量走兜底、引用丢失）。 */
-function isValidQuoteRange(quote: RecallQuote, textLength: number): boolean {
-  return (
-    !!quote &&
-    Number.isInteger(quote.offset) &&
-    Number.isInteger(quote.len) &&
-    quote.len > 0 &&
-    quote.offset >= 1 &&
-    quote.offset - 1 + quote.len + 2 <= textLength
-  );
-}
-
-/** 按 offset / len 还原引语本体（不含两侧引号）：offset 是开引号的 1 基下标，
- * 故本体起点为 0 基的 offset（开引号下标 offset-1 再 +1）。 */
-function sliceQuoteText(text: string, quote: RecallQuote): string {
-  return text.slice(quote.offset, quote.offset + quote.len);
-}
-
-/** 在正文内标出引语：`⟨Qn⟩` 插在开引号前，qid 从 start 起按出参 quotes 顺序连续编号。
- *
- * **前置条件：text 必须与 quote.offset 同基准。** offset 是整段 fragment.text 的 1 基下标，
- * 故当前调用方恒传整段 fragment.text；本函数不做窗口裁剪、不做偏移换算。若将来恢复窗口裁剪
- * 而把裁剪后的窗口文本传进来，落在窗口内的 offset 仍会通过校验却语义错位，静默标错 ⟨Qn⟩
- * （bug-00009 同类：标记与文本不对位 ⇒ 指针指向错误引语）。要支持窗口必须先把 offset 换算到
- * 窗口基准，或直接传整段文本。
- *
- * 定位直接取 offset（1 基 → 0 基减一），不再 indexOf 搜索——同一 chunk 内引语文本重复时
- * 也能各就各位（全量语料 7 处）。越界引语（含两侧引号超出 text 范围 / 数据非法）跳过，
- * 不标错位置；跳过只影响该条，编号仍连续无空洞。 */
-function markQuotesInWindow(
-  text: string,
-  fragment: RecallFragment,
-  start: number
-): { marked: string; assigned: Array<{ qid: string; quote: RecallQuote }>; next: number } {
-  const located: Array<{ at: number; qid: string; quote: RecallQuote }> = [];
-  for (const quote of fragment.quotes ?? []) {
-    if (!isValidQuoteRange(quote, text.length)) {
-      continue;
-    }
-    located.push({
-      at: quote.offset - 1,
-      qid: `Q${start + located.length}`,
-      quote,
-    });
+/** 从父段 ID（{source}:{回号4位}:p{段号4位}）反解段号；无 parent_id / 非该格式返回 undefined */
+function parseSegmentNo(parentId: string | undefined): number | undefined {
+  if (typeof parentId !== "string") {
+    return undefined;
   }
-  const assigned = located.map(({ qid, quote }) => ({ qid, quote }));
-  let marked = text;
-  // 从后往前插入，前面的下标才不被撑位移（编号顺序不受插入顺序影响）
-  for (const { at, qid } of [...located].sort((a, b) => b.at - a.at)) {
-    marked = marked.slice(0, at) + `⟨${qid}⟩` + marked.slice(at);
-  }
-  return { marked, assigned, next: start + assigned.length };
+  const match = /:p(\d+)$/.exec(parentId);
+  return match ? Number(match[1]) : undefined;
 }
-
 /**
  * 注入视图（spec §6.3）：纯原文 + 服务端编号。
- * 片段带 `[片段N]`，片段内引语带 `⟨Qn⟩`；**不带回目、段号、分数**，模型无从抄写出处。
+ * 片段带 `[片段N]`；**不带回目、段号、分数**，模型无从抄写出处。
  * 注入策略（2026-09-20 定稿）：前 INJECT_HEAD_GUARANTEE 段整段保底、不裁剪、不占预算；
- * 第 6 段起仅在开关开启且预算内整段纳入，超预算丢整段、绝不段内裁剪；整段注入下引语
- * 完整可见，编号连续无空洞（不再需要「并入首条引语」等窗口补偿逻辑）。
+ * 第 6 段起仅在开关开启且预算内整段纳入，超预算丢整段、绝不段内裁剪；整段注入下编号
+ * 连续无空洞。
  * feat-A017：草稿台请求级参数覆盖 —— options.topK / guarantee / budget 取代同名生产常量
  * （仅本次请求内生效，不改生产默认路径）；options 传布尔保留旧 tailFallback 调用兼容。
  */
@@ -375,6 +324,21 @@ export interface InjectionViewOptions {
   tailFallback?: boolean;
 }
 
+/** 结构化出处行（bug-00004 方案 C）：〔出处N〕第N回 回目名。
+ * 紧跟对应片段块末尾，位置固定、可被 prompt 定向引用；与 [片段N] 标记形态互不混淆。
+ * chapter / title 缺失（草稿台无出处片段）时不输出，返回 null。 */
+export function buildSourceLine(
+  fragmentKey: string,
+  chapter?: number,
+  title?: string
+): string | null {
+  const match = /^片段(\d+)$/.exec(fragmentKey);
+  if (!match || chapter === undefined || !title) {
+    return null;
+  }
+  return `〔出处${match[1]}〕第${chapter}回 ${title}`;
+}
+
 export function buildInjectionView(
   fragments: RecallFragment[],
   query = "",
@@ -386,11 +350,8 @@ export function buildInjectionView(
   const guarantee = opts.guarantee ?? INJECT_HEAD_GUARANTEE;
   const budget = opts.budget ?? INJECT_TOTAL_BUDGET;
   const tailFallback = opts.tailFallback ?? INJECT_TAIL_FALLBACK_ENABLED;
-  const quotes = new Map<string, RenderedQuote>();
-  const targets = new Map<string, RenderedQuote>();
-  const quoteFragments = new Map<string, string>();
+  const targets = new Map<string, RenderedFragment>();
   const parts: string[] = [];
-  let next = 1;
   const injected = fragments.slice(0, limit);
   // 前 INJECT_HEAD_GUARANTEE 段保底整段注入（不参与预算竞争）；
   // tailFallback=false 时固定只注入前 5 段；开启时第 6+ 段整段在预算内依次纳入，超预算丢整段。
@@ -411,65 +372,43 @@ export function buildInjectionView(
       text: fragment.text,
       chapter: fragment.chapter,
       title: fragment.title,
+      segNo: fragment.segNo,
+      seqInParent: fragment.seqInParent,
     });
-    const { marked, assigned, next: after } = markQuotesInWindow(
-      fragment.text,
-      fragment,
-      next
+    // bug-00004 方案 C：片段块末尾附结构化出处行（回号+回目名），正文保持纯原文
+    const sourceLine = buildSourceLine(
+      fragmentKey,
+      fragment.chapter,
+      fragment.title
     );
-    next = after;
-    for (const { qid, quote } of assigned) {
-      quotes.set(qid, {
-        text: sliceQuoteText(fragment.text, quote),
-        chapter: fragment.chapter,
-        title: fragment.title,
-      });
-      quoteFragments.set(qid, fragmentKey);
-    }
-    parts.push(`[${fragmentKey}] ${marked}`);
+    parts.push(
+      sourceLine ? `[${fragmentKey}] ${fragment.text}\n${sourceLine}` : `[${fragmentKey}] ${fragment.text}`
+    );
   });
-  return { text: parts.join("\n\n"), quotes, fragments: targets, quoteFragments };
+  return { text: parts.join("\n\n"), fragments: targets };
 }
 
-/** 模型输出里的引用指针（`[Qn]` 引语 / `[片段N]` 叙述段） */
+/** 模型输出里的引用指针（`[片段N]` 叙述段） */
 export function extractCitePointers(answer: string): string[] {
-  return [
-    ...[...answer.matchAll(/\[(Q\d+)\]/g)].map((matched) => matched[1]),
-    ...[...answer.matchAll(/\[片段(\d+)\]/g)].map(
-      (matched) => `片段${matched[1]}`
-    ),
-  ];
+  return [...answer.matchAll(/\[片段(\d+)\]/g)].map(
+    (matched) => `片段${matched[1]}`
+  );
 }
 
-/** 模型输出里的引语指针（`[Qn]`） */
-export function extractQuotePointers(answer: string): string[] {
-  return extractCitePointers(answer).filter((ref) => ref.startsWith("Q"));
-}
-
-/** 指针校验（spec §6.4）：至少含一个指针，且指针全部 ∈ 本次注入的 qid / 片段编号集合 */
-export function validateQuotePointers(
+/** 指针校验（spec §6.4）：至少含一个指针，且指针全部 ∈ 本次注入的片段编号集合 */
+export function validateFragmentPointers(
   answer: string,
-  injected: Map<string, RenderedQuote>,
-  injectedFragments?: Map<string, RenderedQuote>
+  injected: Map<string, RenderedFragment>
 ): { ok: boolean; pointers: string[]; invalid: string[] } {
   const pointers = extractCitePointers(answer);
-  const invalid = pointers.filter((ref) =>
-    ref.startsWith("Q") ? !injected.has(ref) : !injectedFragments?.has(ref)
-  );
+  const invalid = pointers.filter((ref) => !injected.has(ref));
   return { ok: pointers.length > 0 && invalid.length === 0, pointers, invalid };
 }
 
-/** 长引语安全网（spec §6.4）：丢弃模型违规抄写的超长「…」（其原文由指针 + 字段渲染提供） */
-export function stripOverlongModelQuotes(answer: string): string {
-  return answer.replace(/「([^」]*)」/g, (whole, inner: string) =>
-    inner.length > MAX_MODEL_QUOTE_LENGTH ? "" : whole
-  );
-}
-
 // bug-00028 单轮方案·结构门第三条：句-片段文本重叠（判定纯函数，见 agent.ts applyNovelCitationGuard）。
-// 答案里带 [片段N] 的叙述句与该片段做字符 n-gram 重叠判定：归一化（剔除空白标点、全角数字转半角、
-// 引号内容不参与）后，句子 n-gram 命中片段集合的比例低于阈值 → 低重叠句（边界复核候选）；
-// 引语句（[Qn]）不受此门约束（沿用服务端渲染）。只依赖片段文本，不引入任何词表 / 枚举。
+// 答案里带 [片段N] 的叙述句与该片段做字符 n-gram 重叠判定：归一化（剔除空白标点、全角数字转半角）
+// 后，句子 n-gram 命中片段集合的比例低于阈值 → 低重叠句（边界复核候选）。只依赖片段文本，
+// 不引入任何词表 / 枚举。
 // bug-00032/33/34：重叠门由「字面一票否决」改为「低重叠 → 边界语义复核」——重叠 < 阈值的待裁句
 // 由 agent 走一次轻量 LLM 语义复核（supported 放行 / unsupported 裁剪，见 agent.ts
 // checkNovelBoundarySupport）；本文件只做纯函数拆分（低重叠句挑选 + 裁剪），不发起任何 LLM 调用。
@@ -478,10 +417,9 @@ export function stripOverlongModelQuotes(answer: string): string {
 export const SENTENCE_OVERLAP_THRESHOLD = 0.5;
 /** 句-片段重叠的字符 n-gram 长度 */
 export const SENTENCE_OVERLAP_NGRAM = 2;
-/** 重叠归一化：剔除引语（引号内容不参与本门判定）、全角数字转半角、剔除空白与标点 */
+/** 重叠归一化：全角数字转半角、剔除空白与标点 */
 function normalizeOverlapText(text: string): string {
   return text
-    .replace(/「[^」]*」|『[^』]*』|“[^”]*”|‘[^’]*’/g, "")
     .replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
     .replace(/[\s\p{P}\p{S}]/gu, "");
 }
@@ -501,9 +439,9 @@ export function sentenceFragmentOverlap(
   fragmentText: string,
   n = SENTENCE_OVERLAP_NGRAM
 ): number {
-  // 指针（[Qn] / [片段N]）是服务端编号标记，不参与文本重叠：先剔除再归一
+  // 指针（[片段N]）是服务端编号标记，不参与文本重叠：先剔除再归一
   const sentGrams = charNgrams(
-    normalizeOverlapText(sentence.replace(/\[(?:Q\d+|片段\d+)\]/g, "")),
+    normalizeOverlapText(sentence.replace(/\[片段\d+\]/g, "")),
     n
   );
   if (sentGrams.size === 0) {
@@ -519,23 +457,21 @@ export function sentenceFragmentOverlap(
   return hit / sentGrams.size;
 }
 
-/** 去掉答案里的引用指针标记（[片段N] / [Qn]），返回句子正文（bug-00038：复核候选与拒答判定按正文） */
+/** 去掉答案里的引用指针标记（[片段N]），返回句子正文（bug-00038：复核候选与拒答判定按正文） */
 export function stripPointerMarkers(text: string): string {
-  return text.replace(/\[(?:Q\d+|片段\d+)\]/g, "");
+  return text.replace(/\[片段\d+\]/g, "");
 }
 
-/** 把答案切成句（句末标点 / 指针为边界），[Qn] / [片段N] 指针并入所属句子 */
-function splitAnswerSentences(answer: string): Array<{
+/** 把答案切成句（句末标点 / 指针为边界），[片段N] 指针并入所属句子 */
+export function splitAnswerSentences(answer: string): Array<{
   text: string;
   narrativePointers: string[];
-  quotePointers: string[];
 }> {
   const sentences: Array<{
     text: string;
     narrativePointers: string[];
-    quotePointers: string[];
   }> = [];
-  const re = /([^。！？；]*[。！？；]?)((?:\[(?:Q\d+|片段\d+)\])*)/g;
+  const re = /([^。！？；]*[。！？；]?)((?:\[片段\d+\])*)/g;
   let matched: RegExpExecArray | null;
   while ((matched = re.exec(answer)) !== null) {
     if (matched[0] === "") {
@@ -545,94 +481,140 @@ function splitAnswerSentences(answer: string): Array<{
     if (!text.trim()) {
       continue;
     }
+    // bug-00044：模型输出「结论句。\n\n[片段N]」会被正则切成「结论句」+ 独立指针行
+    // （trace 46dbc882：结论句无指针 → 对全部注入片段错配无关片段作复核参考 → 误裁拒答）。
+    // 后处理：纯指针行（去掉 [片段N] 后正文为空）且前面存在有正文句子时，拼到前句末尾，
+    // 指针随文本归属前句（本函数从整句文本提取 narrativePointers，拼接后自然生效）；
+    // 前面没有有正文句子的孤儿指针行保持原样（bug-00038 拒答路径不受影响）。
+    const last = sentences[sentences.length - 1];
+    if (
+      last !== undefined &&
+      stripPointerMarkers(text).trim() === "" &&
+      stripPointerMarkers(last.text).trim() !== ""
+    ) {
+      const mergedText = last.text + text;
+      last.text = mergedText;
+      last.narrativePointers = [...mergedText.matchAll(/\[片段(\d+)\]/g)].map(
+        (m) => `片段${m[1]}`
+      );
+      continue;
+    }
     // 指针不限于句尾（bug-00037：句号前指针同样归属本句），从整句正文提取
     const narrativePointers = [...text.matchAll(/\[片段(\d+)\]/g)].map(
       (m) => `片段${m[1]}`
     );
-    const quotePointers = [...text.matchAll(/\[Q(\d+)\]/g)].map(
-      (m) => `Q${m[1]}`
-    );
-    sentences.push({ text, narrativePointers, quotePointers });
+    sentences.push({ text, narrativePointers });
   }
   return sentences;
 }
 
+/** 复核参考片段（bug-00057）：结论句所引单片段的原文 + 结构化出处行（〔出处N〕第N回 回目名）。 */
+export interface LowOverlapFragment {
+  /** 片段指针（如 片段5） */
+  pointer: string;
+  /** 片段原文 */
+  text: string;
+  /** 该片段的结构化出处行（回号类判据取用）；章节 / 回目缺失时为 null */
+  sourceLine: string | null;
+}
+
 /** 低重叠叙述句（边界语义复核候选）：带 [片段N] 或与注入片段低重叠的叙述句，重叠率 < 阈值。 */
 export interface LowOverlapSentence {
-  /** 整句原始文本（含 [片段N] / [Qn] 指针） */
+  /** 整句原始文本（含 [片段N] 指针） */
   text: string;
   /** 该句引用的叙述段指针（如 片段5）；无指针叙述句为空数组 */
   pointers: string[];
   /** 候选片段重叠率的最大值（仍 < SENTENCE_OVERLAP_THRESHOLD；无注入片段时为 0） */
   bestOverlap: number;
-  /** 重叠率最高片段原文（复核参考文本；无注入片段时为 null） */
-  bestFragmentText: string | null;
+  /** 复核参考片段集（bug-00057）：带指针句 = 该句所引全部可解析片段（按指针首现顺序去重）；
+   * 无指针句 = 全注入片段中重叠率最高的那一个；所引指针全不可解析 / 无注入片段时为 []。
+   * 复核 LLM 以整组片段为准判定支撑，回号类判据取各片段出处行。 */
+  referenceFragments: LowOverlapFragment[];
 }
 
 /** 结构门第三条·低重叠句挑选（纯函数）：返回需要边界语义复核的叙述句。
- * 带 [片段N] 的句子取其引用片段的最大重叠率；无指针叙述句（bug-00037：结论句不带指针、
- * 指针挂在引文句时，结论断言会逃过本门）对全部注入片段取最大重叠率。引语句（[Qn]）
- * 不受本门约束（服务端渲染）；重叠率低于阈值即列为复核候选，由调用方按判定结果
- * 用 stripAnswerSentences 放行（不裁剪）或裁剪。
+ * 带 [片段N] 的句子取其引用片段的最大重叠率；无指针叙述句（bug-00037：结论句不带指针时，
+ * 结论断言会逃过本门）对全部注入片段取最大重叠率。重叠率低于阈值即列为复核候选，
+ * 由调用方按判定结果用 stripAnswerSentences 放行（不裁剪）或裁剪。
  * bug-00039：单请求复核预算=1（生成轮之后边界语义复核至多 1 次）——调用方（agent.ts）
  * 只复核 bestOverlap 最高（并列取数组最先出现）的唯一候选句，其余候选直接按
  * unsupported 裁剪；本文件只做纯函数拆分（挑选 + 裁剪），不发起任何 LLM 调用。
- * bug-00038：去掉 [片段N]/[Qn] 标记后无正文的纯指针句先行剔除，不进复核候选。 */
+ * bug-00038：去掉 [片段N] 标记后无正文的纯指针句先行剔除，不进复核候选。 */
 export function findLowOverlapSentences(
   answer: string,
   view: InjectionView
 ): LowOverlapSentence[] {
   const low: LowOverlapSentence[] = [];
   for (const sentence of splitAnswerSentences(answer)) {
-    // bug-00038：纯指针句（去掉 [片段N]/[Qn] 后无正文）不进复核候选——结论句被裁光后
+    // bug-00038：纯指针句（去掉 [片段N] 后无正文）不进复核候选——结论句被裁光后
     // 仅剩的裸引用行会因零字数零重叠被判低重叠句触发 LLM 复核（trace ba5bb4ec 的额外
     // 调用来源），且正文为空仍可能判 supported 保留，最终渲染出「空正文+脚注」。
     if (!stripPointerMarkers(sentence.text).trim()) {
       continue;
     }
-    // bug-00040：去掉指针后非空、但重叠归一化后为空（整句内容均为引语）→ 不进复核候选、不裁剪、
-    // 不占复核预算。模型引文行如 [Q19]“……！……！” 被句切分后（！为句边界）会产生“……！/……”等
-    // 无指针引语片段句：引语内容在重叠归一化时被剔除 → 必低重叠 → 之前每次都会逐句进复核（纯浪费调用）；
-    // 引语本就由指针 + 字段渲染提供，无需复核。
+    // 归一化后无正文（纯标点句）不构成复核候选
     if (normalizeOverlapText(stripPointerMarkers(sentence.text)) === "") {
       continue;
     }
     if (sentence.narrativePointers.length === 0) {
-      // bug-00037：引语句（[Qn]，服务端渲染）不受重叠门约束；纯无指针叙述句纳入全片段重叠检查
-      if (sentence.quotePointers.length > 0) {
-        continue;
-      }
+      // bug-00037：结论句不带指针时结论断言会逃过本门——无指针叙述句纳入全片段重叠检查
       let bestOverlap = 0;
-      let bestFragment: RenderedQuote | undefined;
-      for (const fragment of view.fragments.values()) {
+      let bestFragmentKey: string | undefined;
+      let bestFragment: RenderedFragment | undefined;
+      for (const [fragmentKey, fragment] of view.fragments.entries()) {
         const overlap = sentenceFragmentOverlap(sentence.text, fragment.text);
         if (bestFragment === undefined || overlap > bestOverlap) {
           bestOverlap = overlap;
           bestFragment = fragment;
+          bestFragmentKey = fragmentKey;
         }
       }
       if (bestOverlap < SENTENCE_OVERLAP_THRESHOLD) {
+        // bug-00057 契约 4：无指针叙述句口径不变——全注入片段取重叠最高那一个作参考
         low.push({
           text: sentence.text,
           pointers: [],
           bestOverlap,
-          bestFragmentText: bestFragment?.text ?? null,
+          referenceFragments:
+            bestFragmentKey && bestFragment
+              ? [
+                  {
+                    pointer: bestFragmentKey,
+                    text: bestFragment.text,
+                    sourceLine: buildSourceLine(
+                      bestFragmentKey,
+                      bestFragment.chapter,
+                      bestFragment.title
+                    ),
+                  },
+                ]
+              : [],
         });
       }
       continue;
     }
+    // bug-00057 契约 1：带指针句的复核参考 = 该句所引全部合法片段（原文 + 出处行），
+    // 不再只取字面重叠最高的单个片段；bestOverlap 仍取句-片段重叠最大值（触发条件不变）。
     let bestOverlap = 0;
-    let bestFragment: RenderedQuote | undefined;
+    const referenceFragments: LowOverlapFragment[] = [];
+    const seenPointers = new Set<string>();
     for (const pointer of sentence.narrativePointers) {
+      if (seenPointers.has(pointer)) {
+        continue;
+      }
       const fragment = view.fragments.get(pointer);
       if (!fragment) {
         continue;
       }
+      seenPointers.add(pointer);
+      referenceFragments.push({
+        pointer,
+        text: fragment.text,
+        sourceLine: buildSourceLine(pointer, fragment.chapter, fragment.title),
+      });
       const overlap = sentenceFragmentOverlap(sentence.text, fragment.text);
-      // 首个可解析片段即作为复核参考（零重叠也应给到片段文本），重叠更高才替换
-      if (bestFragment === undefined || overlap > bestOverlap) {
+      if (overlap > bestOverlap) {
         bestOverlap = overlap;
-        bestFragment = fragment;
       }
     }
     if (bestOverlap < SENTENCE_OVERLAP_THRESHOLD) {
@@ -640,7 +622,7 @@ export function findLowOverlapSentences(
         text: sentence.text,
         pointers: sentence.narrativePointers,
         bestOverlap,
-        bestFragmentText: bestFragment?.text ?? null,
+        referenceFragments,
       });
     }
   }
@@ -656,6 +638,96 @@ export function stripAnswerSentences(
     .filter((sentence) => !dropTexts.has(sentence.text))
     .map((sentence) => sentence.text)
     .join("");
+}
+
+/** bug-00004 方案 C：非回号类问句的确定性裁剪（0 LLM）——返回含「第N回」或注入回目名的
+ * 整句（连同指针），供护栏按现有 stripAnswerSentences 裁掉，守住「非回号类问句不输出回目」。
+ * 回号正则覆盖阿拉伯 / 中文数字；回目名按注入视图 title 去空白后包含判定（模型可能不带全角空格）。 */
+export function findChapterLeakSentences(
+  answer: string,
+  view: InjectionView
+): string[] {
+  const titles = [...view.fragments.values()]
+    .map((fragment) => fragment.title)
+    .filter((title): title is string => Boolean(title));
+  const chapterRe = /第[0-9０-９一二三四五六七八九十百千零〇]+回/;
+  const leaked: string[] = [];
+  for (const sentence of splitAnswerSentences(answer)) {
+    const body = stripPointerMarkers(sentence.text).replace(/\s/g, "");
+    if (chapterRe.test(body)) {
+      leaked.push(sentence.text);
+      continue;
+    }
+    if (titles.some((title) => body.includes(title.replace(/\s/g, "")))) {
+      leaked.push(sentence.text);
+    }
+  }
+  return leaked;
+}
+
+/** 回号一致性核对（bug-00004 未闭环，负责人 2026-09-29 拍板；bug-00057 扩展为多片段）：
+ * 回号/回目类问句复核判据显式放行——结论回号与所引任一片段〔出处N〕结构化出处行回号一致 → supported
+ * （「首次/最初/最早」是问句口径，不要求单段证明极值）。确定性核对 0 LLM；
+ * 结论句无回号（如只写回目名）→ 交复核 LLM（prompt 已补判据 + 示例兜底）。
+ * 中文数字 / 阿拉伯数字 / 全角数字统一归一到 int 比较。 */
+
+const CN_NUM_DIGITS: Record<string, number> = {
+  零: 0, 〇: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+};
+
+/** 中文数字 → int（回号 1~120 范围够用；不在此范围的输入返回 null） */
+function chineseNumberToInt(text: string): number | null {
+  let total = 0;
+  let current = 0;
+  for (const ch of text) {
+    if (ch === "十") {
+      total += (current || 1) * 10;
+      current = 0;
+    } else if (ch === "百") {
+      total += (current || 1) * 100;
+      current = 0;
+    } else if (ch in CN_NUM_DIGITS) {
+      current = CN_NUM_DIGITS[ch];
+    } else {
+      return null;
+    }
+  }
+  return total + current;
+}
+
+/** 提取句中首个回号「第N回」并归一到 int；无回号 / 无法解析返回 null。
+ * 全角阿拉伯转半角后走 Number；中文数字走 chineseNumberToInt。 */
+export function extractChapterNumber(text: string): number | null {
+  const match = /第([0-9０-９一二三四五六七八九十百千零〇]+)回/.exec(text);
+  if (!match) {
+    return null;
+  }
+  const raw = match[1];
+  if (/^[0-9０-９]+$/.test(raw)) {
+    const n = Number(raw.replace(/[０-９]/g, (d) => String.fromCharCode(d.charCodeAt(0) - 0xfee0)));
+    return Number.isInteger(n) && n > 0 ? n : null;
+  }
+  return chineseNumberToInt(raw);
+}
+
+/** 回号一致性判据（bug-00057 扩展为多片段）：结论回号与所引任一片段〔出处N〕行回号一致 → "supported"；
+ * 结论回号与所有出处行回号都不一致（且至少一行可取到回号）→ "unsupported"；
+ * 结论无回号 / 所有出处行都取不到回号（如结论只写回目名）→ null（交复核 LLM 兜底）。 */
+export function chapterConsistencyVerdict(
+  sentence: string,
+  sourceLines: ReadonlyArray<string | null>
+): "supported" | "unsupported" | null {
+  const sentenceChapter = extractChapterNumber(sentence);
+  if (sentenceChapter === null) {
+    return null;
+  }
+  const sourceChapters = sourceLines
+    .map((line) => (line ? extractChapterNumber(line) : null))
+    .filter((chapter): chapter is number => chapter !== null);
+  if (sourceChapters.length === 0) {
+    return null;
+  }
+  return sourceChapters.includes(sentenceChapter) ? "supported" : "unsupported";
 }
 
 /** 结构门第三条·字面裁剪（零 LLM 兼容口径，保留给纯函数用例 / 复核不可用时的保守回落）：
@@ -674,65 +746,63 @@ export function stripLowOverlapSentences(
   );
 }
 
-/** 上标角标字符（feat-A006）：¹²³⁴⁵⁶⁷⁸⁹⁰，下标按出现顺序从 1 起 */
-const SUPERSCRIPT_DIGITS = "⁰¹²³⁴⁵⁶⁷⁸⁹";
-
-/** 全局上标角标：1 → ¹，10 → ¹⁰（>9 用多字符组合），与 citations 下标一一对应 */
-export function toSuperscript(index: number): string {
-  return String(index)
-    .split("")
-    .map((digit) => SUPERSCRIPT_DIGITS[Number(digit)])
-    .join("");
-}
-
-/** 解析答案里的指针：引语 `[Qn]`（连同所属片段编号）或叙述段 `[片段N]`；未注册返回 null */
+/** 解析答案里的指针：叙述段 `[片段N]`；未注册返回 null */
 function resolvePointerRef(
   ref: string,
   view: InjectionView
-): { quote: RenderedQuote; fragmentKey: string } | null {
-  const quote = ref.startsWith("Q")
-    ? view.quotes.get(ref)
-    : view.fragments.get(ref);
-  if (!quote) {
-    return null;
-  }
-  const fragmentKey = ref.startsWith("Q")
-    ? view.quoteFragments.get(ref)
-    : ref;
-  return fragmentKey ? { quote, fragmentKey } : null;
+): RenderedFragment | null {
+  return view.fragments.get(ref) ?? null;
 }
 
-/** 服务端渲染引用与出处（feat-A006）：`[Qn]` 引语指针 → 「引文」+ 全局上标角标，
- * `[片段N]` 叙述段指针 → 仅全局上标角标（不内联原文，answer 只放结论，原文进 citations 卡片）；
- * 不再内联出处；citations 按引用出现顺序、片段粒度合并（同片段多引语合并为一条，
- * 角标数量 = 片段数量），只收被引用片段；未注册的指针原样保留。 */
+/** 服务端渲染引用与出处（feat-A006）：`[片段N]` 指针从 answer 剥离（不输出角标），原文与出处进
+ * citations 卡片（不内联原文、不内联出处）；citations 按片段粒度合并（同片段多引用合并为一条），
+ * 只收被引用片段；并按回号递增、同回按原文出现先后
+ * （段号 → 同段块序）排序后下发——无回号 / 无段号的片段排最后、相互保持引用出现顺序。 */
 export function renderAnswerWithCitations(
   answer: string,
   view: InjectionView
 ): ChatData {
-  const citations: Citation[] = [];
-  const citedIndexes = new Map<string, number>();
-  const rendered = answer.replace(/\[(Q\d+|片段\d+)\]/g, (whole, ref: string) => {
-    const resolved = resolvePointerRef(ref, view);
-    if (!resolved) {
-      return whole;
+  // 第一遍：按引用出现顺序收集被引用片段（去重）
+  const cited: Array<{ fragmentKey: string; fragment: RenderedFragment }> = [];
+  const seen = new Set<string>();
+  const pointerRe = /\[片段(\d+)\]/g;
+  let pointerMatch: RegExpExecArray | null;
+  while ((pointerMatch = pointerRe.exec(answer)) !== null) {
+    const fragmentKey = `片段${pointerMatch[1]}`;
+    if (seen.has(fragmentKey)) {
+      continue;
     }
-    let index = citedIndexes.get(resolved.fragmentKey);
-    if (index === undefined) {
-      index = citations.length + 1;
-      citedIndexes.set(resolved.fragmentKey, index);
-      const fragment = view.fragments.get(resolved.fragmentKey);
-      citations.push({
-        text: fragment?.text ?? resolved.quote.text,
-        chapter: fragment?.chapter ?? resolved.quote.chapter,
-        title: fragment?.title ?? resolved.quote.title,
-      });
+    seen.add(fragmentKey);
+    const fragment = resolvePointerRef(fragmentKey, view);
+    if (fragment) {
+      cited.push({ fragmentKey, fragment });
     }
-    if (ref.startsWith("Q")) {
-      return `「${resolved.quote.text}」${toSuperscript(index)}`;
+  }
+  // 第二遍：排序（chapter → segNo → seqInParent；排序键缺失的排最后、保持原相对顺序）
+  const keyed: Array<{ fragmentKey: string; fragment: RenderedFragment }> = [];
+  const unkeyed: Array<{ fragmentKey: string; fragment: RenderedFragment }> = [];
+  for (const entry of cited) {
+    const { chapter, segNo } = entry.fragment;
+    if (Number.isFinite(chapter) && Number.isFinite(segNo)) {
+      keyed.push(entry);
+    } else {
+      unkeyed.push(entry);
     }
-    return toSuperscript(index);
-  });
+  }
+  keyed.sort(
+    (a, b) =>
+      a.fragment.chapter! - b.fragment.chapter! ||
+      a.fragment.segNo! - b.fragment.segNo! ||
+      (a.fragment.seqInParent ?? 0) - (b.fragment.seqInParent ?? 0)
+  );
+  const ordered = [...keyed, ...unkeyed];
+  // 第三遍：剥离所有 `[片段N]` 指针，answer 只留结论正文（不再输出上标角标）
+  const rendered = answer.replace(/\[片段\d+\]/g, "");
+  const citations: Citation[] = ordered.map(({ fragment }) => ({
+    text: fragment.text,
+    chapter: fragment.chapter,
+    title: fragment.title,
+  }));
   return { answer: rendered, citations };
 }
 
@@ -814,7 +884,7 @@ export function pickBestFallbackFragment(
 }
 
 /**
- * 兜底输出（feat-A006 结构化）：不做归纳生成，answer 放结论句（带角标 ¹），
+ * 兜底输出（feat-A006 结构化）：不做归纳生成，answer 放结论句（无角标），
  * citations 恰一条兜底片段（整段、不裁剪；chunk 上限 400 字，天然防刷屏，禁止多段拼刷）。
  * 选段走 pickBestFallbackFragment（结论人物 + query 锚点稀有度），不再盲取 fragments[0]；
  * 无原文可引用不得编造（citations 恒 []）。
@@ -832,7 +902,7 @@ export function buildFallback(
   }
   const top = pickBestFallbackFragment(fragments, query, conclusion);
   return {
-    answer: `${conclusionLine}${toSuperscript(1)}`,
+    answer: conclusionLine,
     citations: [
       {
         text: top.text,

@@ -118,6 +118,12 @@ function extractFocusClasses(query: string): Set<FocusClass> {
   return found;
 }
 
+/** 零 LLM 回号类问句识别（bug-00004 方案 C）：命中 §1.2.1 chapter 焦点词即真，
+ * 供生成轮 prompt 例外 / 护栏复核口径判定使用（确定性、不调用 LLM）。 */
+export function hasChapterFocus(query: string): boolean {
+  return extractFocusClasses(query).has("chapter");
+}
+
 /** 焦点一致性轻校验（§1.2.1 拒判条件）：F(A) 非空且 F(B) 非空且 F(A) ∩ F(B) == ∅ → 拒判
  * 单边无焦点 → 放行（靠相似度阈值判定） */
 function focusClassesDisjoint(a: string, b: string): boolean {

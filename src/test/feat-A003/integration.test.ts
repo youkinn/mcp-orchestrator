@@ -275,15 +275,14 @@ function formatAnswer(answer: { key: SangoOptionKey; text: string }): string {
 /** 原著召回出参（裸 JSON 数组，与 mcp-server 同构） */
 const NOVEL_RECALL = JSON.stringify([
   {
-    id: 'sanguo-yanyi:0005:c0001',
+    chunk_id: 'sanguo-yanyi:0005:p0004:c01',
+    parent_id: 'sanguo-yanyi:0005:p0004',
+    seq_in_parent: 1,
     text: '众皆大惊曰：“云长提刀出阵，斩华雄于帐前！”',
     chapter: 5,
     title: '发矫诏诸镇应曹公　破关兵三英战吕布',
-    type: 'narration',
-    segFrom: 4,
-    segTo: 4,
-    quoteBalanced: true,
-    quotes: [{ offset: 7, len: 13 }],
+    type: 'prose',
+    role: 'body',
   },
 ]);
 

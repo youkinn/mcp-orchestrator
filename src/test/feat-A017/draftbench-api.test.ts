@@ -24,7 +24,7 @@ const TRACE_PROD = '9f7c0000-0000-4000-8000-00000000000a';
 const TRACE_DRAFT = '9f7c0000-0000-4000-8000-00000000000b';
 
 const CHUNK_A: DraftbenchChunk = {
-  chunkId: 'sanguo-yanyi:0005:c0001',
+  chunkId: 'sanguo-yanyi:0005:p0004:c01',
   text: '却说陈宫临欲下手杀曹操，忽转念曰："我为国家跟他到此，杀之不义。不若弃而他往。"',
   chapter: 5,
   title: '发矫诏诸镇应曹公 破关兵三英战吕布',
@@ -56,11 +56,12 @@ class DraftbenchSimTransport {
               next: null,
               chunks: [
                 {
-                  chunkId: 'sanguo-yanyi:0005:c0001',
+                  chunk_id: 'sanguo-yanyi:0005:p0004:c01',
+                  parent_id: 'sanguo-yanyi:0005:p0004',
+                  seq_in_parent: 1,
                   text: '却说陈宫临欲下手杀曹操，忽转念曰："我为国家跟他到此，杀之不义。不若弃而他往。"插剑上马，不等天明，自投东郡去了。操觉，不见陈宫，寻思："此人见我说了这两句，疑我不仁，弃我而去；吾当急行，不可久留。"遂连夜到陈留。',
-                  type: 'narration',
-                  segFrom: 1,
-                  segTo: 2,
+                  type: 'prose',
+                  role: 'body',
                 },
               ],
             }),
@@ -219,7 +220,7 @@ function seedTraceWithRetrieval(logStore: LogStore, traceId: string): void {
       funnel: { injected: 1, cited: 1 },
       candidates: [
         {
-          chunkId: 'sanguo-yanyi:0005:c0001',
+          chunkId: 'sanguo-yanyi:0005:p0004:c01',
           rank: 1,
           chapter: 5,
           title: '发矫诏诸镇应曹公 破关兵三英战吕布',
@@ -436,7 +437,7 @@ test('draftbench: records 列表仅草稿台、时间倒序、分页形状', asy
   assert.equal(res.body.data.list[0].errorMessage, '发送清单不能为空');
   assert.equal(res.body.data.list[0].result, null);
   // 校验失败行 params 快照缺失 → 服务端带出生产缺省（§4.2）
-  assert.deepEqual(res.body.data.list[0].params, { temperature: 0.7, topK: 10, guarantee: 5, budget: 2000 });
+  assert.deepEqual(res.body.data.list[0].params, { temperature: 0.1, topK: 10, guarantee: 5, budget: 2000 });
   assert.equal(res.body.data.list[1].result.citationCount, 1);
 
   const bad = await get(baseUrl, '/api/v1/draftbench/records/not-a-uuid');
@@ -611,12 +612,12 @@ test('draftbench: trace 拉取候选映射 + preview 合成 + 生成温度带出
   assert.equal(res.body.data.chunks.citedCount, 1);
   assert.equal(res.body.data.chunks.candidates.length, 1);
   const candidate = res.body.data.chunks.candidates[0];
-  assert.equal(candidate.chunkId, 'sanguo-yanyi:0005:c0001');
+  assert.equal(candidate.chunkId, 'sanguo-yanyi:0005:p0004:c01');
   assert.equal(candidate.rank, 1);
   assert.equal(candidate.chapter, 5);
   assert.equal(candidate.title, '发矫诏诸镇应曹公 破关兵三英战吕布');
-  assert.equal(candidate.segFrom, 1);
-  assert.equal(candidate.segTo, 2);
+  assert.equal(candidate.segNo, 4);
+  assert.equal(candidate.seqInParent, 1);
   assert.equal(candidate.injected, true);
   assert.equal(candidate.cited, true);
   assert.deepEqual(candidate.sources, ['lexical', 'vector']);
@@ -624,7 +625,7 @@ test('draftbench: trace 拉取候选映射 + preview 合成 + 生成温度带出
   assert.ok(typeof candidate.preview === 'string' && candidate.preview.length <= 120);
 });
 
-test('draftbench: 无生成轮温度缺省 0.7；章节通道故障时 preview 降级 null 不拖垮拉取', async (t) => {
+test('draftbench: 无生成轮温度缺省 0.1；章节通道故障时 preview 降级 null 不拖垮拉取', async (t) => {
   const h = newHarness(t);
   seedProductionTrace(h.logStore, TRACE_PROD);
   h.transport.chapterFail = true;
@@ -632,7 +633,7 @@ test('draftbench: 无生成轮温度缺省 0.7；章节通道故障时 preview �
 
   const res = await get(baseUrl, `/api/v1/draftbench/trace/${TRACE_PROD}`);
   assert.equal(res.body.code, 200);
-  assert.equal(res.body.data.params.temperature, 0.7);
+  assert.equal(res.body.data.params.temperature, 0.1);
   assert.equal(res.body.data.chunks.candidates.length, 0);
   assert.equal(res.body.data.chunks.injectedCount, 0);
 });
